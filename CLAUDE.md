@@ -509,28 +509,31 @@ Ordered roughly by dependency. Each milestone should land as a coherent
 PR with tests where the surface allows. Check items off as they merge.
 
 ### M0 — Project scaffolding
-- [ ] `Cargo.toml` metadata: edition 2024, `rust-version = "1.83"`,
-      BSD-2-Clause, `repository`, `description`.
-- [ ] `clippy.toml` + `deny.toml` mirroring `radius-tokio` posture
+- [x] `Cargo.toml` metadata: edition 2024, `rust-version = "1.85"`
+      (bumped from the originally-targeted 1.83 because edition 2024
+      requires 1.85), BSD-2-Clause, `repository`, `description`.
+- [x] `clippy.toml` + `deny.toml` mirroring `radius-tokio` posture
       (warn on `unsafe_op_in_unsafe_fn`, deny on unauthorized licences).
-- [ ] CI workflow: `cargo fmt --check`, `cargo clippy -- -D warnings`,
+- [x] CI workflow: `cargo fmt --check`, `cargo clippy -- -D warnings`,
       `cargo test`, `cargo deny check`, Linux-only matrix.
-- [ ] `cli.rs` skeleton: `getopt-iter` flag parsing matching the
+- [x] `cli.rs` skeleton: `getopt-iter` flag parsing matching the
       Configuration table; `--help`/`--version` work; `dotenvy::dotenv().ok()`.
-- [ ] `main.rs` boots `tokio` runtime(s), installs the `tracing` subscriber
+      `--version` also reports the git short SHA and commit date via a
+      `vergen-git2` build script.
+- [x] `main.rs` boots `tokio` runtime(s), installs the `tracing` subscriber
       with the non-blocking appender, holds the `WorkerGuard`, exits clean
       on SIGINT/SIGTERM.
 
 ### M1 — Crypto module
-- [ ] `crypto/ffi.rs`: newtypes around `aws-lc-sys` handles (`EVP_MD_CTX`,
+- [x] `crypto/ffi.rs`: newtypes around `aws-lc-sys` handles (`EVP_MD_CTX`,
       `HMAC_CTX`, `SSL`, `SSL_CTX`, `BIO`, …) with correct `Drop` impls.
-- [ ] Hash + HMAC primitives (SHA-1, SHA-256) used by SSTP and PPP-auth.
-- [ ] RNG wrapper (`RAND_bytes`).
-- [ ] TLS server: `SSL_CTX` builder loading cert chain + key from PEM,
+- [x] Hash + HMAC primitives (SHA-1, SHA-256) used by SSTP and PPP-auth.
+- [x] RNG wrapper (`RAND_bytes`).
+- [x] TLS server: `SSL_CTX` builder loading cert chain + key from PEM,
       `TlsAcceptor`/`TlsStream` surface usable from `tokio`.
-- [ ] **TLS exporter** (`SSL_export_keying_material`) — feeds the SSTP
+- [x] **TLS exporter** (`SSL_export_keying_material`) — feeds the SSTP
       Crypto Binding CMK derivation ([MS-SSTP] §3.2.5.2).
-- [ ] Unit tests + AddressSanitizer job covering every `unsafe` block.
+- [x] Unit tests + AddressSanitizer job covering every `unsafe` block.
 
 ### M2 — SSTP framing & state machine
 - [ ] Packet codec: encrypted-data and control packet headers ([MS-SSTP]
