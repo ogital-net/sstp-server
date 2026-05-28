@@ -1,0 +1,629 @@
+# sstp-server
+
+A high-performance, Linux-only [SSTP](MS-SSTP-spec.md) (Secure Socket Tunneling
+Protocol, [MS-SSTP]) server in Rust. Terminates SSTP/TLS from Windows clients,
+runs PPP, and forwards IP through the Linux kernel.
+
+## Goals
+
+- **Server only.** Accept SSTP clients on TCP/443, negotiate PPP, hand the
+  resulting interface to the kernel for IP forwarding. No client mode, no
+  cross-platform support.
+- **Performance is the primary axis.** Targets are headline throughput and
+  tail latency on the data path, and connection setup rate on the control
+  path. Every design choice is judged against these.
+- **Dependency light.** Prefer the standard library, `tokio`, and direct
+  `aws-lc-sys` FFI over higher-level crates. New dependencies need
+  justification.
+- **Spec-faithful.** The wire format and state machine follow [MS-SSTP] as
+  rendered in [MS-SSTP-spec.md](MS-SSTP-spec.md). Deviations are documented
+  with a section reference.
+
+## Non-goals
+
+- Windows / macOS support, or any portability shims.
+- A general-purpose PPP library. PPP support is scoped to what SSTP needs
+  (LCP, authentication phase, IPCP/IPV6CP).
+- Local user databases, config-file-driven user lists, or any auth backend
+  other than RADIUS.
+- A library/crate API surface. This repo is a daemon; reusable pieces can be
+  extracted later if a second consumer appears.
+
+## Architecture
+
+### Runtime topology
+
+- **Listener: `SO_REUSEPORT` + per-core `tokio` `LocalSet`.** One acceptor per
+  worker, no shared accept queue, no `Arc<Mutex<...>>` on the read path.
+  Connection state stays on the worker that accepted it; futures are
+  `!Send` by construction.
+- **Auth on a separate runtime.** RADIUS round-trips are unbounded and
+  network-bound; running them off the I/O workers keeps the read path
+  jitter-free. A small multi-threaded `tokio` runtime (or a dedicated
+  `LocalSet` pinned to a non-I/O core) handles the auth phase, then hands the
+  authenticated session back to the I/O worker that owns the TCP socket.
+- **No global locks on steady-state packet flow.** Per-session state is owned
+  by exactly one task; cross-worker signalling (shutdown, CoA-driven
+  disconnect) goes through bounded MPSC channels, not shared mutable state.
+
+### Data plane
+
+The fastest data path on Linux is to keep bulk IP traffic out of userspace
+entirely after IPCP completes:
+
+1. SSTP frames are read from the TLS socket in userspace.
+2. PPP control frames (LCP, auth, IPCP) are handled by the in-process PPP
+   state machine.
+3. Once IPCP converges, the session is bound to a kernel PPP unit via
+   `/dev/ppp` (`PPPIOCNEWUNIT`, `PPPIOCATTCHAN`). The resulting `pppN`
+   interface is owned by the kernel; routed IP traffic flows through the
+   normal Linux forwarding path without per-packet userspace overhead.
+4. Userspace continues to demultiplex incoming SSTP frames: data packets are
+   written into the kernel PPP channel fd; control packets are handled in
+   process.
+
+This mirrors how `accel-ppp` achieves its throughput numbers and is the
+constraint that drives the choice to implement PPP in-process rather than
+shelling out to `pppd`. `pppd` spawns a process per session and routes every
+data packet through a pty, which caps throughput and inflates memory per
+session by orders of magnitude.
+
+### Crypto
+
+- All cryptographic operations live in a single in-tree `crypto` module that
+  wraps `aws-lc-sys` directly. No `ring`, no `rustls`, no `openssl` crate.
+- TLS uses `aws-lc-sys`'s `libssl` directly through the `crypto` module's
+  `SSL`/`SSL_CTX` newtypes. The rest of the codebase sees a safe
+  `TlsStream` surface; `unsafe` is confined to the FFI wrappers, each block
+  carrying a `// SAFETY:` comment.
+- FFI handles (`SSL`, `SSL_CTX`, `EVP_MD_CTX`, `HMAC_CTX`, ...) are wrapped in
+  newtypes whose `Drop` frees via the correct `*_free`.
+- SSTP-specific crypto (Crypto Binding HMAC over CMK, CMK derivation from the
+  inner-method MSK / TLS exporter per [MS-SSTP] §3.2.5.2) is implemented on
+  top of those primitives in the same module.
+
+### Authentication
+
+- **Backend: RADIUS only**, via the sister crate
+  [`radius-tokio`](https://github.com/ogital-net/radius-tokio) (BSD-2-Clause,
+  same org). PPP authentication phase results — PAP credentials, CHAP /
+  MS-CHAPv2 challenge/response, or EAP fragments — are translated to
+  Access-Request attributes and forwarded.
+- **EAP** is handled by the
+  [`radius-tokio-eap`](https://github.com/ogital-net/radius-tokio/tree/main/crates/radius-tokio-eap)
+  companion crate (PEAP, EAP-TLS, EAP-TTLS, EAP-MSCHAPv2). The PPP layer
+  fragments/reassembles EAP-Message and otherwise stays out of method
+  internals.
+- **MPPE keys** required for the SSTP Crypto Binding come from the RADIUS
+  reply (MS-MPPE-Send-Key / MS-MPPE-Recv-Key VSAs for MS-CHAPv2; EAP MSK for
+  EAP methods). The auth task hands these to the session before it goes
+  hot.
+- **IP address assignment is RADIUS-driven.** The Access-Accept supplies
+  `Framed-IP-Address` (RFC 2865 §5.8) and optionally `Framed-IP-Netmask`,
+  `Framed-Route`, `Framed-MTU`, `MS-Primary-DNS-Server` /
+  `MS-Secondary-DNS-Server`, `MS-Primary-NBNS-Server` /
+  `MS-Secondary-NBNS-Server`. There is no in-process address pool. If the
+  RADIUS reply omits `Framed-IP-Address`, the session is rejected; we do
+  not synthesise addresses. IPv6 follows the same rule via
+  `Framed-IPv6-Prefix` / `Framed-Interface-Id` (RFC 3162) when IPV6CP
+  support lands.
+
+### RADIUS attribute references
+
+The Microsoft-vendor (vendor-ID 311) RADIUS attributes used by NPS / RRAS are
+the interop surface for any SSTP server that wants to talk to existing
+deployments. Canonical sources, in order of authority for *current* Windows
+behavior:
+
+- **[MS-RNAP] — Vendor-Specific RADIUS Attributes for NAP** (Microsoft Open
+  Specification). The current normative definition of the MS-VSAs NPS emits
+  and consumes: `MS-CHAP-Challenge`, `MS-CHAP-Response`, `MS-CHAP2-Response`,
+  `MS-CHAP2-Success`, `MS-CHAP-Error`, `MS-MPPE-Send-Key`,
+  `MS-MPPE-Recv-Key`, `MS-MPPE-Encryption-{Policy,Types}`, `MS-RAS-Vendor`,
+  `MS-RAS-Version`, `MS-RAS-Client-{Name,Version}`, etc. Same Open
+  Specifications program as [MS-SSTP]. Cite by section number in code.
+- **RFC 2548 — Microsoft Vendor-specific RADIUS Attributes**. Original IETF
+  Informational definition; MS-RNAP is a strict superset and wins on
+  conflicts, but for the SSTP-adjacent attributes the two agree.
+- **RFC 2759 — MS-CHAPv2**. The challenge/response algorithm and the
+  AuthenticatorResponse string carried in `MS-CHAP2-Success`.
+- **RFC 3079 — Deriving Keys for MPPE**. How `MS-MPPE-Send-Key` /
+  `MS-MPPE-Recv-Key` are derived from the NT-hash + peer/auth challenges.
+  This is the chain that feeds the SSTP Crypto Binding HMAC over CMK
+  ([MS-SSTP] §3.2.5.2.3).
+- **[MS-CHAP]** (Microsoft Open Specification). Restates RFC 2759 with
+  Microsoft's clarifications; resolves RFC ambiguities.
+
+Reference chain for the Crypto Binding code path:
+RFC 2759 (CHAPv2) → RFC 3079 (MPPE key derivation) → [MS-RNAP] (wire
+encoding of `MS-MPPE-{Send,Recv}-Key`) → [MS-SSTP] §3.2.5.2 (CMK derivation
+from HLAK, HMAC over the call-connected packet).
+
+For attribute *identifiers and on-wire encodings*, defer to the FreeRADIUS
+`dictionary.microsoft` family — it's the de-facto cross-vendor reference
+that NPS, FreeRADIUS, accel-ppp, strongSwan and hostapd all interop against.
+We get it through `radius-tokio`'s vendored dictionary feature rather than
+hand-rolling attribute numbers.
+
+### `radius-tokio` features we depend on
+
+Pinned set, kept minimal:
+
+- `dict-rfc` (default) — base RFC 2865/2866/2868/3162 attributes.
+- `dict-microsoft` — MS VSAs (RFC 2548 + MS-RNAP coverage).
+- `radsec` — only if a deployment wants RADIUS-over-TLS to its RADIUS
+  servers; otherwise off to skip the `libssl` bindgen step.
+- `tracing` / `metrics` — gated behind matching cargo features on this
+  crate so they propagate cleanly.
+
+EAP methods come from `radius-tokio-eap` with the `peap`, `eap-mschapv2`,
+`eap-tls`, and `eap-ttls` features. `eap-md5` is intentionally not enabled
+(Windows SSTP clients don't offer it and it has no MSK, so no Crypto
+Binding).
+
+## Configuration
+
+**CLI flags only. No config files.** Everything that varies per deployment
+is a command-line flag; everything that's a secret is an environment
+variable. `dotenvy` is loaded on startup for development convenience
+(`.env` next to the binary, only if present) but is a no-op in production
+where systemd / Kubernetes / etc. inject env vars directly.
+
+Rationale: a config file is one more piece of state to reload, validate,
+and schema-version. A daemon with ~15 knobs doesn't earn its keep. If the
+flag surface grows past what fits in a `--help` screen, that's a signal to
+push policy into RADIUS, not to add a config parser.
+
+### Flags (first-pass, all parsed via `getopt-iter`)
+
+```
+-l, --listen <addr>        Listen address (default: [::]:443)
+-c, --cert <path>           TLS certificate chain (PEM)
+-k, --key <path>            TLS private key (PEM)
+-r, --radius <host:port>    RADIUS auth server (repeatable)
+-A, --acct <host:port>      RADIUS accounting server (repeatable, optional)
+-t, --threads <n>           I/O worker count (default: auto, see below)
+    --auth-threads <n>      Auth runtime threads (default: max(2, ncpus/4))
+    --control-socket <path> Stats/admin socket (default: /run/sstp-server.sock)
+    --no-control-socket     Disable the control socket entirely
+    --log-format <fmt>      text | json | auto (default: auto)
+    --log-file <path>       Log to file instead of stderr (still non-blocking)
+-v                          Increase log verbosity (repeatable: -v, -vv, -vvv)
+-q, --quiet                 Errors only
+-h, --help                  Print usage
+-V, --version               Print version
+```
+
+### Verbosity → log level mapping
+
+| Flags  | Level    | What it includes                                 |
+|--------|----------|--------------------------------------------------|
+| (none) | `warn`   | Warnings and errors only                         |
+| `-v`   | `info`   | Per-session lifecycle (accept, auth, teardown)   |
+| `-vv`  | `debug`  | Control-plane state transitions (LCP, IPCP, ...)|
+| `-vvv` | `trace`  | Per-frame control-plane tracing (never data plane) |
+| `-q`   | `error`  | Errors only                                       |
+
+`-q` and `-v` are mutually exclusive; later flag wins. Even at `-vvv`
+there is no per-data-packet tracing — that's an eBPF / `tcpdump` job, not
+the server's.
+
+### Worker thread defaults
+
+The `-t` / `--threads` flag overrides; the default is derived at startup:
+
+- I/O workers: `available_parallelism()` from `std::thread`, minus auth
+  threads, floored at 1. Each I/O worker pins to a `LocalSet` with its own
+  `SO_REUSEPORT` listener socket.
+- Auth runtime: `max(2, ncpus / 4)`, capped at the I/O worker count. The
+  auth runtime is multi-threaded `tokio` (work-stealing) so a slow RADIUS
+  server can't head-of-line block; I/O workers stay single-threaded
+  per-core.
+
+Deployments on dedicated hardware will commonly want `-t $(nproc)` minus
+whatever the operator wants to leave for the kernel softirq / NAPI cores,
+plus an `--auth-threads` override if RADIUS latency is unusual.
+
+### Secrets
+
+Never passed on the command line (visible in `ps`, leaks to shell
+history). Env vars only:
+
+| Variable                          | Purpose                                  |
+|-----------------------------------|------------------------------------------|
+| `SSTP_RADIUS_SECRET`              | Shared secret for `--radius` servers     |
+| `SSTP_RADIUS_ACCT_SECRET`         | Shared secret for `--acct` servers (defaults to `SSTP_RADIUS_SECRET`) |
+| `SSTP_TLS_KEY_PASSWORD`           | Optional passphrase for the TLS key      |
+| `SSTP_RADSEC_CLIENT_KEY_PASSWORD` | Optional, only with `radsec` feature     |
+
+`dotenvy::dotenv().ok()` runs once at startup before flag parsing so a
+developer's `.env` populates the environment. In production the `.env` is
+absent and the loader is a no-op. Secrets are zeroized after use where the
+lifetime permits (the RADIUS secret stays resident — it's used per
+request).
+
+## Constraints and conventions
+
+- **MSRV: Rust 1.83** (matches `radius-tokio`; needed for return-position
+  `impl Trait` in traits and `async fn` in traits without `async-trait`).
+- **Edition 2024.**
+- **CLI parsing:** [`getopt-iter`](https://github.com/ogital-net/getopt-iter)
+  (BSD-2-Clause, same org, zero dependencies). POSIX-style short options +
+  Solaris-style long options embedded in the optstring
+  (`"h(help)v+(verbose)..."`). No `clap`, no `structopt` — they pull a derive
+  macro and a tree of dependencies for a handful of flags. `argv[0]`-driven
+  program-name handling and `remaining()` for positional args cover what a
+  daemon needs.
+- **No config files.** All knobs are CLI flags; all secrets are env vars
+  (see Configuration). `dotenvy` is loaded at startup for dev.
+- **`unsafe`** is allowed in the `crypto` module's FFI wrappers, in the
+  `/dev/ppp` ioctl wrappers, and in hot-loop bounds-check-elision sites
+  (see Performance discipline below). Every block carries a `// SAFETY:`
+  comment naming the invariant. `unsafe` outside those three categories
+  needs explicit justification.
+- **No `async-trait`.** Use native `async fn` in traits.
+- **No `anyhow` / `eyre` in library-style modules.** Concrete error enums
+  with `thiserror` are fine; the binary entry point may use a broader error
+  type.
+- **License: BSD-2-Clause**, matching `radius-tokio` and `getopt-iter`.
+
+## Error handling
+
+Error handling is deliberately spartan. The server is a packet forwarder;
+threading `Result` through every internal call to model conditions that
+*cannot happen* is overhead with no payoff. Two rules cover almost
+everything:
+
+1. **`Result` is for input validation at trust boundaries.** External
+   inputs — wire-format SSTP frames, PPP options, RADIUS replies, CLI
+   flags, env vars, file contents at startup — get parsed into typed
+   internal forms and return `Result<_, ConcreteError>` on the way in.
+   Once a value is in its validated internal form, downstream code
+   consumes it infallibly.
+2. **`assert!` / `debug_assert!` for invariants the implementation
+   guarantees.** A library function returning a `Result` whose error
+   variant *cannot occur* given how we call it gets asserted, not
+   propagated. Example: `aws_lc_sys::RAND_bytes` returns `c_int`; per AWS-LC
+   it only returns 0 on initialization failure of the global RNG, which
+   for a long-running daemon either succeeded at startup or the process is
+   already dead. Wrap it as:
+
+   ```rust
+   // SAFETY: out_ptr/len describe a valid &mut [u8].
+   let rc = unsafe { RAND_bytes(out.as_mut_ptr(), out.len()) };
+   assert_eq!(rc, 1, "RAND_bytes failed; AWS-LC RNG unusable");
+   ```
+
+   Same pattern for `EVP_DigestInit_ex`, `HMAC_Init_ex`, `SSL_CTX_new`
+   on fixed methods, etc. — invariants we control, not user input.
+
+Other rules that fall out of (1) and (2):
+
+- **`unwrap()` / `expect()` are fine** when the operand is provably
+  `Some`/`Ok`. Prefer `expect("explanation of why this is infallible")` so
+  a future panic message names the broken invariant.
+- **`debug_assert!` for hot-path invariants.** Anything checked per packet
+  or per PPP option lives behind `debug_assert!` so release builds carry
+  no overhead. Use `assert!` for once-per-session checks where the
+  assertion cost is negligible and a panic is preferable to silent
+  corruption (e.g. crypto length invariants).
+- **No `?` chains for "can't happen" branches.** Don't sprinkle
+  `.unwrap_or_else(|_| unreachable!())`; just assert and move on.
+- **Panics at session scope, not process scope.** A per-session task
+  panicking unwinds and tears down *that* session. The accept loop
+  catches the join handle, increments `sstp_session_panics`, and
+  continues. Process-wide invariants (RNG, crypto context init, TLS
+  cert load) panic up to `main` and abort — there is no recovery.
+- **Logging is the troubleshooting surface, not return values.** The
+  authentication path in particular is logged generously at `info` and
+  `debug` because RADIUS interop is where deployments break:
+  - `info`: auth start (user, method, peer), auth result (accept /
+    reject + reason if known), MPPE keys present? (boolean, not the
+    keys themselves).
+  - `debug`: each RADIUS request/response with attribute *names* (never
+    secrets — `User-Password`, `MS-MPPE-*`, `Tunnel-Password` are
+    redacted to `<len=N>`), retry/timeout events, EAP method
+    negotiation, fragment reassembly progress.
+  - `warn`: protocol violations from the client/RADIUS that we
+    tolerate (unexpected attributes, malformed but non-fatal options).
+  - `error`: only for things that abort the session.
+
+  Outside the auth path, log volume is lower by an order of magnitude;
+  the data path logs nothing per packet at any level.
+
+## Observability
+
+This is a daemon, not a library, so observability is built in unconditionally
+rather than hidden behind cargo features. There's no exporter to choose at
+compile time and no consumer to keep API-compatible; the operator's
+interface is a Unix control socket and structured logs.
+
+### Counters and gauges
+
+- **`metrics` crate facade**, always compiled in. Recorder is installed at
+  startup and feeds an in-process registry — no Prometheus HTTP endpoint,
+  no statsd UDP socket, no exporter dependency tree. Operators scrape via
+  the control socket (below).
+- **No allocation on the data path.** Counter keys are `&'static str`;
+  labels are pre-interned or `&'static`. Histograms are bucketed up-front
+  so recording is `O(log buckets)` with no allocation.
+- **Per-packet counters live in the kernel.** `sstp_bytes_{in,out}` are
+  incremented per kernel-PPP write batch, not per packet; for
+  packet-granular accounting use `ip -s link show pppN`. The server does
+  not duplicate what the kernel already records for free.
+- **Fixed event vocabulary**, prefixed `sstp_` (mirrors `radius_tokio_*` /
+  `radius_tokio_eap_*` so a single scraper sees a consistent namespace
+  across both crates). First-pass set:
+  - `sstp_connections_accepted`, `sstp_connections_active` (gauge),
+    `sstp_handshake_failures{reason=...}` (TLS, SSTP negotiation, PPP).
+  - `sstp_auth_duration_seconds` (histogram), `sstp_auth_outcome{result=...}`.
+  - `sstp_session_duration_seconds`, `sstp_session_teardown{reason=...}`.
+  - `sstp_bytes_in` / `sstp_bytes_out` (per-batch, see above).
+  - `sstp_crypto_binding_failures` (should always read zero in production).
+
+### Control socket
+
+HAProxy-style Unix-domain stats/admin socket, off the data plane, served
+from a dedicated task on the auth runtime (never an I/O worker). Default
+path `/run/sstp-server.sock`; overridable via `--control-socket <path>`,
+disable with `--no-control-socket`.
+
+- Line-oriented text protocol, one request → one response, designed to be
+  driven by `socat`, `nc -U`, or a shell loop. No framing, no auth (Unix
+  permissions on the socket file are the access control — `0660` by
+  default, group-owned by the process group).
+- Initial command set:
+  - `show info` — version, uptime, worker count, active sessions.
+  - `show stat` — all counters/gauges/histograms, one metric per line,
+    pre-rendered strings so emission costs nothing on the hot path.
+  - `show sess` — one line per active session: peer addr, username,
+    assigned IP, bytes, duration, current PPP state.
+  - `show sess <id>` — detailed dump for a single session.
+  - `disable session <id>` — graceful teardown (PPP LCP Terminate-Request
+    → SSTP Call-Disconnect).
+  - `shutdown` — graceful drain: stop accepting, let active sessions
+    finish, then exit.
+- Cross-worker queries (`show sess`, `disable session`) fan out via the
+  same bounded MPSC channels used for CoA disconnect; no shared mutable
+  state.
+- No HTTP, no JSON, no Prometheus exposition format in-tree. If an
+  operator needs Prometheus they front the control socket with a tiny
+  scraper sidecar — that's a 30-line script, not a build-time choice we
+  should make for everyone.
+
+### Logging
+
+- **`tracing` is always compiled in**, with the standard `tracing` +
+  `tracing-subscriber` + `tracing-appender` stack.
+- **Non-blocking writer.** `tracing_appender::non_blocking` wraps the
+  output sink (stderr by default) so a slow log consumer can never stall
+  an I/O worker. The returned `WorkerGuard` is held in `main` for the
+  lifetime of the process; on shutdown it flushes the buffer before
+  return.
+- **Bounded drop on backpressure.** The non-blocking appender's queue is
+  sized at startup (default 8192 lines); when full, lines are dropped and
+  `sstp_log_lines_dropped` is incremented. Dropping is the right answer
+  for a packet-forwarding daemon — blocking the read path on a journal
+  hiccup is worse than losing a debug line.
+- **Span entry/exit on the control path only.** No spans on the
+  steady-state packet loop. Even at `-vvv` (trace), per-data-packet events
+  are disallowed — that's an eBPF / `tcpdump` job.
+- **Output format:** human-readable to a TTY (`tracing_subscriber::fmt`
+  with ANSI when `isatty(stderr)`), `json` when not a TTY (so systemd /
+  journald / Loki get structured fields without a CLI flag). Override via
+  `--log-format {text,json,auto}`.
+- **Destination:** stderr by default. `--log-file <path>` switches to a
+  file (still wrapped in the non-blocking appender; no log rotation
+  in-process — that's `logrotate` / `journald` territory).
+
+## Performance discipline
+
+Performance is the primary axis. A few principles that override "idiomatic
+Rust" defaults where they conflict:
+
+- **`unsafe` for elided bounds checks is allowed**, but only when *both*
+  conditions hold:
+  1. We can guarantee the invariant from the surrounding code
+     (`debug_assert!` it on the line above so a debug build catches
+     violations).
+  2. The compiler demonstrably can *not* elide the check on its own —
+     verified by reading `cargo asm` / `cargo rustc -- --emit=asm` or
+     `perf annotate`, not by hunch.
+
+  `get_unchecked`, `get_unchecked_mut`, `unwrap_unchecked`,
+  `slice::from_raw_parts`, etc. are tools, not crimes. Confined to hot
+  loops in the SSTP demux path, PPP HDLC framing, and crypto primitive
+  inner loops. Each call carries a `// SAFETY:` comment naming the
+  invariant.
+
+- **Target modern x86_64 and aarch64.** Reach for `std::arch` SSE/AVX2 /
+  NEON intrinsics when an inner loop benefits — HDLC byte-stuffing
+  scanning, PPP option scanning, CRC, constant-time compares all have
+  obvious SIMD wins. Wrap intrinsics behind a small dispatch
+  (`#[target_feature]` on a private helper, scalar fallback for
+  cross-compile / older CPUs) so the binary still runs on baseline
+  hardware while the fast path is used everywhere modern.
+  - x86_64 baseline target: **x86-64-v3** (Haswell / AVX2 / BMI2).
+    Encoded via `RUSTFLAGS="-C target-cpu=x86-64-v3"` in the release
+    profile.
+  - aarch64 baseline: **ARMv8.2-A + NEON** (Graviton 2, Ampere Altra,
+    Apple Silicon, modern phone-class). `-C target-cpu=neoverse-n1` for
+    the canonical cloud SKU.
+  - Runtime CPU dispatch only where the baseline isn't enough (e.g.
+    AES-NI / SHA-NI presence is checked once at startup; the result is
+    a `static AtomicBool` so the dispatch is branch-predictor-friendly).
+
+- **Allocation discipline.** No allocation on the steady-state packet
+  path. Per-connection state is allocated once at session accept and
+  reused for the connection's lifetime. Bytes flow through `BytesMut` /
+  `Bytes` so demuxed PPP frames are zero-copy views, not owned vectors.
+  Confirm with `dhat` or `heaptrack` on the bench harness; a non-zero
+  per-packet allocation count is a regression.
+
+- **`#[inline]` is data-driven.** Don't sprinkle it. Add it only where a
+  benchmark (or `perf` profile) shows the call overhead matters. The
+  default cross-crate inliner does the right thing 95% of the time;
+  `#[inline(always)]` is a last resort for things like CRC step
+  functions and HMAC inner-block routines.
+
+- **Branch hints sparingly.** `std::hint::likely` / `unlikely` (when
+  stabilized) or `cold` attributes on error paths only. Profile-guided
+  optimization beats hand-placed hints; if PGO is on the table later,
+  most hand hints come back out.
+
+## Repository layout
+
+Current state is a `cargo new` skeleton. Target layout as modules land:
+
+```
+src/
+  main.rs             # binary entry, runtime construction
+  cli.rs              # getopt-iter flag parsing, env-var loading
+  crypto/             # aws-lc-sys wrappers (TLS, HMAC, hashes, RNG)
+  sstp/               # SSTP framing, control messages, state machine
+  ppp/                # in-process PPP control plane (LCP, auth, IPCP/IPV6CP)
+  kppp/               # /dev/ppp ioctl wrappers, kernel PPP unit lifecycle
+  auth/               # PPP-auth <-> RADIUS bridge (radius-tokio client)
+  session/            # per-connection state, lifecycle, shutdown
+  control/            # Unix control socket, stats/admin command dispatch
+  net/                # SO_REUSEPORT listener, per-core LocalSet plumbing
+MS-SSTP-spec.pdf      # upstream spec (do not edit)
+MS-SSTP-spec.md       # markdown render of the spec, regenerated from PDF
+```
+
+## Working with the spec
+
+The authoritative reference is [MS-SSTP-spec.md](MS-SSTP-spec.md) (rendered
+from [MS-SSTP-spec.pdf](MS-SSTP-spec.pdf) with `pymupdf4llm`). When citing
+the spec in code or commit messages, reference section numbers (e.g.
+"§2.2.7 Crypto Binding Attribute") so the citation survives spec revisions.
+Regenerate the markdown after replacing the PDF:
+
+```bash
+/tmp/pdfvenv/bin/python -c "import pymupdf4llm; open('MS-SSTP-spec.md','w').write(pymupdf4llm.to_markdown('MS-SSTP-spec.pdf'))"
+```
+
+## Build checklist
+
+Ordered roughly by dependency. Each milestone should land as a coherent
+PR with tests where the surface allows. Check items off as they merge.
+
+### M0 — Project scaffolding
+- [ ] `Cargo.toml` metadata: edition 2024, `rust-version = "1.83"`,
+      BSD-2-Clause, `repository`, `description`.
+- [ ] `clippy.toml` + `deny.toml` mirroring `radius-tokio` posture
+      (warn on `unsafe_op_in_unsafe_fn`, deny on unauthorized licences).
+- [ ] CI workflow: `cargo fmt --check`, `cargo clippy -- -D warnings`,
+      `cargo test`, `cargo deny check`, Linux-only matrix.
+- [ ] `cli.rs` skeleton: `getopt-iter` flag parsing matching the
+      Configuration table; `--help`/`--version` work; `dotenvy::dotenv().ok()`.
+- [ ] `main.rs` boots `tokio` runtime(s), installs the `tracing` subscriber
+      with the non-blocking appender, holds the `WorkerGuard`, exits clean
+      on SIGINT/SIGTERM.
+
+### M1 — Crypto module
+- [ ] `crypto/ffi.rs`: newtypes around `aws-lc-sys` handles (`EVP_MD_CTX`,
+      `HMAC_CTX`, `SSL`, `SSL_CTX`, `BIO`, …) with correct `Drop` impls.
+- [ ] Hash + HMAC primitives (SHA-1, SHA-256) used by SSTP and PPP-auth.
+- [ ] RNG wrapper (`RAND_bytes`).
+- [ ] TLS server: `SSL_CTX` builder loading cert chain + key from PEM,
+      `TlsAcceptor`/`TlsStream` surface usable from `tokio`.
+- [ ] **TLS exporter** (`SSL_export_keying_material`) — feeds the SSTP
+      Crypto Binding CMK derivation ([MS-SSTP] §3.2.5.2).
+- [ ] Unit tests + AddressSanitizer job covering every `unsafe` block.
+
+### M2 — SSTP framing & state machine
+- [ ] Packet codec: encrypted-data and control packet headers ([MS-SSTP]
+      §2.2.1–2.2.2), zero-copy parse from a `BytesMut`.
+- [ ] Attribute encode/decode: `Encapsulated-Protocol-Id`,
+      `Status-Info`, `Crypto-Binding`, `Crypto-Binding-Req`
+      (§2.2.4–2.2.7).
+- [ ] Control message types: `Call-Connect-Request`, `-Ack`, `-Nak`,
+      `Call-Connected`, `Call-Abort`, `Call-Disconnect`,
+      `Echo-Request`/`-Response` (§2.2.9–2.2.14).
+- [ ] Server state machine (§3.2): `Call_Disconnected` →
+      `Server_Call_Connected_Pending` → `Server_Call_Connected`, with
+      hello timer and abort handling.
+- [ ] Crypto Binding verification: HMAC over the Call-Connected packet
+      using CMK derived from HLAK (§3.2.5.2.3). Constant-time compare.
+- [ ] Conformance tests against captured Windows client traces (kept
+      under `tests/fixtures/`).
+
+### M3 — In-process PPP control plane
+- [ ] HDLC-like framing (no async-map negotiation; SSTP carries PPP raw).
+- [ ] LCP: Configure-Request/-Ack/-Nak/-Reject, Terminate-Request,
+      Echo-Request/-Reply, Code-Reject.
+- [ ] Auth phase dispatch: PAP, CHAP, MS-CHAPv2, EAP (just the
+      fragment/reassembly layer; methods live in RADIUS).
+- [ ] IPCP: Configure exchange for `Framed-IP-Address` /
+      `MS-Primary-DNS-Server` etc. from the auth result.
+- [ ] (Deferred) IPV6CP — see Open questions.
+
+### M4 — RADIUS bridge
+- [ ] `radius-tokio` client wired into the auth runtime with
+      `dict-rfc` + `dict-microsoft` enabled.
+- [ ] PAP → Access-Request translation; Access-Accept → session bring-up.
+- [ ] MS-CHAPv2: `MS-CHAP-Challenge` + `MS-CHAP2-Response` →
+      Access-Request; harvest `MS-MPPE-Send-Key`/`-Recv-Key` (RFC 3079)
+      from Access-Accept for the Crypto Binding HLAK.
+- [ ] EAP via `radius-tokio-eap`: `peap`, `eap-mschapv2`, `eap-tls`,
+      `eap-ttls` features; EAP-Message fragmentation/reassembly across
+      RADIUS hops.
+- [ ] Accounting: Start / Interim-Update / Stop with byte counters
+      pulled from the kernel PPP unit, not the userspace path.
+- [ ] CoA / Disconnect-Request receiver → session teardown via MPSC
+      channel to the owning I/O worker.
+
+### M5 — Kernel PPP data plane
+- [ ] `/dev/ppp` ioctl wrappers (`PPPIOCNEWUNIT`, `PPPIOCATTCHAN`,
+      `PPPIOCGCHAN`, `PPPIOCSMRU`, `PPPIOCSFLAGS`) with `// SAFETY:`
+      comments on every `unsafe` block.
+- [ ] Channel fd: write user-plane PPP frames demuxed from SSTP into the
+      kernel channel; control frames stay in userspace.
+- [ ] Unit fd: create `pppN` netdev, push `Framed-IP-Address` and routes
+      via netlink (probably `rtnetlink` crate; weigh against direct
+      `socket(AF_NETLINK, …)` calls).
+- [ ] Teardown path: unit deletion on session close, fd cleanup on
+      panic/SIGTERM.
+
+### M6 — Session glue & lifecycle
+- [ ] Per-connection task on the accepting I/O worker that owns the
+      TCP socket, TLS state, SSTP state machine, and PPP control plane.
+- [ ] Bounded MPSC for cross-worker control: shutdown, CoA disconnect,
+      `disable session` from the control socket.
+- [ ] Graceful drain: stop accepting on SIGTERM / `shutdown` command,
+      send PPP LCP Terminate-Request, wait up to N seconds, then exit.
+
+### M7 — Control socket
+- [ ] Unix socket bind at `--control-socket` path, `0660` perms.
+- [ ] Line-oriented dispatcher running on the auth runtime.
+- [ ] Commands: `show info`, `show stat`, `show sess`, `show sess <id>`,
+      `disable session <id>`, `shutdown`.
+- [ ] Pre-rendered metric snapshot to keep `show stat` allocation-free
+      on the registry side.
+
+### M8 — Benchmarks & hardening
+- [ ] `benches/` with a synthetic SSTP client to measure connection-setup
+      rate (control plane) and steady-state throughput (data plane via
+      kernel PPP).
+- [ ] Fuzz targets for SSTP framing and PPP option parsing (`cargo-fuzz`,
+      mirroring `radius-tokio`'s setup).
+- [ ] Long-run soak test (24h) with `valgrind`/`heaptrack` on a debug
+      build to confirm zero growth at steady state.
+- [ ] systemd unit file with appropriate `CapabilityBoundingSet`
+      (`CAP_NET_ADMIN`, `CAP_NET_BIND_SERVICE`), `NoNewPrivileges`,
+      `ProtectSystem=strict`, etc.
+
+### M9 — Release prep
+- [ ] `README.md` for end users (separate from this document).
+- [ ] `CHANGELOG.md` started.
+- [ ] Interop matrix documented: Windows 10/11 built-in client,
+      Windows Server RRAS, at least one third-party client (SoftEther,
+      sstp-client).
+- [ ] v0.1.0 tag.
+
+## Open questions
+
+- IPv6CP support timing relative to IPv4 IPCP.
+- Whether to expose `--threads`/`--auth-threads` as percentages of
+  `available_parallelism()` in addition to absolute counts.
