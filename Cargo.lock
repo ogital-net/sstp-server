@@ -239,6 +239,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast-md5"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d5eae88ed9322ba43db8f1ce3214050d9dea7730f44b2de0769604526b8d584"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -633,6 +639,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
+name = "radius-tokio"
+version = "0.1.0"
+source = "git+https://github.com/ogital-net/radius-tokio?branch=client#25a9b9996c6899c5dd7d8d3814cd9cbdb308306c"
+dependencies = [
+ "aws-lc-sys",
+ "fast-md5",
+ "libc",
+ "radius-tokio-dict",
+ "socket2",
+ "tokio",
+]
+
+[[package]]
+name = "radius-tokio-dict"
+version = "0.1.0"
+source = "git+https://github.com/ogital-net/radius-tokio?branch=client#25a9b9996c6899c5dd7d8d3814cd9cbdb308306c"
+dependencies = [
+ "radius-tokio-dict-codegen",
+]
+
+[[package]]
+name = "radius-tokio-dict-codegen"
+version = "0.1.0"
+source = "git+https://github.com/ogital-net/radius-tokio?branch=client#25a9b9996c6899c5dd7d8d3814cd9cbdb308306c"
+
+[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -762,7 +794,11 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-sys",
  "dotenvy",
+ "fast-md5",
  "getopt-iter",
+ "libc",
+ "radius-tokio",
+ "socket2",
  "thiserror",
  "tokio",
  "tracing",

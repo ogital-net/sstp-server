@@ -11,8 +11,12 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+mod auth;
 mod cli;
 mod crypto;
+mod kppp;
+mod net;
+mod ppp;
 mod sstp;
 
 use std::io::{self, IsTerminal, Write};
@@ -80,14 +84,16 @@ fn run(config: &Config) -> ExitCode {
         .expect("build auth runtime");
 
     // I/O workers: one current_thread runtime per worker thread, each with
-    // its own LocalSet. M0 only sleeps until shutdown; the SO_REUSEPORT
-    // listener bind lands in a later milestone.
+    // its own LocalSet. Every worker binds an SO_REUSEPORT listener on the
+    // configured address; the kernel hashes incoming SYNs across them so
+    // the worker that accepts a connection also owns it for life.
     let mut workers = Vec::with_capacity(config.io_threads.get());
     for id in 0..config.io_threads.get() {
         let rx = shutdown_tx.subscribe();
+        let listen_addr = config.listen;
         let handle = thread::Builder::new()
             .name(format!("sstp-io-{id}"))
-            .spawn(move || io_worker_main(id, rx))
+            .spawn(move || io_worker_main(id, listen_addr, rx))
             .expect("spawn I/O worker");
         workers.push(handle);
     }
@@ -108,7 +114,7 @@ fn run(config: &Config) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn io_worker_main(id: usize, mut shutdown: broadcast::Receiver<()>) {
+fn io_worker_main(id: usize, listen: std::net::SocketAddr, mut shutdown: broadcast::Receiver<()>) {
     let rt: Runtime = Builder::new_current_thread()
         .enable_all()
         .thread_name(format!("sstp-io-{id}"))
@@ -116,10 +122,47 @@ fn io_worker_main(id: usize, mut shutdown: broadcast::Receiver<()>) {
         .expect("build I/O worker runtime");
     let local = LocalSet::new();
     local.block_on(&rt, async move {
-        // Future milestones: bind a SO_REUSEPORT listener here and spawn
-        // per-connection !Send tasks on this LocalSet.
-        let _ = shutdown.recv().await;
+        let listener = match net::bind_reuseport(listen) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(worker = id, error = %e, "failed to bind listener");
+                return;
+            }
+        };
+        info!(worker = id, listen = %listen, "listener ready");
+        accept_loop(id, listener, &mut shutdown).await;
     });
+}
+
+async fn accept_loop(
+    worker_id: usize,
+    listener: tokio::net::TcpListener,
+    shutdown: &mut broadcast::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.recv() => {
+                info!(worker = worker_id, "accept loop draining");
+                return;
+            }
+            res = listener.accept() => match res {
+                Ok((stream, peer)) => {
+                    // M6 will spawn a per-connection !Send task here.
+                    // For now: log, drop the stream so the peer sees an
+                    // immediate FIN — useful as a smoke test of the
+                    // listener wiring without pulling in TLS/SSTP yet.
+                    info!(worker = worker_id, %peer, "accepted connection (no handler yet)");
+                    drop(stream);
+                }
+                Err(e) => {
+                    // Per-connection errors (EMFILE, ECONNABORTED) are
+                    // transient; log and keep accepting.
+                    warn!(worker = worker_id, error = %e, "accept failed");
+                }
+            }
+        }
+    }
 }
 
 async fn wait_for_shutdown() {

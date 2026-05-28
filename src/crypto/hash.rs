@@ -1,15 +1,65 @@
-//! SHA-1 and SHA-256 using stack-allocated `SHA_CTX` / `SHA256_CTX`.
+//! MD5 (via `fast-md5`), SHA-1 and SHA-256 (via `aws-lc-sys`).
 //!
-//! No heap allocation per digest; the context lives entirely on the stack.
-//! Uses the lower-level `SHA1_Init` / `SHA256_Init` family directly rather
-//! than routing through the higher-level `EVP_MD_CTX` machinery.
+//! MD5 is cryptographically broken and is only used here for the RADIUS
+//! wire format (RFC 2865 authenticators, User-Password obfuscation). We
+//! delegate it to the `fast-md5` crate (hand-written `aarch64`/`x86_64`
+//! assembly, portable Rust fallback) which avoids FIPS-module overhead
+//! for a non-security primitive while still being fast.
+//!
+//! SHA-1 / SHA-256 remain on `aws-lc-sys` (stack-allocated, no EVP
+//! overhead, FIPS-validatable).
 
 use std::mem::MaybeUninit;
 
 use aws_lc_sys as aws;
 
+pub const MD5_OUTPUT_LEN: usize = fast_md5::DIGEST_LENGTH;
 pub const SHA1_OUTPUT_LEN: usize = aws::SHA_DIGEST_LENGTH as usize;
 pub const SHA256_OUTPUT_LEN: usize = aws::SHA256_DIGEST_LENGTH as usize;
+
+// ---------------------------------------------------------------------------
+// MD5 — fast-md5 backend
+// ---------------------------------------------------------------------------
+
+/// Incremental MD5 context.
+///
+/// Call [`update`](Self::update) one or more times, then
+/// [`finish`](Self::finish). MD5 is only used for the RADIUS wire
+/// format; no security properties are assumed.
+pub struct Md5 {
+    inner: fast_md5::Md5,
+}
+
+impl Md5 {
+    pub fn new() -> Self {
+        Self {
+            inner: fast_md5::Md5::new(),
+        }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    pub fn finish(self) -> [u8; MD5_OUTPUT_LEN] {
+        self.inner.finalize()
+    }
+
+    /// One-shot: hash `data` and return the 16-byte digest.
+    pub fn digest(data: &[u8]) -> [u8; MD5_OUTPUT_LEN] {
+        fast_md5::digest(data)
+    }
+}
+
+impl Default for Md5 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SHA-1 / SHA-256 — aws-lc-sys backend
+// ---------------------------------------------------------------------------
 
 macro_rules! impl_hash {
     (
@@ -61,9 +111,6 @@ macro_rules! impl_hash {
             }
 
             /// One-shot: hash `data` and return the digest.
-            ///
-            /// Uses the single-call FFI function directly, avoiding the
-            /// Init → Update → Final round-trip across the FFI boundary.
             pub fn digest(data: &[u8]) -> [u8; $output_len] {
                 let mut out = [0u8; $output_len];
                 // SAFETY: data is a readable slice; out is exactly the digest length.
@@ -104,8 +151,16 @@ impl_hash!(
 mod tests {
     use super::*;
 
-    // RFC 3174 test vector.
+    // RFC 1321 test vector — confirms the fast-md5 backend is wired up.
     #[test]
+    fn md5_abc() {
+        assert_eq!(
+            Md5::digest(b"abc"),
+            [0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72],
+        );
+    }
+
+    // RFC 3174 test vector.    #[test]
     fn sha1_abc() {
         let out = Sha1::digest(b"abc");
         let expected: [u8; 20] = [

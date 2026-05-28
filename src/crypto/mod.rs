@@ -13,7 +13,7 @@ pub mod hmac;
 pub mod rand;
 pub mod tls;
 
-pub use hash::{Sha1, Sha256};
+pub use hash::{Md5, Sha1, Sha256};
 pub use hmac::{HmacSha1, HmacSha256};
 pub use rand::fill_bytes;
 pub use tls::{SslContext, TlsError, TlsStream};

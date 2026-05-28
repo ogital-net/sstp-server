@@ -12,7 +12,11 @@ categories = ["network-programming"]
 [dependencies]
 aws-lc-sys = { version = "0.41", features = ["ssl"] }
 dotenvy = "0.15"
+fast-md5 = "1"
 getopt-iter = "1"
+libc = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
+radius-tokio = { git = "https://github.com/ogital-net/radius-tokio", branch = "client", default-features = false, features = ["dict-rfc", "dict-microsoft", "client", "fast-md5"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
 tracing = "0.1"

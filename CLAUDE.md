@@ -68,6 +68,32 @@ shelling out to `pppd`. `pppd` spawns a process per session and routes every
 data packet through a pty, which caps throughput and inflates memory per
 session by orders of magnitude.
 
+**v0.1 reality.** Mainline Linux has no generic userspace-channel API on
+`/dev/ppp` — channels are registered only by in-kernel transport drivers
+(`pppoe`, `pppol2tp`, `pptp`). Without our own kmod, the per-packet path
+necessarily runs through userspace: the `pppN` unit fd is used
+bidirectionally (read = TX, write = RX), the same model `pppd` uses over
+a pty. We deliberately keep `pppN` (rather than a plain TUN device)
+because the migration to a future kmod becomes a swap of the data-path
+module rather than a redesign — the PPP unit lifecycle, NP-mode filtering,
+header compression negotiation, and the `ip -s link show pppN` accounting
+all carry over unchanged. The TUN alternative would save one kernel
+module dependency but add a per-packet PPP-header strip/add in userspace
+and force us to re-implement NP filtering by hand, for no win we'd
+recoup later.
+
+**Future kmod ABI.** The intended kernel-side interface for v0.x is
+sketched in [kernel-abi/sstp.h](kernel-abi/sstp.h) as a draft UAPI
+header. Userspace will hand the kernel a TLS-equipped TCP fd plus the
+negotiated PPP unit via an `SSTP_IOC_ATTACH` ioctl on `/dev/sstp`; the
+kernel then registers an SSTP PPP channel against that unit and runs
+the steady-state data path (kTLS decrypt → SSTP demux → `ppp_input`)
+without userspace involvement. The header is non-normative until the
+module actually exists, but it pins down the shape so the userspace
+side we ship in v0.1 can be written with that handoff in mind. See the
+header for open questions (kTLS vs in-kmod TLS, channel-vs-unit
+ownership split, etc.).
+
 ### Crypto
 
 - All cryptographic operations live in a single in-tree `crypto` module that
@@ -487,6 +513,8 @@ src/
   session/            # per-connection state, lifecycle, shutdown
   control/            # Unix control socket, stats/admin command dispatch
   net/                # SO_REUSEPORT listener, per-core LocalSet plumbing
+kernel-abi/
+  sstp.h              # DRAFT UAPI for the future SSTP kmod (see Data plane)
 MS-SSTP-spec.pdf      # upstream spec (do not edit)
 MS-SSTP-spec.md       # markdown render of the spec, regenerated from PDF
 ```
@@ -553,41 +581,71 @@ PR with tests where the surface allows. Check items off as they merge.
       under `tests/fixtures/`).
 
 ### M3 — In-process PPP control plane
-- [ ] HDLC-like framing (no async-map negotiation; SSTP carries PPP raw).
-- [ ] LCP: Configure-Request/-Ack/-Nak/-Reject, Terminate-Request,
+- [x] HDLC-like framing (no async-map negotiation; SSTP carries PPP raw).
+- [x] LCP: Configure-Request/-Ack/-Nak/-Reject, Terminate-Request,
       Echo-Request/-Reply, Code-Reject.
-- [ ] Auth phase dispatch: PAP, CHAP, MS-CHAPv2, EAP (just the
+- [x] Auth phase dispatch: PAP, CHAP, MS-CHAPv2, EAP (just the
       fragment/reassembly layer; methods live in RADIUS).
-- [ ] IPCP: Configure exchange for `Framed-IP-Address` /
+- [x] IPCP: Configure exchange for `Framed-IP-Address` /
       `MS-Primary-DNS-Server` etc. from the auth result.
 - [ ] (Deferred) IPV6CP — see Open questions.
 
 ### M4 — RADIUS bridge
-- [ ] `radius-tokio` client wired into the auth runtime with
+- [x] `radius-tokio` client wired into the auth runtime with
       `dict-rfc` + `dict-microsoft` enabled.
-- [ ] PAP → Access-Request translation; Access-Accept → session bring-up.
-- [ ] MS-CHAPv2: `MS-CHAP-Challenge` + `MS-CHAP2-Response` →
+- [x] PAP → Access-Request translation; Access-Accept → session bring-up.
+- [x] MS-CHAPv2: `MS-CHAP-Challenge` + `MS-CHAP2-Response` →
       Access-Request; harvest `MS-MPPE-Send-Key`/`-Recv-Key` (RFC 3079)
       from Access-Accept for the Crypto Binding HLAK.
-- [ ] EAP via `radius-tokio-eap`: `peap`, `eap-mschapv2`, `eap-tls`,
-      `eap-ttls` features; EAP-Message fragmentation/reassembly across
-      RADIUS hops.
-- [ ] Accounting: Start / Interim-Update / Stop with byte counters
+- [x] EAP pass-through (no `radius-tokio-eap` dep): RADIUS-side
+      fragmentation via `radius_tokio::eap::{fragments,reassemble}`,
+      `State` echoed across Access-Challenge rounds, terminal
+      Accept/Reject projected the same as PAP/MS-CHAPv2. Method
+      internals (PEAP, EAP-TLS, EAP-TTLS, EAP-MSCHAPv2) live in the
+      RADIUS server — we just shuttle EAP-Message bytes between the
+      PPP peer and the authenticator.
+- [x] Accounting: Start / Interim-Update / Stop with byte counters
       pulled from the kernel PPP unit, not the userspace path.
-- [ ] CoA / Disconnect-Request receiver → session teardown via MPSC
+      Implemented in `src/auth/accounting.rs` as a tokio-UDP
+      `AcctClient` with `(peer, identifier)` correlation and
+      RFC 5080 retry semantics. Byte / packet counters are supplied
+      by the caller; M6 will sample them via `rtnetlink`
+      `IFLA_STATS64` against `pppN`.
+- [x] CoA / Disconnect-Request receiver → session teardown via MPSC
       channel to the owning I/O worker.
+      v0.1: parser + responder live in `src/auth/coa.rs`
+      (`CoaListener` + `Handler` trait). The MPSC handoff to the
+      session map is M6 work — today the handler is a caller-supplied
+      closure that can return ACK/NAK with an RFC 3576 Error-Cause.
 
 ### M5 — Kernel PPP data plane
-- [ ] `/dev/ppp` ioctl wrappers (`PPPIOCNEWUNIT`, `PPPIOCATTCHAN`,
+- [x] `/dev/ppp` ioctl wrappers (`PPPIOCNEWUNIT`, `PPPIOCATTCHAN`,
       `PPPIOCGCHAN`, `PPPIOCSMRU`, `PPPIOCSFLAGS`) with `// SAFETY:`
-      comments on every `unsafe` block.
+      comments on every `unsafe` block. Const-fn `_IO`/`_IOR`/`_IOW`/
+      `_IOWR` ports pinned by a numerical compile-time test against
+      `<linux/ppp-ioctl.h>`.
 - [ ] Channel fd: write user-plane PPP frames demuxed from SSTP into the
       kernel channel; control frames stay in userspace.
-- [ ] Unit fd: create `pppN` netdev, push `Framed-IP-Address` and routes
-      via netlink (probably `rtnetlink` crate; weigh against direct
-      `socket(AF_NETLINK, …)` calls).
-- [ ] Teardown path: unit deletion on session close, fd cleanup on
+      **NOTE:** mainline Linux has no generic userspace-channel
+      interface — channels are registered by kernel transport drivers
+      (`pppoe`, `pppol2tp`, `pptp`). Without a custom kernel module,
+      the data path stays in userspace and uses the unit fd
+      bidirectionally (read = TX, write = RX), the same model `pppd`
+      uses over a pty. Per-packet zero-copy via the kernel would need
+      a new in-tree channel driver or eBPF; out of scope for v0.1.
+- [x] Unit fd: create `pppN` netdev, push `Framed-IP-Address` and routes
+      via netlink. Hand-rolled `NETLINK_ROUTE` client in
+      `src/kppp/netlink.rs` (no `rtnetlink` crate dependency — the
+      surface is three message types and the operations are off the
+      data path). Supports `RTM_NEWADDR` (P2P address pair), link
+      `IFF_UP`, and `IFLA_MTU`; `Framed-Route` (`RTM_NEWROUTE`)
+      deferred to when a deployment needs it.
+- [x] Teardown path: unit deletion on session close, fd cleanup on
       panic/SIGTERM.
+      `Unit::close()` is the explicit teardown call (debug-traced);
+      `Drop` traces and lets `OwnedFd` close the `/dev/ppp` fd,
+      which removes `pppN`. A panicking session task therefore
+      releases its netdev as it unwinds.
 
 ### M6 — Session glue & lifecycle
 - [ ] Per-connection task on the accepting I/O worker that owns the
