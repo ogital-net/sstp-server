@@ -13,6 +13,7 @@
 
 mod cli;
 mod crypto;
+mod sstp;
 
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;

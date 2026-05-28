@@ -32,7 +32,9 @@ macro_rules! impl_hash {
                 let rc = unsafe { $init(ctx.as_mut_ptr()) };
                 assert_eq!(rc, 1, concat!(stringify!($Name), "::new init failed"));
                 // SAFETY: $init returned 1, so ctx is fully initialised.
-                Self { ctx: unsafe { ctx.assume_init() } }
+                Self {
+                    ctx: unsafe { ctx.assume_init() },
+                }
             }
 
             pub fn update(&mut self, data: &[u8]) {
@@ -40,8 +42,13 @@ macro_rules! impl_hash {
                     return;
                 }
                 // SAFETY: ctx is initialised; data is a readable slice.
-                let rc =
-                    unsafe { $update(&mut self.ctx, data.as_ptr().cast::<std::ffi::c_void>(), data.len()) };
+                let rc = unsafe {
+                    $update(
+                        &mut self.ctx,
+                        data.as_ptr().cast::<std::ffi::c_void>(),
+                        data.len(),
+                    )
+                };
                 assert_eq!(rc, 1, concat!(stringify!($Name), "::update failed"));
             }
 

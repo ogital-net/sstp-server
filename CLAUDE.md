@@ -536,18 +536,18 @@ PR with tests where the surface allows. Check items off as they merge.
 - [x] Unit tests + AddressSanitizer job covering every `unsafe` block.
 
 ### M2 — SSTP framing & state machine
-- [ ] Packet codec: encrypted-data and control packet headers ([MS-SSTP]
+- [x] Packet codec: encrypted-data and control packet headers ([MS-SSTP]
       §2.2.1–2.2.2), zero-copy parse from a `BytesMut`.
-- [ ] Attribute encode/decode: `Encapsulated-Protocol-Id`,
+- [x] Attribute encode/decode: `Encapsulated-Protocol-Id`,
       `Status-Info`, `Crypto-Binding`, `Crypto-Binding-Req`
       (§2.2.4–2.2.7).
-- [ ] Control message types: `Call-Connect-Request`, `-Ack`, `-Nak`,
+- [x] Control message types: `Call-Connect-Request`, `-Ack`, `-Nak`,
       `Call-Connected`, `Call-Abort`, `Call-Disconnect`,
       `Echo-Request`/`-Response` (§2.2.9–2.2.14).
-- [ ] Server state machine (§3.2): `Call_Disconnected` →
+- [x] Server state machine (§3.2): `Call_Disconnected` →
       `Server_Call_Connected_Pending` → `Server_Call_Connected`, with
       hello timer and abort handling.
-- [ ] Crypto Binding verification: HMAC over the Call-Connected packet
+- [x] Crypto Binding verification: HMAC over the Call-Connected packet
       using CMK derived from HLAK (§3.2.5.2.3). Constant-time compare.
 - [ ] Conformance tests against captured Windows client traces (kept
       under `tests/fixtures/`).

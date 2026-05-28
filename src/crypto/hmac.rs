@@ -34,7 +34,9 @@ macro_rules! impl_hmac {
                 let mut ctx = MaybeUninit::<aws::HMAC_CTX>::uninit();
                 unsafe { aws::HMAC_CTX_init(ctx.as_mut_ptr()) };
                 // SAFETY: HMAC_CTX_init completed, so ctx is initialised.
-                let mut s = Self { ctx: unsafe { ctx.assume_init() } };
+                let mut s = Self {
+                    ctx: unsafe { ctx.assume_init() },
+                };
                 // SAFETY: ctx is initialised; key is a readable slice (possibly
                 // empty); `$evp_md()` returns a static EVP_MD; engine is null.
                 let rc = unsafe {
@@ -46,7 +48,10 @@ macro_rules! impl_hmac {
                         std::ptr::null_mut(),
                     )
                 };
-                assert_eq!(rc, 1, concat!(stringify!($Name), "::new HMAC_Init_ex failed"));
+                assert_eq!(
+                    rc, 1,
+                    concat!(stringify!($Name), "::new HMAC_Init_ex failed")
+                );
                 s
             }
 
@@ -63,9 +68,7 @@ macro_rules! impl_hmac {
                 let mut out = [0u8; $output_len];
                 let mut out_len: u32 = 0;
                 // SAFETY: ctx is initialised; out is exactly the MAC size.
-                let rc = unsafe {
-                    aws::HMAC_Final(&mut self.ctx, out.as_mut_ptr(), &mut out_len)
-                };
+                let rc = unsafe { aws::HMAC_Final(&mut self.ctx, out.as_mut_ptr(), &mut out_len) };
                 assert_eq!(rc, 1, concat!(stringify!($Name), "::finish failed"));
                 debug_assert_eq!(out_len as usize, $output_len);
                 out
@@ -97,6 +100,38 @@ macro_rules! impl_hmac {
 
 impl_hmac!(HmacSha1, aws::EVP_sha1, SHA1_OUTPUT_LEN);
 impl_hmac!(HmacSha256, aws::EVP_sha256, SHA256_OUTPUT_LEN);
+
+/// IKEv2-style PRF+ ([RFC 4306] §2.13) using HMAC-SHA1, used by SSTP
+/// Crypto Binding CMK derivation ([MS-SSTP] §3.2.5.2.2). The
+/// per-iteration input is `T_{n-1} | seed | len_le | n`, where `len_le`
+/// is the requested output length as an unsigned 16-bit little-endian
+/// integer per the spec.
+///
+/// The CMK case only ever asks for 20 octets (one HMAC-SHA1 block), so
+/// the implementation is hard-coded to a single iteration.
+pub fn prf_plus_sha1_cmk(key: &[u8; 32], seed: &[u8]) -> [u8; SHA1_OUTPUT_LEN] {
+    const _: () = assert!(SHA1_OUTPUT_LEN <= u16::MAX as usize);
+    #[allow(clippy::cast_possible_truncation)]
+    let len_le = (SHA1_OUTPUT_LEN as u16).to_le_bytes();
+    let mut h = HmacSha1::new(key);
+    h.update(seed);
+    h.update(&len_le);
+    h.update(&[0x01]);
+    h.finish()
+}
+
+/// PRF+ using HMAC-SHA256 ([MS-SSTP] §3.2.5.2.4). CMK output length is
+/// 32 octets, which fits in one HMAC-SHA256 block.
+pub fn prf_plus_sha256_cmk(key: &[u8; 32], seed: &[u8]) -> [u8; SHA256_OUTPUT_LEN] {
+    const _: () = assert!(SHA256_OUTPUT_LEN <= u16::MAX as usize);
+    #[allow(clippy::cast_possible_truncation)]
+    let len_le = (SHA256_OUTPUT_LEN as u16).to_le_bytes();
+    let mut h = HmacSha256::new(key);
+    h.update(seed);
+    h.update(&len_le);
+    h.update(&[0x01]);
+    h.finish()
+}
 
 #[cfg(test)]
 mod tests {
