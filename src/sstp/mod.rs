@@ -14,6 +14,7 @@ pub mod attr;
 pub mod binding;
 pub mod frame;
 pub mod msg;
+pub mod preamble;
 pub mod state;
 
 pub use attr::{AttrIter, Attribute, AttributeId, CryptoBinding, CryptoBindingReq, StatusInfo};

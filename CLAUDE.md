@@ -673,6 +673,95 @@ PR with tests where the surface allows. Check items off as they merge.
       abandoning stuck tasks. The actual PPP `LCP Terminate-Request`
       lands when the session task drives the PPP FSM end-to-end.
 
+#### M6 MVP roadmap (first end-to-end PAP login)
+
+The pieces below are what stand between today's scaffold session
+task (TCP accept → peek-and-drop) and a Windows / `sstpc` client
+completing an unauthenticated PAP handshake against the server.
+Tracked here as a checklist rather than inlined into the M6 box
+because each is a self-contained PR-sized unit; the end-to-end
+integration test in `tests/e2e.rs` (`sstpc_pap_login`) graduates
+its assertions as each item lands.
+
+Ordered by dependency:
+
+- [x] **M6a — TLS terminate in the session task.** Replace the
+      placeholder `stream.peek()` with `crypto::tls::SslContext::accept`
+      against an `SslContext` constructed once at startup from the
+      `--cert` / `--key` flags and cloned per worker. Failure logs at
+      `info` with `sstp_handshake_failures{reason="tls"}` incremented;
+      session ends. The cert / key load belongs in `main::run` so a
+      bad PEM aborts startup rather than every connection.
+- [x] **M6b — SSTP HTTPS preamble (§3.2.4.1).** Read the HTTP/1.1
+      request line + headers from the TLS stream, validate
+      `SSTPCORRELATIONID` + `Content-Length: 18446744073709551615`,
+      send the canned `HTTP/1.1 200` response, then hand the rest of
+      the byte stream to the SSTP framing codec. Bounded read buffer
+      (4 KiB header cap, RFC 7230 §3.2.5 alignment); reject anything
+      else with `400 Bad Request` and `sstp_handshake_failures{
+      reason="http"}`.
+- [x] **M6c — Drive `sstp::StateMachine` from the session task.**
+      `drive_sstp` in [src/session.rs](src/session.rs) selects on
+      `(tls_read, control_rx, drain_rx, ssm_timers)`, feeds inbound
+      packets through `Packet::parse` + `parse_control` into the
+      state machine, and applies each `StepOut` via `apply_step`
+      (write `tx_buf[..send_len]`, arm at most one
+      `tokio::time::Sleep` per `Timer`, surface `NotifyHigher`,
+      honour `Terminate`). `Truncated` / `LengthMismatch` parse
+      errors are treated as "need more bytes" against a `Vec<u8>`
+      reassembly buffer; other parse errors abort the session. PPP
+      data bodies are still dropped — wiring lands in M6d.
+- [x] **M6d — Drive the PPP control plane.** New
+      [src/ppp/driver.rs](src/ppp/driver.rs) houses `LcpServer` and
+      `IpcpServer`, each wrapping `super::fsm::Fsm` with the
+      server-side option-negotiation policy ([RFC 1661] §6, [RFC 1332]
+      §3, [RFC 1877] §1). LCP advertises `Auth-Protocol = PAP` only
+      for v0.1; CHAP / MS-CHAPv2 / EAP plumbing exists in
+      `super::auth` but is not yet wired through the orchestrator.
+      The top-level `Ppp` driver orchestrates Establish → AuthPending
+      → AuthInFlight → Network → Dead, surfaces PAP credentials via
+      `PppEvent::NeedPapAuth { peer_id, password }` and accepts the
+      verdict back through `Ppp::on_auth_result(AuthVerdict)`.
+      Inbound PPP frames flow as `ProtocolId::Lcp` / `::Pap` /
+      `::Ipcp` SSTP data packets; outbound frames are encoded with
+      uncompressed Address/Control/Protocol prefixes ready to be
+      wrapped in an SSTP data packet. Wired into
+      [src/session.rs](src/session.rs) `drive_sstp`: the
+      `NotifyHigher::StartPpp` notification (emitted when SSTP sends
+      `Call-Connect-Ack`) instantiates `Ppp` and calls `Ppp::open`;
+      inbound `Packet::Data` payloads feed `Ppp::on_frame`; a second
+      `Pin<Box<Sleep>>` slot tracks the active PPP restart timer
+      (`TimerOwner::Lcp` or `::Ipcp`). PAP credentials are handed to
+      a `oneshot::Sender<AuthVerdict>` which v0.1 fulfils
+      in-process with a `Reject("auth backend not wired (M6e)")` —
+      M6e replaces the rejector with a `radius-tokio` round-trip
+      without changing the oneshot signature.
+- [ ] **M6e — RADIUS bridge integration.** `auth::client::authenticate_pap`
+      runs on the auth runtime; on Access-Accept the resulting
+      `AuthAccept` (with `Framed-IP-Address`, optional DNS / WINS,
+      MPPE keys if present) is sent back to the session task via a
+      `oneshot`. The session task then drives IPCP with those
+      addresses and emits SSTP `Call-Connected` (M6f).
+- [ ] **M6f — SSTP Crypto Binding `Call-Connected`.** Derive HLAK
+      from the TLS exporter (no MSK with PAP, so HLAK is the EKM
+      bytes per [MS-SSTP] §3.2.5.2.1.1); compute the
+      `Crypto-Binding` HMAC; build and send the `Call-Connected`
+      packet. State machine transitions to `Server_Call_Connected`.
+- [ ] **M6g — Kernel PPP unit bring-up.** Allocate a `pppN` unit via
+      `kppp::Unit::new`, push the negotiated MRU and IP addresses
+      through `kppp::netlink`. For v0.1 the userspace data path keeps
+      reading frames from TLS, demuxing, and writing PPP packets to
+      the unit fd (`pppd`-over-pty model). Tear down the unit on
+      session close.
+- [ ] **M6h — Graduate the integration test.** Replace the soft
+      forward-looking assertions in `tests/e2e.rs` with positive
+      checks: `radius.seen()` contains exactly one Access-Request
+      with `username == "alice"` and `pap_outcome == Match`; `sstpc`
+      exits 0; the kernel has a `pppN` interface with the assigned
+      `Framed-IP-Address`. Drop the runtime skip on root / `/dev/ppp`
+      from the harness and instead require those preconditions in
+      the dev container.
+
 ### M7 — Control socket
 - [x] Unix socket bind at `--control-socket` path, `0660` perms.
       `src/control.rs::serve` removes any stale socket file, binds

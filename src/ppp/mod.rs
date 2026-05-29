@@ -16,6 +16,9 @@ pub mod fsm;
 pub mod lcp;
 pub mod auth;
 pub mod ipcp;
+pub mod driver;
+
+pub use driver::{AssignedAddrs, AuthVerdict, Ppp, PppEvent, PppStep, TimerOwner};
 
 pub use frame::{
     ADDRESS_ALL_STATIONS, CONTROL_UI, FrameError, PppFrame, ProtocolId, decode_frame, encode_frame,

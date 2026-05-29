@@ -24,11 +24,15 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
+use crate::crypto::tls::{SslContext, TlsStream};
 use crate::metrics;
+use crate::ppp::{AuthVerdict, Ppp, PppEvent, PppStep, TimerOwner};
+use crate::sstp::preamble;
 
 /// Bounded depth for the per-session control channel. Control commands
 /// (Disconnect) are rare enough that any backlog past a couple of slots
@@ -179,16 +183,16 @@ impl Registry {
 /// Per-connection task entry point.
 ///
 /// Runs on the I/O worker that accepted the connection. The TCP stream,
-/// (future) TLS state, SSTP state machine, and PPP control plane are
-/// owned here for the session's lifetime; nothing in this task is
-/// `Send` once protocol state is in place.
+/// TLS state, (future) SSTP state machine, and (future) PPP control
+/// plane are owned here for the session's lifetime; nothing in this
+/// task is `Send` once protocol state is in place.
 ///
-/// **v0.1 status.** This is the M6 glue: the task registers itself,
-/// selects on `(stream, control_rx, drain_rx)`, unregisters on exit.
-/// The actual TLS handshake → SSTP demux → PPP drive loop is a TODO
-/// that lands as the surrounding subsystems get wired together end to
-/// end. Until then the task drops the connection after the first read
-/// readiness event (smoke-test useful, not a real server).
+/// **v0.1 status (M6a).** The TLS handshake is wired up: the task
+/// registers itself, terminates TLS against the shared [`SslContext`],
+/// then selects on `(tls_read, control_rx, drain_rx)`. The SSTP HTTPS
+/// preamble (M6b), SSTP state machine (M6c) and PPP drive (M6d) land
+/// next; until they do, the task discards inbound application bytes
+/// after logging the first read.
 pub async fn run(
     stream: TcpStream,
     peer: SocketAddr,
@@ -196,6 +200,7 @@ pub async fn run(
     registry: Registry,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     mut drain_rx: broadcast::Receiver<()>,
+    tls_ctx: SslContext,
 ) {
     info!(%id, %peer, "session accepted");
 
@@ -204,55 +209,542 @@ pub async fn run(
         id,
     };
 
-    // TODO(M6+): drive TLS handshake (crate::crypto::tls), then run the
-    // SSTP state machine (crate::sstp::StateMachine) selecting on the
-    // TLS read half, the control channel, and the drain signal. PPP
-    // FSM (crate::ppp) runs alongside, RADIUS (crate::auth) is awaited
-    // on the auth runtime via a `oneshot`.
-    // Single select pass for v0.1 — every arm exits the task. When
-    // the full TLS/SSTP/PPP drive loop lands this becomes a real loop
-    // again with per-frame work between selects.
-    let mut buf = [0u8; 1];
-    #[allow(clippy::never_loop)]
-    loop {
-        tokio::select! {
-            biased;
-            _ = drain_rx.recv() => {
-                info!(%id, "session draining (server shutdown)");
-                break;
+    // Phase 1: TLS handshake. Failures here are common in practice
+    // (port scanners, readiness probes, TLS-version mismatches) so
+    // they are logged at warn — not error — and counted into the
+    // single `HANDSHAKE_FAILURES` bucket. Distinguishing TLS vs HTTP
+    // vs SSTP-negotiation reasons lands when those layers do
+    // (CLAUDE.md M6b onward).
+    let mut tls = tokio::select! {
+        biased;
+        _ = drain_rx.recv() => {
+            info!(%id, "session draining before TLS handshake");
+            return;
+        }
+        cmd = control_rx.recv() => {
+            if let Some(ControlCommand::Disconnect(reason)) = cmd {
+                info!(%id, ?reason, "session control: disconnect before TLS handshake");
             }
-            cmd = control_rx.recv() => match cmd {
-                Some(ControlCommand::Disconnect(reason)) => {
-                    info!(%id, ?reason, "session control: disconnect");
-                    break;
+            return;
+        }
+        res = tls_ctx.accept(stream) => match res {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(%id, error = %e, "TLS handshake failed");
+                metrics::HANDSHAKE_FAILURES.inc();
+                return;
+            }
+        },
+    };
+    info!(%id, "TLS handshake completed");
+
+    // Phase 2: SSTP HTTPS preamble (MS-SSTP §3.2.4.1 / §4.1). The
+    // client posts to the well-known URI with `Content-Length:
+    // ULONGLONG_MAX`; we validate and respond with `HTTP/1.1 200`.
+    // After this exchange the same connection carries raw SSTP
+    // frames.
+    let preamble = match preamble::handshake(&mut tls).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(%id, error = %e, "SSTP preamble failed");
+            metrics::HANDSHAKE_FAILURES.inc();
+            // Best-effort 400 for protocol-level errors so the
+            // client surfaces a meaningful message instead of a
+            // bare TCP reset. I/O errors get no response — the
+            // socket is already broken.
+            if matches!(e, preamble::PreambleError::Bad(_) | preamble::PreambleError::TooLarge) {
+                let _ = preamble::write_error_response(&mut tls).await;
+            }
+            return;
+        }
+    };
+    info!(
+        %id,
+        correlation_id = preamble.correlation_id.as_deref().unwrap_or("-"),
+        "SSTP HTTPS preamble accepted"
+    );
+
+    // Phase 3: drive the SSTP state machine until it terminates.
+    // PPP wiring (M6d), the RADIUS bridge (M6e) and Crypto Binding
+    // verification (M6f) hook in here as those subsystems land —
+    // today the loop accepts a `Call-Connect-Request`, responds with
+    // an `Ack`, and would normally signal PPP to start LCP. Without
+    // a PPP layer the FSM sits in `Server_Call_Connected_Pending`
+    // until the negotiation timer fires and the abort sequence
+    // drains the connection.
+    drive_sstp(id, tls, control_rx, drain_rx).await;
+
+    info!(%id, "session ended");
+}
+
+/// SSTP state machine driver. Runs after the HTTPS preamble has
+/// completed.
+///
+/// Owns the [`StateMachine`], a single timer slot (the FSM is
+/// designed so at most one logical timer is armed at any time across
+/// the negotiation / hello / abort / disconnect sub-FSMs), and the
+/// inbound packet reassembly buffer. Each iteration of the select
+/// converts an external event (drain signal, control command, timer
+/// fire, TLS read) into one or more FSM steps, then writes any
+/// outbound packets back through the TLS stream.
+#[allow(clippy::too_many_lines)] // straight-line event dispatch; splitting hurts readability
+async fn drive_sstp(
+    id: SessionId,
+    mut tls: TlsStream,
+    mut control_rx: mpsc::Receiver<ControlCommand>,
+    mut drain_rx: broadcast::Receiver<()>,
+) {
+    use std::future::poll_fn;
+    use std::pin::Pin;
+    use std::task::Poll;
+    use tokio::time::Sleep;
+
+    use crate::sstp::frame::SSTP_MAX_PACKET_LEN;
+    use crate::sstp::state::Timer;
+    use crate::sstp::{Packet, StateMachine, parse_control};
+
+    let mut ssm = StateMachine::new();
+    let mut tx_buf = [0u8; SSTP_MAX_PACKET_LEN];
+    let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 4096];
+    let mut sstp_timer: Option<(Timer, Pin<Box<Sleep>>)> = None;
+    let mut ppp: Option<Ppp> = None;
+    let mut ppp_timer: Option<(TimerOwner, Pin<Box<Sleep>>)> = None;
+
+    // Spec entry point: `New HTTPS Connection Received` (§3.3.2.1).
+    let initial = ssm.on_https_accepted();
+    if !handle_sstp_step(id, &mut tls, &initial, &tx_buf, &mut sstp_timer, &mut ppp, &mut ppp_timer)
+        .await
+    {
+        return;
+    }
+
+    loop {
+        // Wrap each optional timer in a poll_fn so the corresponding
+        // select branch is `Poll::Pending` forever when no timer is
+        // armed. Borrows on the timer slots end at the `select!`
+        // boundary so other arms can mutate them through the apply
+        // helpers afterwards.
+        let outcome = {
+            let sstp_timer_fut = poll_fn(|cx| match sstp_timer.as_mut() {
+                Some((_, sleep)) => sleep.as_mut().poll(cx),
+                None => Poll::Pending,
+            });
+            let ppp_timer_fut = poll_fn(|cx| match ppp_timer.as_mut() {
+                Some((_, sleep)) => sleep.as_mut().poll(cx),
+                None => Poll::Pending,
+            });
+            tokio::select! {
+                biased;
+                _ = drain_rx.recv() => DriverEvent::Drain,
+                c = control_rx.recv() => DriverEvent::Control(c),
+                () = sstp_timer_fut => DriverEvent::SstpTimer,
+                () = ppp_timer_fut => DriverEvent::PppTimer,
+                r = tls.read(&mut chunk) => DriverEvent::Read(r),
+            }
+        };
+
+        match outcome {
+            DriverEvent::Drain => {
+                info!(%id, "session draining (server shutdown)");
+                let out = ssm.on_higher_layer_disconnect(&mut tx_buf);
+                if !handle_sstp_step(
+                    id,
+                    &mut tls,
+                    &out,
+                    &tx_buf,
+                    &mut sstp_timer,
+                    &mut ppp,
+                    &mut ppp_timer,
+                )
+                .await
+                {
+                    return;
                 }
-                None => {
-                    debug!(%id, "control channel closed by all senders");
-                    break;
+            }
+            DriverEvent::Control(Some(ControlCommand::Disconnect(reason))) => {
+                info!(%id, ?reason, "session control: disconnect");
+                let out = ssm.on_higher_layer_disconnect(&mut tx_buf);
+                if !handle_sstp_step(
+                    id,
+                    &mut tls,
+                    &out,
+                    &tx_buf,
+                    &mut sstp_timer,
+                    &mut ppp,
+                    &mut ppp_timer,
+                )
+                .await
+                {
+                    return;
                 }
-            },
-            res = stream.peek(&mut buf) => match res {
-                Ok(0) => {
-                    info!(%id, "peer closed connection");
-                    break;
+            }
+            DriverEvent::Control(None) => {
+                debug!(%id, "control channel closed by all senders");
+                return;
+            }
+            DriverEvent::SstpTimer => {
+                let (which, _) = sstp_timer
+                    .take()
+                    .expect("sstp timer slot is Some when timer fires");
+                debug!(%id, ?which, "SSTP timer expired");
+                let out = ssm.on_timer(which, &mut tx_buf);
+                if !handle_sstp_step(
+                    id,
+                    &mut tls,
+                    &out,
+                    &tx_buf,
+                    &mut sstp_timer,
+                    &mut ppp,
+                    &mut ppp_timer,
+                )
+                .await
+                {
+                    return;
                 }
-                Ok(_) => {
-                    // Placeholder until the TLS / SSTP / PPP drive loop
-                    // lands. Drop the connection so peers see a clean
-                    // FIN rather than hanging.
-                    info!(%id, "received bytes; protocol driver not wired yet");
-                    break;
+            }
+            DriverEvent::PppTimer => {
+                let (owner, _) = ppp_timer
+                    .take()
+                    .expect("ppp timer slot is Some when timer fires");
+                debug!(%id, ?owner, "PPP timer expired");
+                if let Some(p) = ppp.as_mut() {
+                    let step = p.on_timer(owner);
+                    if !handle_ppp_step(id, &mut tls, p, step, &mut ppp_timer).await {
+                        return;
+                    }
                 }
-                Err(e) => {
-                    warn!(%id, error = %e, "stream peek failed");
-                    break;
+            }
+            DriverEvent::Read(Ok(0)) => {
+                info!(%id, "peer closed connection");
+                return;
+            }
+            DriverEvent::Read(Err(e)) => {
+                warn!(%id, error = %e, "TLS read failed");
+                return;
+            }
+            DriverEvent::Read(Ok(n)) => {
+                rx_buf.extend_from_slice(&chunk[..n]);
+                // Drain as many complete SSTP packets as the buffer
+                // currently holds. The codec is zero-copy against the
+                // borrowed slice; we copy out the consumed bytes via
+                // `drain` at the end of each iteration.
+                loop {
+                    let parsed = Packet::parse(&rx_buf);
+                    let consumed = match parsed {
+                        Err(
+                            crate::sstp::ParseError::Truncated
+                            | crate::sstp::ParseError::LengthMismatch { .. },
+                        ) => break,
+                        Err(e) => {
+                            warn!(%id, error = %e, "SSTP frame parse failed; aborting");
+                            return;
+                        }
+                        Ok((Packet::Data(payload), length)) => {
+                            // Data packets restart the hello timer
+                            // once SSTP is `Server_Call_Connected`,
+                            // and (when PPP is running) feed into the
+                            // PPP demux.
+                            let out = ssm.on_data_packet();
+                            if !handle_sstp_step(
+                                id,
+                                &mut tls,
+                                &out,
+                                &tx_buf,
+                                &mut sstp_timer,
+                                &mut ppp,
+                                &mut ppp_timer,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                            if let Some(p) = ppp.as_mut() {
+                                let step = p.on_frame(payload);
+                                if !handle_ppp_step(id, &mut tls, p, step, &mut ppp_timer).await {
+                                    return;
+                                }
+                            }
+                            length
+                        }
+                        Ok((Packet::Control(ctrl), length)) => {
+                            match parse_control(ctrl) {
+                                Ok(msg) => {
+                                    let out = ssm.on_message(msg, &mut tx_buf);
+                                    if !handle_sstp_step(
+                                        id,
+                                        &mut tls,
+                                        &out,
+                                        &tx_buf,
+                                        &mut sstp_timer,
+                                        &mut ppp,
+                                        &mut ppp_timer,
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(%id, error = %e, "SSTP control parse failed");
+                                    return;
+                                }
+                            }
+                            length
+                        }
+                    };
+                    rx_buf.drain(..consumed);
                 }
-            },
+            }
+        }
+    }
+}
+
+/// One-shot description of which select arm fired. Kept local to
+/// [`drive_sstp`] because it has no other consumers.
+enum DriverEvent {
+    Drain,
+    Control(Option<ControlCommand>),
+    SstpTimer,
+    PppTimer,
+    Read(std::io::Result<usize>),
+}
+
+/// Apply an SSTP [`StepOut`] via [`apply_step`], then handle any
+/// `NotifyHigher` that resulted by spinning up the PPP driver
+/// (`StartPpp`) or logging (`SstpEstablished`). Returns `false` when
+/// the driver should exit.
+#[allow(clippy::too_many_arguments)]
+async fn handle_sstp_step(
+    id: SessionId,
+    tls: &mut TlsStream,
+    out: &crate::sstp::StepOut,
+    tx_buf: &[u8],
+    sstp_timer: &mut Option<(
+        crate::sstp::state::Timer,
+        std::pin::Pin<Box<tokio::time::Sleep>>,
+    )>,
+    ppp: &mut Option<Ppp>,
+    ppp_timer: &mut Option<(TimerOwner, std::pin::Pin<Box<tokio::time::Sleep>>)>,
+) -> bool {
+    let outcome = apply_step(id, tls, out, tx_buf, sstp_timer).await;
+    if !outcome.keep_going {
+        return false;
+    }
+    if outcome.start_ppp {
+        if ppp.is_some() {
+            debug!(%id, "spurious StartPpp notify after PPP already running");
+            return true;
+        }
+        info!(%id, "starting PPP control plane");
+        let mut new_ppp = Ppp::new();
+        let step = new_ppp.open();
+        *ppp = Some(new_ppp);
+        if !handle_ppp_step(
+            id,
+            tls,
+            ppp.as_mut().expect("just inserted"),
+            step,
+            ppp_timer,
+        )
+        .await
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Apply a [`PppStep`]: write each frame as an SSTP data packet,
+/// update the PPP timer slot, and act on any [`PppEvent`]. The PAP
+/// auth event is currently fulfilled in-process with a Reject so the
+/// session tears down cleanly until M6e replaces this rejector with
+/// a RADIUS round-trip.
+async fn handle_ppp_step(
+    id: SessionId,
+    tls: &mut TlsStream,
+    ppp: &mut Ppp,
+    mut step: PppStep,
+    ppp_timer: &mut Option<(TimerOwner, std::pin::Pin<Box<tokio::time::Sleep>>)>,
+) -> bool {
+    use tokio::time::{Instant, sleep_until};
+
+    // Loop because handling an event (e.g. PAP auth result) re-enters
+    // the driver and may produce more frames and another event.
+    loop {
+        for frame in &step.frames {
+            if let Err(e) = write_ppp_as_sstp_data(tls, frame).await {
+                warn!(%id, error = %e, "TLS write of PPP frame failed");
+                return false;
+            }
+        }
+        if !step.frames.is_empty() {
+            if let Err(e) = tokio::io::AsyncWriteExt::flush(tls).await {
+                warn!(%id, error = %e, "TLS flush failed");
+                return false;
+            }
+        }
+        for owner in &step.timer_stops {
+            if ppp_timer.as_ref().is_some_and(|(o, _)| o == owner) {
+                *ppp_timer = None;
+            }
+        }
+        for (owner, dur) in &step.timer_starts {
+            let sleep = Box::pin(sleep_until(Instant::now() + *dur));
+            *ppp_timer = Some((*owner, sleep));
+        }
+
+        let event = step.event.take();
+        let finished = step.finished;
+
+        match event {
+            Some(PppEvent::NeedPapAuth { peer_id, password: _ }) => {
+                // M6e seam: build a oneshot, hand the credentials to
+                // the auth runtime via the oneshot::Sender. For v0.1
+                // there is no auth backend wired, so we fulfil the
+                // oneshot in-process with a Reject and feed the
+                // verdict back into PPP. The shape of the oneshot is
+                // preserved so M6e is a drop-in replacement.
+                let (tx, rx) = oneshot::channel::<AuthVerdict>();
+                let user = String::from_utf8_lossy(&peer_id).into_owned();
+                info!(
+                    %id,
+                    user = %user,
+                    "PAP credentials received; auth backend not wired (M6e)"
+                );
+                let _ = tx.send(AuthVerdict::Reject {
+                    message: b"auth backend not wired (M6e)".to_vec(),
+                });
+                let verdict = rx
+                    .await
+                    .unwrap_or_else(|_| AuthVerdict::Reject {
+                        message: b"auth backend dropped".to_vec(),
+                    });
+                step = ppp.on_auth_result(verdict);
+                // Loop to render the new step.
+                continue;
+            }
+            Some(PppEvent::NetworkUp(addrs)) => {
+                info!(
+                    %id,
+                    ip = ?addrs.ip,
+                    "PPP network up; kernel-PPP bring-up deferred (M6g)"
+                );
+            }
+            None => {}
+        }
+
+        if finished {
+            info!(%id, "PPP driver reported finished");
+            return false;
+        }
+        return true;
+    }
+}
+
+/// Wrap a raw PPP frame in an SSTP data packet and write it to TLS.
+async fn write_ppp_as_sstp_data(tls: &mut TlsStream, payload: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    use crate::sstp::frame::{SSTP_HEADER_LEN, SSTP_MAX_PACKET_LEN, write_header};
+
+    let total = SSTP_HEADER_LEN + payload.len();
+    debug_assert!(
+        total <= SSTP_MAX_PACKET_LEN,
+        "PPP frame exceeds SSTP MTU: {total}"
+    );
+    let mut header = [0u8; SSTP_HEADER_LEN];
+    write_header(&mut header, false, total);
+    tls.write_all(&header).await?;
+    tls.write_all(payload).await?;
+    Ok(())
+}
+
+/// Apply a [`StepOut`] from the SSTP state machine: write any
+/// outbound bytes, update the SSTP timer slot, and decode the
+/// terminate flag plus higher-layer notification. Returns
+/// [`SstpOutcome`] for the caller to act on (PPP wire-up happens in
+/// [`handle_sstp_step`]).
+async fn apply_step(
+    id: SessionId,
+    tls: &mut TlsStream,
+    out: &crate::sstp::StepOut,
+    tx_buf: &[u8],
+    active_timer: &mut Option<(
+        crate::sstp::state::Timer,
+        std::pin::Pin<Box<tokio::time::Sleep>>,
+    )>,
+) -> SstpOutcome {
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{Instant, sleep_until};
+
+    use crate::sstp::state::{NotifyHigher, Terminate};
+
+    if out.send_len > 0 {
+        if let Err(e) = tls.write_all(&tx_buf[..out.send_len]).await {
+            warn!(%id, error = %e, "TLS write failed");
+            return SstpOutcome::stop();
+        }
+        if let Err(e) = tls.flush().await {
+            warn!(%id, error = %e, "TLS flush failed");
+            return SstpOutcome::stop();
         }
     }
 
-    info!(%id, "session ended");
-    drop(stream);
+    if let Some(stop) = out.timer_stop
+        && active_timer
+            .as_ref()
+            .is_some_and(|(t, _)| *t == stop)
+    {
+        *active_timer = None;
+    }
+    if let Some((which, dur)) = out.timer_start {
+        let sleep = Box::pin(sleep_until(Instant::now() + dur));
+        *active_timer = Some((which, sleep));
+    }
+
+    let mut start_ppp = false;
+    if let Some(note) = out.notify {
+        match note {
+            NotifyHigher::StartPpp => {
+                start_ppp = true;
+            }
+            NotifyHigher::SstpEstablished => {
+                info!(%id, "SSTP: tunnel established, PPP data may flow (M6g)");
+            }
+        }
+    }
+
+    match out.terminate {
+        Terminate::None => SstpOutcome {
+            keep_going: true,
+            start_ppp,
+        },
+        Terminate::Graceful => {
+            info!(%id, "SSTP terminated gracefully");
+            SstpOutcome::stop()
+        }
+        Terminate::Abrupt => {
+            info!(%id, "SSTP terminated abruptly");
+            SstpOutcome::stop()
+        }
+    }
+}
+
+/// Outcome of one SSTP FSM step from the session driver's view.
+#[derive(Debug, Clone, Copy)]
+struct SstpOutcome {
+    keep_going: bool,
+    start_ppp: bool,
+}
+
+impl SstpOutcome {
+    fn stop() -> Self {
+        Self {
+            keep_going: false,
+            start_ppp: false,
+        }
+    }
 }
 
 /// RAII guard that unregisters a session on task exit (including

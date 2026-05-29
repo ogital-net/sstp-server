@@ -37,6 +37,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::cli::{Config, LogFormat, ParseOutcome};
+use crate::crypto::tls::SslContext;
 use crate::session::{DisconnectReason, Registry};
 
 const LOG_QUEUE_LINES: usize = 8192;
@@ -85,6 +86,18 @@ fn run(config: &Config) -> ExitCode {
     let registry = Registry::new();
     let started = std::time::Instant::now();
 
+    // Build the shared TLS server context once. `SslContext` is cheap to
+    // clone (it's an `SSL_CTX_up_ref` under the hood) and is documented
+    // thread-safe in AWS-LC, so each I/O worker / session gets its own
+    // ref-counted handle without re-parsing the PEM files.
+    let tls_ctx = match SslContext::server_from_pem(&config.cert, &config.key) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, cert = %config.cert.display(), key = %config.key.display(), "failed to load TLS material");
+            return ExitCode::from(1);
+        }
+    };
+
     // Auth runtime: multi-threaded so a slow RADIUS server can't head-of-line
     // block. M4 will spawn the actual auth tasks here.
     let auth_runtime = Builder::new_multi_thread()
@@ -104,9 +117,12 @@ fn run(config: &Config) -> ExitCode {
         let listen_addr = config.listen;
         let worker_registry = registry.clone();
         let worker_shutdown = shutdown_tx.clone();
+        let worker_tls = tls_ctx.clone();
         let handle = thread::Builder::new()
             .name(format!("sstp-io-{id}"))
-            .spawn(move || io_worker_main(id, listen_addr, rx, worker_registry, worker_shutdown))
+            .spawn(move || {
+                io_worker_main(id, listen_addr, rx, worker_registry, worker_shutdown, worker_tls);
+            })
             .expect("spawn I/O worker");
         workers.push(handle);
     }
@@ -175,6 +191,7 @@ fn io_worker_main(
     mut shutdown: broadcast::Receiver<()>,
     registry: Registry,
     shutdown_tx: broadcast::Sender<()>,
+    tls_ctx: SslContext,
 ) {
     let rt: Runtime = Builder::new_current_thread()
         .enable_all()
@@ -191,7 +208,7 @@ fn io_worker_main(
             }
         };
         info!(worker = id, listen = %listen, "listener ready");
-        accept_loop(id, listener, &mut shutdown, registry, shutdown_tx).await;
+        accept_loop(id, listener, &mut shutdown, registry, shutdown_tx, tls_ctx).await;
     });
 }
 
@@ -201,6 +218,7 @@ async fn accept_loop(
     shutdown: &mut broadcast::Receiver<()>,
     registry: Registry,
     shutdown_tx: broadcast::Sender<()>,
+    tls_ctx: SslContext,
 ) {
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
     loop {
@@ -223,8 +241,9 @@ async fn accept_loop(
                     let (id, control_rx) = session::spawn_handle(&registry, peer);
                     let drain_rx = shutdown_tx.subscribe();
                     let registry = registry.clone();
+                    let session_tls = tls_ctx.clone();
                     let handle = tokio::task::spawn_local(session::run(
-                        stream, peer, id, registry, control_rx, drain_rx,
+                        stream, peer, id, registry, control_rx, drain_rx, session_tls,
                     ));
                     tasks.push(handle);
                 }
