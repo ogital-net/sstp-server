@@ -693,6 +693,40 @@ Regenerate the markdown after replacing the PDF:
 /tmp/pdfvenv/bin/python -c "import pymupdf4llm; open('MS-SSTP-spec.md','w').write(pymupdf4llm.to_markdown('MS-SSTP-spec.pdf'))"
 ```
 
+## Dev RADIUS
+
+Real-client interop testing needs *some* RADIUS server reachable from the
+SSTP daemon. To avoid making FreeRADIUS a prerequisite, the repo ships a
+minimal in-tree authenticator at [examples/dev-radius.rs](examples/dev-radius.rs).
+It reuses `radius-tokio` (already a dev-dependency for the e2e tests), so
+it adds no new build deps and the production binary is unchanged.
+
+Scope is deliberately tiny: PAP only, an in-memory pool that hands out
+`Framed-IP-Address`, sticky per-username assignment, optional static
+credential list. MS-CHAPv2 / EAP / accounting are out of scope — point at
+FreeRADIUS for those.
+
+Typical local-loopback session:
+
+```bash
+# Terminal A — RADIUS
+cargo run --example dev-radius -- \
+    -l 127.0.0.1:1812 \
+    -p 10.99.0.10-10.99.0.250 \
+    -v
+
+# Terminal B — SSTP server
+SSTP_RADIUS_SECRET=testing123 \
+  cargo run -- \
+    -l 0.0.0.0:443 -c cert.pem -k key.pem \
+    -r 127.0.0.1:1812 -i 10.99.0.1 -vv
+```
+
+Configure the Windows / sstpc client for **PAP** (not MS-CHAPv2) — the
+dev server only speaks PAP. Default secret is `testing123`; override
+with `--secret` or `DEV_RADIUS_SECRET`. Pass `-u alice:hunter2` (one or
+more times) to switch from accept-any to a static allowlist.
+
 ## Build checklist
 
 Ordered roughly by dependency. Each milestone should land as a coherent

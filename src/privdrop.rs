@@ -32,6 +32,11 @@ use thiserror::Error;
 /// Linux capability bit for `CAP_NET_ADMIN` (per `<linux/capability.h>`).
 pub const CAP_NET_ADMIN: u32 = 12;
 
+/// Linux capability bit for `CAP_SYS_NICE` (per `<linux/capability.h>`).
+/// Required after privdrop to call `sched_setscheduler(SCHED_FIFO, …)`
+/// on the I/O worker threads.
+pub const CAP_SYS_NICE: u32 = 23;
+
 /// `_LINUX_CAPABILITY_VERSION_3`, the 64-bit-capable header version.
 /// Two `cap_user_data_t` slots follow the header (low 32 bits, then
 /// high 32 bits).

@@ -112,7 +112,14 @@ fn run(config: &Config) -> ExitCode {
     // clone (it's an `SSL_CTX_up_ref` under the hood) and is documented
     // thread-safe in AWS-LC, so each I/O worker / session gets its own
     // ref-counted handle without re-parsing the PEM files.
-    let tls_ctx = match SslContext::server_from_pem(&config.cert, &config.key) {
+    // Restrict TLS 1.2 to AEAD ciphers only when the operator forced
+    // the kernel data path. In that mode CBC-SHA suites would fail at
+    // attach time anyway (kTLS only accelerates AEAD), so it's better
+    // to reject the handshake up-front. Auto / tun / userspace stay
+    // permissive — non-AEAD sessions transparently fall back to
+    // userspace TLS.
+    let aead_only = matches!(config.data_path, cli::DataPathMode::Kernel);
+    let tls_ctx = match SslContext::server_from_pem(&config.cert, &config.key, aead_only) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, cert = %config.cert.display(), key = %config.key.display(), "failed to load TLS material");
@@ -185,7 +192,10 @@ fn run(config: &Config) -> ExitCode {
 
     // ---- Phase 2: drop privileges (still single-threaded) ----
     if let Some(id) = drop_identity {
-        if let Err(e) = privdrop::drop_to(id, &[privdrop::CAP_NET_ADMIN]) {
+        if let Err(e) = privdrop::drop_to(
+            id,
+            &[privdrop::CAP_NET_ADMIN, privdrop::CAP_SYS_NICE],
+        ) {
             tracing::error!(error = %e, "privilege drop failed");
             return ExitCode::from(1);
         }
@@ -193,7 +203,7 @@ fn run(config: &Config) -> ExitCode {
             uid = id.uid,
             gid = id.gid,
             user = %privdrop::name_for_uid(id.uid),
-            retained_caps = "CAP_NET_ADMIN",
+            retained_caps = "CAP_NET_ADMIN,CAP_SYS_NICE",
             "dropped privileges"
         );
     }
@@ -266,6 +276,7 @@ fn run(config: &Config) -> ExitCode {
     let reload_tls = tls_ctx.clone();
     let reload_cert = config.cert.clone();
     let reload_key = config.key.clone();
+    let reload_aead_only = aead_only;
     let control_state = control::ControlState {
         registry: registry.clone(),
         shutdown_tx: shutdown_tx.clone(),
@@ -275,7 +286,12 @@ fn run(config: &Config) -> ExitCode {
     };
     let control_shutdown_rx = shutdown_tx.subscribe();
     auth_runtime.block_on(async move {
-        tokio::spawn(watch_sighup_reload_tls(reload_tls, reload_cert, reload_key));
+        tokio::spawn(watch_sighup_reload_tls(
+            reload_tls,
+            reload_cert,
+            reload_key,
+            reload_aead_only,
+        ));
 
         // Hand the pre-bound control socket to a runtime task. Failures
         // here can only come from `from_std`, which only fails if the
@@ -388,6 +404,40 @@ fn resolve_data_path_mode(requested: cli::DataPathMode) -> cli::DataPathMode {
     }
 }
 
+/// Promote the current thread to `SCHED_FIFO` priority 10. This
+/// gives the I/O workers preemption authority over `SCHED_OTHER`
+/// userspace (anything that's not RT-scheduled) so a busy host
+/// can't introduce data-path jitter, while staying well below
+/// the kernel's softirq RT threads (priority ~50) and the
+/// `migration/N` kernel kthreads. Best-effort: we start as root
+/// in normal deployments, but if `setpriority` is denied (no
+/// `CAP_SYS_NICE`, `RLIMIT_RTPRIO`, container restrictions, etc.)
+/// we log and keep going on the kernel's default scheduler.
+fn set_io_thread_realtime(id: usize) {
+    const SCHED_FIFO: libc::c_int = 1;
+    const RT_PRIO: libc::c_int = 10;
+
+    // SAFETY: `param` is a fully-initialized `sched_param`; passing
+    // a null `pid_t` (0) means "the calling thread". The libc binding
+    // takes a `*const sched_param`, which we provide.
+    let rc = unsafe {
+        let param = libc::sched_param {
+            sched_priority: RT_PRIO,
+        };
+        libc::sched_setscheduler(0, SCHED_FIFO, &raw const param)
+    };
+    if rc == 0 {
+        tracing::debug!(worker = id, prio = RT_PRIO, "I/O worker promoted to SCHED_FIFO");
+    } else {
+        let err = io::Error::last_os_error();
+        tracing::warn!(
+            worker = id,
+            error = %err,
+            "could not set I/O worker to SCHED_FIFO; staying on default scheduler"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // worker boot: every arg is essential per-worker context
 fn io_worker_main(
     id: usize,
@@ -401,6 +451,7 @@ fn io_worker_main(
     local_ip: std::net::Ipv4Addr,
     data_path: cli::DataPathMode,
 ) {
+    set_io_thread_realtime(id);
     let rt: Runtime = Builder::new_current_thread()
         .enable_all()
         .thread_name(format!("sstp-io-{id}"))
@@ -520,7 +571,12 @@ async fn wait_for_shutdown(mut admin_rx: broadcast::Receiver<()>) {
     }
 }
 
-async fn watch_sighup_reload_tls(tls_ctx: SharedTlsContext, cert: PathBuf, key: PathBuf) {
+async fn watch_sighup_reload_tls(
+    tls_ctx: SharedTlsContext,
+    cert: PathBuf,
+    key: PathBuf,
+    aead_only: bool,
+) {
     let mut sighup = match signal(SignalKind::hangup()) {
         Ok(s) => s,
         Err(e) => {
@@ -531,7 +587,7 @@ async fn watch_sighup_reload_tls(tls_ctx: SharedTlsContext, cert: PathBuf, key: 
 
     loop {
         sighup.recv().await;
-        match SslContext::server_from_pem(&cert, &key) {
+        match SslContext::server_from_pem(&cert, &key, aead_only) {
             Ok(new_ctx) => {
                 *tls_ctx.write().expect("TLS context RwLock poisoned") = new_ctx;
                 info!(

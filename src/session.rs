@@ -935,7 +935,7 @@ async fn handle_sstp_step(
             return true;
         }
         info!(%id, "starting PPP control plane");
-        let mut new_ppp = Ppp::new();
+        let mut new_ppp = Ppp::new(local_ip.octets());
         let step = new_ppp.open();
         *ppp = Some(new_ppp);
         if !handle_ppp_step(

@@ -245,6 +245,10 @@ impl LcpServer {
 struct IpcpServer {
     fsm: Fsm,
     addrs: AssignedAddrs,
+    /// Server's own end of the tunnel — advertised in our
+    /// `Configure-Request` `IP-Address` option so the peer can
+    /// install a route via this gateway.
+    local_ip: [u8; 4],
     last_cr_id: u8,
     /// For `Send::ConfigureAck` we echo the client's last CR option
     /// list verbatim.
@@ -259,10 +263,11 @@ struct IpcpServer {
 }
 
 impl IpcpServer {
-    fn new(addrs: AssignedAddrs) -> Self {
+    fn new(addrs: AssignedAddrs, local_ip: [u8; 4]) -> Self {
         Self {
             fsm: Fsm::new(),
             addrs,
+            local_ip,
             last_cr_id: 0,
             last_cr_options: Vec::new(),
             pending_nak: Vec::new(),
@@ -419,10 +424,14 @@ impl IpcpServer {
     }
 
     fn push_v4_option(buf: &mut Vec<u8>, opt_type: u8, addr: [u8; 4]) {
-        let mut tmp = [0u8; IPV4_OPTION_TOTAL_LEN];
-        let n = write_ipv4_option(&mut tmp, opt_type, addr);
-        buf.extend_from_slice(&tmp[..n]);
+        push_v4_option(buf, opt_type, addr);
     }
+}
+
+fn push_v4_option(buf: &mut Vec<u8>, opt_type: u8, addr: [u8; 4]) {
+    let mut tmp = [0u8; IPV4_OPTION_TOTAL_LEN];
+    let n = write_ipv4_option(&mut tmp, opt_type, addr);
+    buf.extend_from_slice(&tmp[..n]);
 }
 
 // =============================================================================
@@ -453,18 +462,25 @@ pub struct Ppp {
     /// Addresses to feed IPCP once auth completes. `None` until
     /// `on_auth_result(Accept)` runs.
     pending_addrs: Option<AssignedAddrs>,
+    /// Server's own IPv4 address advertised in the IPCP
+    /// `Configure-Request` so the peer learns its tunnel gateway
+    /// ([RFC 1332] §3.3). Without this the client invents an
+    /// arbitrary peer address (MikroTik defaults to a 10.112/16
+    /// pool) and on-link routing fails.
+    local_ip: [u8; 4],
 }
 
 impl Ppp {
     /// Build the driver. The caller must invoke [`Ppp::open`] to
     /// kick off the LCP exchange.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(local_ip: [u8; 4]) -> Self {
         Self {
             phase: Phase::Establish,
             lcp: LcpServer::new(),
             ipcp: None,
             pending_addrs: None,
+            local_ip,
         }
     }
 
@@ -527,7 +543,7 @@ impl Ppp {
                 self.pending_addrs = Some(addrs);
                 self.phase = Phase::Network;
                 // Kick off IPCP.
-                let mut ipcp = IpcpServer::new(addrs);
+                let mut ipcp = IpcpServer::new(addrs, self.local_ip);
                 let fsm_step = ipcp.open();
                 self.ipcp = Some(ipcp);
                 let ipcp_step = self.render_ipcp_step(fsm_step);
@@ -645,7 +661,7 @@ impl Ppp {
 
 impl Default for Ppp {
     fn default() -> Self {
-        Self::new()
+        Self::new([0, 0, 0, 0])
     }
 }
 
@@ -717,10 +733,17 @@ fn render_ipcp_send(
     let (code, identifier) = match send {
         FsmSend::ConfigureRequest => {
             let id = ipcp.fsm.bump_identifier();
-            // Server proposes its own IP only — IPCP doesn't require
-            // the server to advertise the assigned-to-peer address in
-            // its own CR (peer drives that via its own CR with 0s).
-            // We send an empty CR (no options).
+            // Advertise the server's tunnel address so the peer can
+            // install a route via this gateway ([RFC 1332] §3.3).
+            // Without this option the peer either invents a fallback
+            // (MikroTik picks from its default pool) or never
+            // installs a usable next-hop, and ping across the
+            // tunnel times out.
+            push_v4_option(
+                &mut body,
+                IpcpOptionId::IpAddress.as_u8(),
+                ipcp.local_ip,
+            );
             (IpcpCode::ConfigureRequest, id)
         }
         FsmSend::ConfigureAck => {
@@ -819,7 +842,7 @@ mod tests {
 
     #[test]
     fn open_emits_lcp_configure_request_with_pap() {
-        let mut ppp = Ppp::new();
+        let mut ppp = Ppp::new([0,0,0,0]);
         let step = ppp.open();
         assert_eq!(step.frames.len(), 1);
         let (proto, code, _id, opts) = peel(&step.frames[0]);
@@ -835,7 +858,7 @@ mod tests {
 
     #[test]
     fn ack_acceptable_lcp_cr() {
-        let mut ppp = Ppp::new();
+        let mut ppp = Ppp::new([0,0,0,0]);
         let _open = ppp.open();
         // Client CR: MRU=1500, Magic, PFC, ACFC.
         let opts: Vec<u8> = vec![
@@ -856,7 +879,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_lcp_option() {
-        let mut ppp = Ppp::new();
+        let mut ppp = Ppp::new([0,0,0,0]);
         let _open = ppp.open();
         // Option type 99 (unknown) plus a known MRU.
         let opts: Vec<u8> = vec![
@@ -875,7 +898,7 @@ mod tests {
 
     #[test]
     fn lcp_opened_transitions_to_auth_pending() {
-        let mut ppp = Ppp::new();
+        let mut ppp = Ppp::new([0,0,0,0]);
         let _ = ppp.open();
         // Client sends an Ack to our CR (using id=1, the bumped id).
         let ack = encode_lcp_frame(
@@ -910,7 +933,7 @@ mod tests {
 
     #[test]
     fn pap_request_emits_need_auth_event() {
-        let mut ppp = Ppp::new();
+        let mut ppp = Ppp::new([0,0,0,0]);
         drive_to_auth_pending(&mut ppp);
 
         // PAP Authenticate-Request: id=2, peer-id="alice", pw="hunter2".
@@ -944,7 +967,7 @@ mod tests {
 
     #[test]
     fn auth_accept_acks_pap_and_starts_ipcp() {
-        let mut ppp = Ppp::new();
+        let mut ppp = Ppp::new([0,0,0,0]);
         drive_to_auth_pending(&mut ppp);
         // Send a PAP request to advance to AuthInFlight.
         let pap_body = vec![
@@ -980,7 +1003,7 @@ mod tests {
 
     #[test]
     fn ipcp_naks_zero_ip_with_assigned() {
-        let mut ppp = Ppp::new();
+        let mut ppp = Ppp::new([0,0,0,0]);
         drive_to_auth_pending(&mut ppp);
         let pap_body = vec![
             pap::Code::AuthenticateRequest.as_u8(),
@@ -1014,7 +1037,7 @@ mod tests {
 
     #[test]
     fn ipcp_acks_matching_ip() {
-        let mut ppp = Ppp::new();
+        let mut ppp = Ppp::new([0,0,0,0]);
         drive_to_auth_pending(&mut ppp);
         let pap_body = vec![
             pap::Code::AuthenticateRequest.as_u8(),
@@ -1043,7 +1066,7 @@ mod tests {
 
     #[test]
     fn auth_reject_emits_nak_and_terminates() {
-        let mut ppp = Ppp::new();
+        let mut ppp = Ppp::new([0,0,0,0]);
         drive_to_auth_pending(&mut ppp);
         let pap_body = vec![
             pap::Code::AuthenticateRequest.as_u8(),

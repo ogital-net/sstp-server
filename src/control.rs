@@ -193,6 +193,10 @@ async fn handle_connection(stream: UnixStream, state: ControlState) -> std::io::
         }
         let response = dispatch(line.trim(), &state);
         wr.write_all(response.as_bytes()).await?;
+        if !response.ends_with('\n') {
+            wr.write_all(b"\n").await?;
+        }
+        // Blank-line terminator so clients can frame the response.
         wr.write_all(b"\n").await?;
         if response_requested_close(&response) {
             return Ok(());

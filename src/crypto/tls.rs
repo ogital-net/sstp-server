@@ -49,7 +49,16 @@ pub struct SslContext {
 
 impl SslContext {
     /// Build a TLS server context from a PEM certificate chain and key.
-    pub fn server_from_pem(cert: &Path, key: &Path) -> Result<Self, TlsError> {
+    ///
+    /// When `aead_only` is true, the TLS 1.2 cipher list is restricted
+    /// to AEAD suites (AES-GCM / ChaCha20-Poly1305) so every session
+    /// is kTLS-eligible. Use this in `--data-path kernel` mode where
+    /// CBC-SHA falls outside the kTLS allow-list and would force the
+    /// session to fail at attach time anyway. Leave it false for
+    /// permissive deployments (auto / tun / userspace) so legacy
+    /// clients that only offer CBC suites can still connect; those
+    /// sessions transparently fall back to userspace TLS.
+    pub fn server_from_pem(cert: &Path, key: &Path, aead_only: bool) -> Result<Self, TlsError> {
         // SAFETY: TLS_server_method returns a static SSL_METHOD; SSL_CTX_new
         // either returns a valid pointer or null on alloc failure.
         let ctx_ptr = unsafe { aws::SSL_CTX_new(aws::TLS_server_method()) };
@@ -67,6 +76,35 @@ impl SslContext {
             return Err(TlsError::Init(
                 "SSL_CTX_set_min_proto_version failed".into(),
             ));
+        }
+
+        // Restrict the TLS 1.2 cipher list to AEAD suites (AES-GCM,
+        // ChaCha20-Poly1305) only when the operator opted into the
+        // kernel data path. kTLS only accelerates AEAD ciphers, so a
+        // CBC-SHA suite (e.g. `AES256-SHA`) would force the data path
+        // back to userspace; in `--data-path kernel` mode that's a
+        // session-level failure (`SSTP_IOC_ATTACH: EOPNOTSUPP`), so
+        // we'd rather refuse the handshake here with `NO_SHARED_CIPHER`.
+        // TLS 1.3 only defines AEAD suites, so its ciphersuite list
+        // never needs pruning. The list is OpenSSL/AWS-LC cipher-list
+        // syntax, ECDHE-first for forward secrecy, then plain RSA-AEAD
+        // as a fallback for clients that don't offer ECDHE.
+        if aead_only {
+            const TLS12_CIPHERS: &[u8] =
+                b"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:\
+                  ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:\
+                  ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
+                  AES128-GCM-SHA256:AES256-GCM-SHA384\0";
+            // SAFETY: ctx valid; TLS12_CIPHERS is a NUL-terminated byte string.
+            let rc = unsafe {
+                aws::SSL_CTX_set_cipher_list(ctx.as_ptr(), TLS12_CIPHERS.as_ptr().cast())
+            };
+            if rc != 1 {
+                return Err(TlsError::Init(format!(
+                    "SSL_CTX_set_cipher_list (TLS 1.2 AEAD-only): {}",
+                    last_error()
+                )));
+            }
         }
 
         let cert_c = path_to_cstring(cert)?;
@@ -929,7 +967,7 @@ mod tests {
     fn build_context_from_pem() {
         let tmp = tempdir();
         let (cert, key) = gen_self_signed(tmp.path());
-        let _ctx = SslContext::server_from_pem(&cert, &key).expect("ctx");
+        let _ctx = SslContext::server_from_pem(&cert, &key, false).expect("ctx");
     }
 
     #[test]
@@ -937,7 +975,7 @@ mod tests {
         let tmp = tempdir();
         let (_cert, key) = gen_self_signed(tmp.path());
         let bad = tmp.path().join("missing.pem");
-        let res = SslContext::server_from_pem(&bad, &key);
+        let res = SslContext::server_from_pem(&bad, &key, false);
         let Err(err) = res else {
             panic!("expected error")
         };
@@ -948,7 +986,7 @@ mod tests {
     async fn handshake_read_write_export() {
         let tmp = tempdir();
         let (cert, key) = gen_self_signed(tmp.path());
-        let ctx = SslContext::server_from_pem(&cert, &key).expect("ctx");
+        let ctx = SslContext::server_from_pem(&cert, &key, false).expect("ctx");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

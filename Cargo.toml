@@ -9,12 +9,29 @@ repository = "https://github.com/ogital-net/sstp-server"
 keywords = ["sstp", "vpn", "ppp", "radius"]
 categories = ["network-programming"]
 
+[features]
+default = ["cli"]
+# Builds the `sstp-server-cli` interactive admin REPL. The server
+# binary itself does not depend on these crates.
+cli = ["dep:rustyline", "dep:command-trie"]
+
+[[bin]]
+name = "sstp-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "sstp-server-cli"
+path = "src/bin/sstp_server_cli.rs"
+required-features = ["cli"]
+
 [dependencies]
 aws-lc-sys = { version = "0.41", features = ["ssl"] }
+command-trie = { version = "1", optional = true }
 dotenvy = "0.15"
 fast-md5 = "1"
 getopt-iter = "1"
 libc = "0.2"
+rustyline = { version = "18", optional = true }
 socket2 = { version = "0.6", features = ["all"] }
 radius-tokio = { git = "https://github.com/ogital-net/radius-tokio", branch = "client", default-features = false, features = ["dict-rfc", "dict-microsoft", "client", "fast-md5"] }
 thiserror = "2"

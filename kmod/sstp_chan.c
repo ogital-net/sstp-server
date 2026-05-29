@@ -23,10 +23,15 @@ static int sstp_chan_start_xmit(struct ppp_channel *chan,
 				struct sk_buff *skb)
 {
 	struct sstp_session *s = chan->private;
-	u8 hdr[SSTP_HEADER_LEN];
+	u8 hdr[SSTP_HEADER_LEN + 2];
 	struct kvec iov[2];
 	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
-	size_t total = SSTP_HEADER_LEN + skb->len;
+	/* ppp_generic hands us the PPP frame starting at the 2-byte
+	 * Protocol field; the peer expects the HDLC-style Address +
+	 * Control prefix because ACFC was not negotiated by LCP. We
+	 * fold both the SSTP header and the `ff 03` A/C bytes into a
+	 * single 6-byte prefix iovec so this stays a one-syscall send. */
+	size_t total = SSTP_HEADER_LEN + 2 + skb->len;
 	int ret;
 
 	if (READ_ONCE(s->closing)) {
@@ -46,9 +51,11 @@ static int sstp_chan_start_xmit(struct ppp_channel *chan,
 	hdr[1] = 0;                       /* C = 0 (data), Reserved = 0 */
 	hdr[2] = (total >> 8) & 0x0F;     /* R (4 bits) = 0 | high nibble */
 	hdr[3] = total & 0xFF;
+	hdr[4] = 0xff;                    /* PPP Address (all-stations) */
+	hdr[5] = 0x03;                    /* PPP Control (UI) */
 
 	iov[0].iov_base = hdr;
-	iov[0].iov_len  = SSTP_HEADER_LEN;
+	iov[0].iov_len  = SSTP_HEADER_LEN + 2;
 	iov[1].iov_base = skb->data;
 	iov[1].iov_len  = skb->len;
 

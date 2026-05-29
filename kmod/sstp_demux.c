@@ -33,11 +33,28 @@
 #define SSTP_TLS_RT_HANDSHAKE        22
 #define SSTP_TLS_RT_APPLICATION_DATA 23
 
-/* Hand a single PPP-payload skb up to ppp_generic. */
+/* Hand a single PPP-payload skb up to ppp_generic. The wire format
+ * inside an SSTP data packet is a full PPP frame with the HDLC-style
+ * Address (0xff) + Control (0x03) prefix unless ACFC was negotiated
+ * by LCP. The userspace driver does not propose ACFC, so peers send
+ * A/C-prefixed frames. ppp_generic's channel input expects the skb
+ * to start with the 2-byte Protocol field, so strip the leading
+ * `ff 03` here when present. Without this the kernel parses the
+ * Address byte as the high half of the protocol id and silently
+ * drops every IP packet. */
 static void sstp_deliver_ppp(struct sstp_session *s,
 			     const u8 *payload, u32 payload_len)
 {
 	struct sk_buff *skb;
+
+	if (payload_len >= 2 && payload[0] == 0xff && payload[1] == 0x03) {
+		payload += 2;
+		payload_len -= 2;
+	}
+	if (payload_len < 2) {
+		atomic64_inc(&s->stats_sstp_malformed);
+		return;
+	}
 
 	skb = dev_alloc_skb(payload_len);
 	if (!skb) {
