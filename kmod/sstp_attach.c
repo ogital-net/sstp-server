@@ -34,6 +34,8 @@ static void sstp_session_release(struct kref *ref)
 	if (s->wq)
 		destroy_workqueue(s->wq);
 
+	kfree(s->rx_buf);
+
 	if (s->tcp_file)
 		fput(s->tcp_file);
 
@@ -122,6 +124,12 @@ long sstp_do_attach(struct file *misc_file,
 	s->flags = a.flags;
 	s->mtu = a.mtu ? a.mtu : 1500;
 
+	s->rx_buf = kmalloc(SSTP_RX_BUF_CAP, GFP_KERNEL);
+	if (!s->rx_buf) {
+		ret = -ENOMEM;
+		goto err_free;
+	}
+
 	/* Grab the TCP fd. We take a counted reference on the
 	 * underlying `struct file` so the caller can close its
 	 * descriptor freely after the ioctl returns. */
@@ -198,9 +206,14 @@ long sstp_do_attach(struct file *misc_file,
 		return -EFAULT;
 	}
 
-	/* Kick off the receive loop. The work item holds its own
-	 * implicit reference via being queued; sstp_demux_shutdown()
-	 * cancels and waits before final put. */
+	/* Wire the socket callback last — after this, sstp_sk_data_ready
+	 * may fire on any new bytes and queue rx_work. The work item
+	 * holds an implicit reference via being queued; the demux
+	 * shutdown path cancels it before the final put. */
+	sstp_demux_install_callback(s);
+
+	/* Kick off the receive loop in case bytes were already queued
+	 * before the callback was installed. */
 	queue_work(s->wq, &s->rx_work);
 
 	return 0;

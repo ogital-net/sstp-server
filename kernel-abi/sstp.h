@@ -223,6 +223,13 @@ struct sstp_stats {
 #define SSTP_IOC_DETACH         _IOW (SSTP_IOC_MAGIC, 0x81, struct sstp_detach)
 #define SSTP_IOC_GETSTATS       _IOR (SSTP_IOC_MAGIC, 0x82, struct sstp_stats)
 
+/* Returns the PPP channel index assigned by `ppp_register_channel()`
+ * at attach time. Userspace passes this to `PPPIOCATTCHAN` on its
+ * `/dev/ppp` handle and then `PPPIOCCONNECT` on the unit fd to bind
+ * the SSTP channel to the PPP unit it negotiated earlier. Issued on
+ * the session_fd. */
+#define SSTP_IOC_GET_CHAN_INDEX _IOR (SSTP_IOC_MAGIC, 0x83, __s32)
+
 /* ----------------------------------------------------------------
  * Event stream (read from session_fd)
  *

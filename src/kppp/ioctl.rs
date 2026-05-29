@@ -61,6 +61,26 @@ const fn iowr<T>(typ: u8, nr: u8) -> libc::c_ulong {
     ioc(IOC_READ | IOC_WRITE, typ, nr, core::mem::size_of::<T>())
 }
 
+/// Crate-internal alias of the `_IOR(type, nr, T)` macro for use by
+/// sibling modules (e.g. `sstp_kmod`) that compose their own ioctl
+/// number sets.
+#[inline]
+pub(crate) const fn ioc_read<T>(typ: u8, nr: u8) -> libc::c_ulong {
+    ior::<T>(typ, nr)
+}
+
+/// Crate-internal alias of `_IOW(type, nr, T)`.
+#[inline]
+pub(crate) const fn ioc_write<T>(typ: u8, nr: u8) -> libc::c_ulong {
+    iow::<T>(typ, nr)
+}
+
+/// Crate-internal alias of `_IOWR(type, nr, T)`.
+#[inline]
+pub(crate) const fn ioc_readwrite<T>(typ: u8, nr: u8) -> libc::c_ulong {
+    iowr::<T>(typ, nr)
+}
+
 // ---------------------------------------------------------------------------
 // PPP ioctls — `<linux/ppp-ioctl.h>` type byte is `'t'` (0x74).
 // ---------------------------------------------------------------------------

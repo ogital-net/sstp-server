@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * sstp_chan.c — `struct ppp_channel` ops.
+ * sstp_chan.c — `struct ppp_channel` ops (TX path).
  *
- * ppp_generic calls into us with PPP frames on the TX path (peer
- * direction). We wrap them in SSTP framing ([MS-SSTP] §2.2.3),
- * encrypt via kTLS (handled transparently by sendmsg on the
- * kTLS-equipped socket), and push to the wire.
- *
- * v0.1 status: TX path is stubbed. start_xmit returns 1 (consumed)
- * after dropping the skb; the real implementation lives behind the
- * TODO below.
+ * ppp_generic invokes start_xmit with PPP frames bound for the
+ * peer. We prepend the 4-byte SSTP data-packet header
+ * ([MS-SSTP] §2.2.3) and push the result down the kTLS socket;
+ * kTLS handles the AEAD seal transparently.
  */
 
 #include <linux/errno.h>
+#include <linux/net.h>
 #include <linux/ppp_channel.h>
+#include <linux/printk.h>
 #include <linux/skbuff.h>
 #include <linux/spinlock.h>
+#include <linux/uio.h>
+#include <net/sock.h>
 
 #include "sstp_internal.h"
 
@@ -24,18 +24,71 @@ static int sstp_chan_start_xmit(struct ppp_channel *chan,
 {
 	struct sstp_session *s = chan->private;
 	unsigned long flags;
+	u8 hdr[SSTP_HEADER_LEN];
+	struct kvec iov[2];
+	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
+	size_t total = SSTP_HEADER_LEN + skb->len;
+	int ret;
 
-	/* TODO(v0.1): SSTP-encapsulate (§2.2.3 data packet header:
-	 * version, R-bit, length), then kernel_sendmsg() on
-	 * s->tcp_sock. kTLS handles the AEAD seal transparently.
-	 *
-	 * For the draft we drop the frame but bump the counter so
-	 * a loadable build is observable. Returning 1 tells
-	 * ppp_generic the frame was consumed (don't queue). */
-	spin_lock_irqsave(&s->stats_lock, flags);
-	s->stats.ppp_frames_tx++;
-	spin_unlock_irqrestore(&s->stats_lock, flags);
+	if (READ_ONCE(s->closing)) {
+		kfree_skb(skb);
+		return 1;
+	}
+	if (total > SSTP_MAX_PACKET_LEN) {
+		/* Larger than what the 12-bit Length field can carry.
+		 * ppp_generic enforces MRU but defence in depth. */
+		spin_lock_irqsave(&s->stats_lock, flags);
+		s->stats.sstp_malformed++;
+		spin_unlock_irqrestore(&s->stats_lock, flags);
+		kfree_skb(skb);
+		return 1;
+	}
 
+	/* [MS-SSTP] §2.2.3 data-packet header. */
+	hdr[0] = SSTP_VERSION_1_0;
+	hdr[1] = 0;                       /* C = 0 (data), Reserved = 0 */
+	hdr[2] = (total >> 8) & 0x0F;     /* R (4 bits) = 0 | high nibble */
+	hdr[3] = total & 0xFF;
+
+	iov[0].iov_base = hdr;
+	iov[0].iov_len  = SSTP_HEADER_LEN;
+	iov[1].iov_base = skb->data;
+	iov[1].iov_len  = skb->len;
+
+	ret = kernel_sendmsg(s->tcp_sock, &msg, iov, 2, total);
+
+	if (ret == (int)total) {
+		spin_lock_irqsave(&s->stats_lock, flags);
+		s->stats.ppp_frames_tx++;
+		s->stats.sstp_frames_tx++;
+		s->stats.tls_records_tx++;
+		spin_unlock_irqrestore(&s->stats_lock, flags);
+		kfree_skb(skb);
+		return 1;
+	}
+
+	if (ret == -EAGAIN || ret == -EWOULDBLOCK) {
+		/* Socket buffer full. Tell ppp_generic to hold off; it
+		 * will retry after we call ppp_output_wakeup(). For v0.1
+		 * we drop the frame — installing the sk_write_space hook
+		 * to trigger ppp_output_wakeup() is a TODO. */
+		spin_lock_irqsave(&s->stats_lock, flags);
+		s->stats.sstp_malformed++;
+		spin_unlock_irqrestore(&s->stats_lock, flags);
+		kfree_skb(skb);
+		return 1;
+	}
+
+	/* Short write or hard error: the TCP stream is now ambiguous
+	 * (the kernel may have buffered the header but not the body,
+	 * or vice versa). Tear the session down — there is no clean
+	 * resync. */
+	pr_warn_ratelimited(SSTP_MOD_NAME
+		": sendmsg ret=%d (wanted %zu); aborting session\n",
+		ret, total);
+	sstp_session_emit(s, SSTP_EVT_TLS_FATAL_ALERT,
+			  ret < 0 ? (u32)-ret : 0);
+	WRITE_ONCE(s->closing, true);
 	kfree_skb(skb);
 	return 1;
 }
@@ -47,8 +100,8 @@ static int sstp_chan_ioctl(struct ppp_channel *chan, unsigned int cmd,
 	(void)cmd;
 	(void)arg;
 
-	/* No channel-specific ioctls in v0.1; everything goes through
-	 * the session_fd. */
+	/* No channel-specific ioctls — everything goes through the
+	 * session_fd. */
 	return -ENOTTY;
 }
 

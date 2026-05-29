@@ -52,6 +52,7 @@ OPTIONS:
     -n, --no-control-socket      Disable the control socket
     -F, --log-format <fmt>       text | json | auto (default: auto)
     -L, --log-file <path>        Log to file instead of stderr
+    -D, --data-path <mode>       auto | kernel | userspace (default: auto)
     -v                           Increase verbosity (-v, -vv, -vvv)
     -q, --quiet                  Errors only
     -h, --help                   Print this help and exit
@@ -83,13 +84,25 @@ T:(auth-threads)\
 s:(control-socket)\
 n(no-control-socket)\
 F:(log-format)\
-L:(log-file)";
+L:(log-file)\
+D:(data-path)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
     Text,
     Json,
     Auto,
+}
+
+/// Operator-selectable data-path mode. `Auto` tries the kernel path
+/// first and falls back to userspace copying with a warning log if the
+/// `sstp` kmod isn't present or the attach fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DataPathMode {
+    #[default]
+    Auto,
+    Kernel,
+    Userspace,
 }
 
 /// Parsed configuration. `Result::Ok` here means the daemon should start;
@@ -107,6 +120,7 @@ pub struct Config {
     pub log_format: LogFormat,
     pub log_file: Option<PathBuf>,
     pub log_level: LevelFilter,
+    pub data_path: DataPathMode,
 }
 
 #[derive(Debug)]
@@ -191,6 +205,7 @@ where
     let mut no_control_socket = false;
     let mut log_format = LogFormat::Auto;
     let mut log_file: Option<PathBuf> = None;
+    let mut data_path = DataPathMode::Auto;
     let mut verbose: i32 = 0;
     let mut quiet = false;
 
@@ -241,6 +256,21 @@ where
                 };
             }
             'L' => log_file = opt.into_arg().map(cow_to_path),
+            'D' => {
+                let raw = opt.arg().unwrap_or("");
+                data_path = match raw {
+                    "auto" => DataPathMode::Auto,
+                    "kernel" => DataPathMode::Kernel,
+                    "userspace" => DataPathMode::Userspace,
+                    other => {
+                        return Err(ParseError::invalid(
+                            "data-path",
+                            other,
+                            BadEnumValue("expected one of: auto, kernel, userspace"),
+                        ));
+                    }
+                };
+            }
             '?' => {
                 let bad = opt.erropt().unwrap_or('?');
                 return Err(ParseError::UnknownOption(bad));
@@ -297,6 +327,7 @@ where
         log_format,
         log_file,
         log_level,
+        data_path,
     })))
 }
 

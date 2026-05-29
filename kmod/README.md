@@ -9,15 +9,29 @@ then registers a `ppp_channel` and (eventually) runs the
 steady-state SSTP demux entirely in kernel context.
 
 **v0.1 status.** The module compiles cleanly and exercises the
-full attach/detach lifecycle: `/dev/sstp` misc node, kTLS
-validation on the supplied TCP fd, `ppp_register_channel`,
-anon-inode session fd with `poll/read/ioctl` for events and
-stats, refcounted teardown on close. The per-frame paths
-(`sstp_rx_worker` in `sstp_demux.c`, `sstp_chan_start_xmit` in
-`sstp_chan.c`) are TODOs — they currently bump counters but do
-not actually move PPP frames. Loading the module is harmless;
-attaching a session creates a registered channel that ignores
-TX and never delivers RX until those TODOs land.
+full attach/detach lifecycle plus the per-frame paths in both
+directions:
+
+- **RX**: `sk_data_ready` hook → workqueue → `kernel_recvmsg` →
+  [MS-SSTP] §2.2.3 reassembly (max 4095 B frames straddling TLS
+  records) → `ppp_input()` per data frame. Malformed framing
+  surfaces as a `SSTP_EVT_PROTOCOL_ERROR` event on `session_fd`
+  and tears the session down.
+- **TX**: `ppp_channel_ops.start_xmit` prepends the 4-byte SSTP
+  data-packet header and `kernel_sendmsg`s on the kTLS socket;
+  short writes / hard errors abort the session.
+- **Userspace binding**: `SSTP_IOC_GET_CHAN_INDEX` returns the
+  registered channel id so userspace can `PPPIOCATTCHAN` +
+  `PPPIOCCONNECT` against its own `/dev/ppp` handle.
+
+Still TODO before v0.1 ships:
+
+- `sk_write_space` hook + `ppp_output_wakeup` so a full socket
+  buffer pauses ppp_generic instead of dropping the frame.
+- Control-packet (`C=1`) forwarding to userspace so the SSTP
+  hello timer can stay in userspace (today they are counted and
+  dropped).
+- TLS 1.3 `KeyUpdate` detection → `SSTP_EVT_TLS_REKEY_NEEDED`.
 
 ## Files
 
@@ -55,33 +69,59 @@ make -C kmod KDIR=/lib/modules/6.12.86+deb13-arm64/build
 The artifact lands at `kmod/sstp.ko`. `modinfo kmod/sstp.ko`
 should report `depends: ppp_generic` and `alias: devname:sstp`.
 
-## Loading (not yet supported in this container)
+## Loading
 
 ```sh
-sudo insmod kmod/sstp.ko       # requires ppp_generic loaded first
-sudo rmmod sstp                # safe even with attached sessions:
-                               # rmmod will wait for refs to drop
+sudo modprobe tls               # kTLS ULP; the kmod rejects attach without it
+sudo insmod kmod/sstp.ko        # /dev/sstp appears with mode 0600, root-only
+sudo rmmod sstp                 # safe even with attached sessions:
+                                # rmmod waits for refs to drop
 ```
 
-A loadable test against a real kernel is out of scope for the
-dev container; CI will need a VM (or a `kunit`-style harness).
+`ppp_generic` is built in on most distro kernels (`CONFIG_PPP=y` on
+Ubuntu); when it is a module (`=m`) modprobe it first.
+
+## Testing
+
+A self-contained userspace lifecycle test lives under
+[kmod/tests/](tests/). It exercises:
+
+- `/dev/sstp` open + ioctl dispatch.
+- Negative `SSTP_IOC_ATTACH` paths (bad ABI major, reserved-nonzero,
+  negative fd, non-socket fd, plain TCP without kTLS → `-EOPNOTSUPP`).
+- The happy path: loopback TCP with OpenSSL TLS 1.2 + AES-GCM and
+  `SSL_OP_ENABLE_KTLS` so the kernel sees a kTLS-equipped socket;
+  `ATTACH` succeeds, `GETSTATS` returns zeros, `poll()` is quiet,
+  `DETACH` flips the session into closing and `poll()` then reports
+  `POLLHUP`, `close(session_fd)` triggers the refcounted teardown.
+
+```sh
+cd kmod/tests
+make run        # builds kmod (if needed), loads it, runs test_sstp,
+                # prints last dmesg, attempts rmmod
+```
+
+Requires `libssl-dev` (OpenSSL 3.x) and passwordless `sudo` (for
+`insmod` / `rmmod` / running as `CAP_NET_ADMIN`).
 
 ## Next steps
 
 In rough order:
 
-1. **Receive demux** (`sstp_demux.c`): `kernel_recvmsg` on the
-   kTLS socket, parse `[MS-SSTP] §2.2.3` data-packet framing,
-   `ppp_input(&chan, skb)` per complete PPP frame inside.
-2. **Transmit framing** (`sstp_chan.c`): wrap outgoing PPP frames
-   in the SSTP data-packet header, `kernel_sendmsg` on the kTLS
-   socket. Handle `-EAGAIN` via the usual `sk_write_space`
-   callback and `ppp_output_wakeup`.
+1. **TX backpressure**: install `sk_write_space` on the TCP socket
+   so `-EAGAIN` from `kernel_sendmsg` returns 0 from start_xmit
+   (telling ppp_generic to queue), then `ppp_output_wakeup` when
+   space is available.
+2. **Control-packet forwarding**: post-handoff Echo Request /
+   Response should surface to userspace via a new
+   `SSTP_EVT_CONTROL_PACKET` event with the payload available via
+   a read of the session_fd, so the hello timer stays where the
+   state machine lives.
 3. **TLS rekey handling**: detect TLS 1.3 KeyUpdate records,
    emit `SSTP_EVT_TLS_REKEY_NEEDED`, suspend the data path until
    userspace reinstalls crypto info via `setsockopt(SOL_TLS, ...)`.
-4. **Unit binding**: expose `ppp_channel_index()` so userspace can
-   `PPPIOCATTCHAN` + `PPPIOCCONNECT` on its own `/dev/ppp` fd to
-   bind the kernel-side channel to the PPP unit it created earlier
-   (or invert the model — kernel allocates the unit too — once
-   the open question in `kernel-abi/sstp.h` is settled).
+4. **Userspace integration**: the Rust `kppp` module needs an
+   `attach()` helper that wraps `SSTP_IOC_ATTACH` +
+   `SSTP_IOC_GET_CHAN_INDEX` + `PPPIOCATTCHAN` + `PPPIOCCONNECT`
+   so a session can flip from userspace to kernel data path once
+   IPCP converges.

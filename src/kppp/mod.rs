@@ -43,8 +43,10 @@
 
 #![allow(dead_code)]
 
+pub mod datapath;
 pub mod ioctl;
 pub mod netlink;
+pub mod sstp_kmod;
 pub mod unit;
 
 /// IPv4 configuration applied to a `pppN` interface after IPCP.

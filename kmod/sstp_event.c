@@ -154,6 +154,16 @@ static long sstp_session_ioctl(struct file *file, unsigned int cmd,
 			return -EFAULT;
 		return 0;
 	}
+	case SSTP_IOC_GET_CHAN_INDEX: {
+		__s32 idx;
+
+		if (!s->chan_registered)
+			return -ENXIO;
+		idx = ppp_channel_index(&s->chan);
+		if (copy_to_user(uarg, &idx, sizeof(idx)))
+			return -EFAULT;
+		return 0;
+	}
 	default:
 		return -ENOTTY;
 	}

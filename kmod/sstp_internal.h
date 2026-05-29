@@ -27,6 +27,15 @@
 
 #define SSTP_MOD_NAME "sstp"
 
+/* SSTP packet framing constants ([MS-SSTP] §2.2.1, §2.2.3). The
+ * outer header is 4 bytes: version (1), reserved+C (1), 16-bit
+ * LengthPacket (4-bit R + 12-bit total length). */
+#define SSTP_VERSION_1_0      0x10
+#define SSTP_HEADER_LEN       4
+#define SSTP_LEN_MASK         0x0FFF       /* 12-bit length field */
+#define SSTP_C_BIT            0x01         /* control = 1, data = 0 */
+#define SSTP_MAX_PACKET_LEN   SSTP_LEN_MASK
+
 /* Maximum number of queued SSTP_EVT_* events per session before we
  * coalesce-drop. Events are infrequent (peer close, TLS fatal,
  * rekey-needed, protocol error) so this is generous. */
@@ -77,6 +86,22 @@ struct sstp_session {
 	struct work_struct    rx_work;
 	struct workqueue_struct *wq;
 
+	/* RX reassembly buffer. SSTP frames are length-prefixed
+	 * (max 4095 bytes per [MS-SSTP] §2.2.3) but can straddle
+	 * TLS-record boundaries; we accumulate bytes here and parse
+	 * complete frames out of the head. Accessed only from the
+	 * rx_worker, so no lock needed. */
+	u8                   *rx_buf;
+	u32                   rx_len;        /* bytes valid at head */
+#define SSTP_RX_BUF_CAP       8192       /* > 2 * max SSTP frame */
+
+	/* Original socket callbacks, saved at attach so we can
+	 * restore them at detach without leaking our wakeup hook
+	 * into a socket the caller may keep open. */
+	void                (*saved_data_ready)(struct sock *sk);
+	void                 *saved_user_data;
+	bool                  cb_installed;
+
 	/* Set when the session is being torn down; the rx worker
 	 * checks this and exits its loop. */
 	bool                  closing;
@@ -101,5 +126,7 @@ extern const struct ppp_channel_ops sstp_chan_ops;
 /* Data path (sstp_demux.c). */
 void sstp_rx_worker(struct work_struct *w);
 void sstp_demux_shutdown(struct sstp_session *s);
+void sstp_demux_install_callback(struct sstp_session *s);
+void sstp_demux_remove_callback(struct sstp_session *s);
 
 #endif /* _SSTP_INTERNAL_H */
