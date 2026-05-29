@@ -1,7 +1,8 @@
 //! `sstp-server` binary entry point.
 //!
 //! Boots the `tokio` runtime(s), installs the `tracing` subscriber with a
-//! non-blocking appender, and waits for `SIGINT`/`SIGTERM` to drain.
+//! non-blocking appender, supports `SIGHUP` TLS material reload, and
+//! waits for `SIGINT`/`SIGTERM` to drain.
 //!
 //! The runtime topology mirrors the Architecture section in `CLAUDE.md`:
 //! one `current_thread` `tokio` runtime per I/O worker thread (each with its
@@ -24,7 +25,9 @@ mod session;
 mod sstp;
 
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -47,6 +50,14 @@ const LOG_QUEUE_LINES: usize = 8192;
 /// remaining sessions. Mirrors the typical PPP `Max-Terminate` budget
 /// (RFC 1661 §4.1: 2 retransmits × 3 s) with headroom for TLS close.
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// Shared TLS server context handle. `RwLock` is the right primitive here:
+/// the read path (`accept_loop` cloning the inner `SslContext`) is
+/// uncontended in steady state and the critical section is just an
+/// `SSL_CTX_up_ref` (one atomic increment). The write path (`SIGHUP`
+/// reload) fires at most hourly in an ACME deployment and blocks accepts
+/// for microseconds — invisible next to TLS handshake latency.
+type SharedTlsContext = Arc<RwLock<SslContext>>;
 
 fn main() -> ExitCode {
     // Developer convenience: populate env from `.env` if present. No-op in
@@ -108,6 +119,7 @@ fn run(config: &Config) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let tls_ctx: SharedTlsContext = Arc::new(RwLock::new(tls_ctx));
 
     // RADIUS shared secret — env-only, never argv. Read here so the
     // server fails fast if it's missing, before any sockets are bound.
@@ -251,6 +263,9 @@ fn run(config: &Config) -> ExitCode {
 
     let shutdown_for_signal = shutdown_tx.clone();
     let drain_registry = registry.clone();
+    let reload_tls = tls_ctx.clone();
+    let reload_cert = config.cert.clone();
+    let reload_key = config.key.clone();
     let control_state = control::ControlState {
         registry: registry.clone(),
         shutdown_tx: shutdown_tx.clone(),
@@ -260,6 +275,12 @@ fn run(config: &Config) -> ExitCode {
     };
     let control_shutdown_rx = shutdown_tx.subscribe();
     auth_runtime.block_on(async move {
+        tokio::spawn(watch_sighup_reload_tls(
+            reload_tls,
+            reload_cert,
+            reload_key,
+        ));
+
         // Hand the pre-bound control socket to a runtime task. Failures
         // here can only come from `from_std`, which only fails if the
         // OS refuses to register the fd — extremely unusual.
@@ -369,7 +390,7 @@ fn io_worker_main(
     mut shutdown: broadcast::Receiver<()>,
     registry: Registry,
     shutdown_tx: broadcast::Sender<()>,
-    tls_ctx: SslContext,
+    tls_ctx: SharedTlsContext,
     auth_bridge: AuthBridge,
     local_ip: std::net::Ipv4Addr,
     data_path: cli::DataPathMode,
@@ -400,7 +421,7 @@ async fn accept_loop(
     shutdown: &mut broadcast::Receiver<()>,
     registry: Registry,
     shutdown_tx: broadcast::Sender<()>,
-    tls_ctx: SslContext,
+    tls_ctx: SharedTlsContext,
     auth_bridge: AuthBridge,
     local_ip: std::net::Ipv4Addr,
     data_path: cli::DataPathMode,
@@ -426,7 +447,10 @@ async fn accept_loop(
                     let (id, control_rx) = session::spawn_handle(&registry, peer);
                     let drain_rx = shutdown_tx.subscribe();
                     let registry = registry.clone();
-                    let session_tls = tls_ctx.clone();
+                    let session_tls = tls_ctx
+                        .read()
+                        .expect("TLS context RwLock poisoned")
+                        .clone();
                     let session_auth = auth_bridge.clone();
                     let handle = tokio::task::spawn_local(session::run(
                         stream, peer, id, registry, control_rx, drain_rx, session_tls, session_auth, local_ip, data_path,
@@ -476,6 +500,38 @@ async fn wait_for_shutdown(mut admin_rx: broadcast::Receiver<()>) {
         _ = tokio::signal::ctrl_c() => info!("received SIGINT, shutting down"),
         _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
         _ = admin_rx.recv() => info!("received control-socket shutdown, shutting down"),
+    }
+}
+
+async fn watch_sighup_reload_tls(tls_ctx: SharedTlsContext, cert: PathBuf, key: PathBuf) {
+    let mut sighup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "failed to install SIGHUP handler; TLS reload disabled");
+            return;
+        }
+    };
+
+    loop {
+        sighup.recv().await;
+        match SslContext::server_from_pem(&cert, &key) {
+            Ok(new_ctx) => {
+                *tls_ctx.write().expect("TLS context RwLock poisoned") = new_ctx;
+                info!(
+                    cert = %cert.display(),
+                    key = %key.display(),
+                    "reloaded TLS material on SIGHUP; new connections use updated certificate"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    cert = %cert.display(),
+                    key = %key.display(),
+                    "SIGHUP TLS reload failed; keeping current certificate"
+                );
+            }
+        }
     }
 }
 
