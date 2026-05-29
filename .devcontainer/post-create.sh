@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Dev container post-create hook.
 #
-# Installs system build dependencies and compiles the ndmsystems/sstp-client
-# binary for use in integration / interop tests (so the test suite does not
-# require a Windows or MikroTik client on the network).
+# Installs system build dependencies and compiles the upstream
+# sstp-project/sstp-client binary (https://gitlab.com/sstp-project/sstp-client)
+# for use in integration / interop tests (so the test suite does not require
+# a Windows or MikroTik client on the network).
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
@@ -28,8 +29,8 @@ sudo apt-get install -y --no-install-recommends \
     ca-certificates \
     git
 
-SSTP_CLIENT_REPO="https://github.com/ndmsystems/sstp-client.git"
-SSTP_CLIENT_REF="ndm-1.0.12"
+SSTP_CLIENT_REPO="https://gitlab.com/sstp-project/sstp-client.git"
+SSTP_CLIENT_REF="1.0.20"
 SRC_DIR="/opt/sstp-client/src"
 PREFIX="/opt/sstp-client"
 

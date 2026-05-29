@@ -12,7 +12,7 @@
 		}
 	],
 
-	"containerEnv": {
+	"remoteEnv": {
 		"PATH": "${containerEnv:HOME}/.local/bin:${containerEnv:PATH}",
 		"SSTPC_BIN": "${containerEnv:HOME}/.local/bin/sstpc"
 	},
