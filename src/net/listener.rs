@@ -60,11 +60,13 @@ pub enum ListenError {
     },
 }
 
-/// Build a `SO_REUSEPORT` TCP listener bound to `addr` and registered
-/// with the current `tokio` runtime.
-///
-/// Call this once per I/O worker with the same address.
-pub fn bind_reuseport(addr: SocketAddr) -> Result<TcpListener, ListenError> {
+/// Build a `SO_REUSEPORT` TCP listener bound to `addr` as a plain
+/// `std::net::TcpListener`. Use this from a synchronous context
+/// (notably `main()` before any tokio runtime exists) when the bind
+/// needs to happen at startup — e.g. while we still have
+/// `CAP_NET_BIND_SERVICE` and before `privdrop`. Each worker calls
+/// [`adopt`] on the returned listener from inside its own runtime.
+pub fn bind_reuseport_std(addr: SocketAddr) -> Result<std::net::TcpListener, ListenError> {
     let domain = match addr {
         SocketAddr::V4(_) => Domain::IPV4,
         SocketAddr::V6(_) => Domain::IPV6,
@@ -91,8 +93,25 @@ pub fn bind_reuseport(addr: SocketAddr) -> Result<TcpListener, ListenError> {
     sock.listen(LISTEN_BACKLOG)
         .map_err(|source| ListenError::Listen { addr, source })?;
 
-    let std_listener: std::net::TcpListener = sock.into();
+    Ok(sock.into())
+}
+
+/// Wrap a pre-bound `std::net::TcpListener` in tokio's runtime-bound
+/// type. Must be called from within a tokio runtime context.
+pub fn adopt(std_listener: std::net::TcpListener) -> Result<TcpListener, ListenError> {
+    let addr = std_listener
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
     TcpListener::from_std(std_listener).map_err(|source| ListenError::Register { addr, source })
+}
+
+/// Build a `SO_REUSEPORT` TCP listener bound to `addr` and registered
+/// with the current `tokio` runtime. Convenience wrapper over
+/// [`bind_reuseport_std`] + [`adopt`] for tests / callers that
+/// don't care about privdrop sequencing.
+#[cfg(test)]
+pub fn bind_reuseport(addr: SocketAddr) -> Result<TcpListener, ListenError> {
+    adopt(bind_reuseport_std(addr)?)
 }
 
 #[cfg(test)]

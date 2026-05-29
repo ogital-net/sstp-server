@@ -33,7 +33,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::cert::gen_self_signed;
-use common::radius::{Credential, DummyRadius};
+use common::radius::{Credential, DummyRadius, PapOutcome};
 use common::spawn::ServerBuilder;
 use common::{free_tcp_port, free_udp_port, loopback, TempDir};
 
@@ -74,9 +74,29 @@ fn sstpc_skip_reason() -> Option<String> {
 }
 
 fn which(prog: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let cand = dir.join(prog);
+    // Fallback to well-known install locations. The VS Code test
+    // runner inherits a stripped PATH that often omits
+    // `~/.local/bin` and `/opt/*/sbin`, so the shell-level `which`
+    // succeeds while the in-test probe used to skip. Check the
+    // dev-container's canonical sstpc paths directly.
+    const FALLBACKS: &[&str] = &[
+        "/home/vscode/.local/bin",
+        "/opt/sstp-client/sbin",
+        "/usr/local/sbin",
+        "/usr/sbin",
+        "/sbin",
+    ];
+    // PATH first, so an explicit override wins.
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join(prog);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    for dir in FALLBACKS {
+        let cand = std::path::Path::new(dir).join(prog);
         if cand.is_file() {
             return Some(cand);
         }
@@ -166,10 +186,21 @@ async fn tls_handshake_smoke() {
 /// server. Skipped if prerequisites (sstpc, /dev/ppp, root) are not
 /// available — see [`sstpc_skip_reason`].
 ///
-/// Current assertion bar: server accepts the TCP connection from
-/// `sstpc`. The session driver is M6 work; once it lands this test
-/// should assert RADIUS was reached, the user-name matched, and
-/// `sstpc` reported a successful link.
+/// **M6h graduated assertions.** When prerequisites are present this
+/// drives the full PAP path end-to-end and checks:
+///   * the dummy RADIUS authenticator received exactly one
+///     `Access-Request` with `User-Name=alice` and a PAP outcome of
+///     `Match`;
+///   * the server logged "kernel PPP unit attached" (M6g brought up
+///     `pppN` via `/dev/ppp` + netlink);
+///   * the resulting netdev exists and carries the
+///     `Framed-IP-Address` as its P2P peer.
+///
+/// We deliberately *do not* assert `sstpc`'s exit status: the harness
+/// SIGKILLs it once the kernel PPP unit appears, so its exit will be
+/// signal-terminated. Asserting a clean exit would require driving
+/// `sstpc`'s own teardown path, which is outside the SSTP server's
+/// responsibility.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sstpc_pap_login() {
     if let Some(reason) = sstpc_skip_reason() {
@@ -191,12 +222,11 @@ async fn sstpc_pap_login() {
 
     // sstpc usage:
     //   sstpc [opts] <hostname> [pppd opts]
-    // We bypass cert verification with --cert-warn / --ipparam and
-    // pass the PAP user via the standard pppd options. --nolaunchpppd
-    // would skip the pppd fork but then sstpc has nothing to do with
-    // the PPP frames; we want the full path.
+    // `noauth` disables peer-auth requirements; `user`/`password`
+    // give pppd the PAP credentials it offers when the server
+    // proposes Auth-Protocol=PAP.
     let host = format!("127.0.0.1:{sstp_port}");
-    let status = tokio::task::spawn_blocking(move || {
+    let sstpc = tokio::task::spawn_blocking(move || {
         Command::new("sstpc")
             .args([
                 "--cert-warn",
@@ -216,44 +246,90 @@ async fn sstpc_pap_login() {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // Give sstpc a hard timeout via SIGKILL on drop — the
-            // test framework's per-test timeout won't reap the
-            // pppd child if sstpc gets stuck.
             .spawn()
-            .map(|mut child| {
-                // Wait at most 5s — sstpc should either succeed or
-                // fail fast against a server that doesn't speak
-                // SSTP-over-HTTPS yet.
-                std::thread::sleep(Duration::from_secs(5));
-                let _ = child.kill();
-                let out = child.wait_with_output().expect("reap sstpc");
-                (out.status, out.stdout, out.stderr)
-            })
-    })
-    .await
-    .expect("sstpc join")
-    .expect("spawn sstpc");
+            .expect("spawn sstpc")
+    });
+    let mut child = sstpc.await.expect("sstpc spawn join");
 
-    let stdout = String::from_utf8_lossy(&status.1);
-    let stderr = String::from_utf8_lossy(&status.2);
+    // The decisive event is M6g's "kernel PPP unit attached" log
+    // line, emitted once IPCP converges and the netlink bring-up
+    // succeeds. Give the full PAP + IPCP round-trip a generous
+    // window — pppd is slow to start under load.
+    let attach_line = server.wait_for_log("kernel PPP unit attached", Duration::from_secs(15));
 
-    // Server should have logged a session accept.
-    let saw_session = server
-        .wait_for_log("session accepted", Duration::from_secs(2))
-        .is_some();
+    // Reap sstpc unconditionally so we don't leak the child if an
+    // assertion below fires.
+    let _ = child.kill();
+    let out = child.wait_with_output().expect("reap sstpc");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let attach_line = attach_line.unwrap_or_else(|| {
+        panic!(
+            "did not see 'kernel PPP unit attached' within 15s.\n\
+             sstpc stdout:\n{stdout}\nsstpc stderr:\n{stderr}\n\
+             server logs:\n{}",
+            server.drain_logs().join("\n")
+        )
+    });
+
+    // Pull the netdev name out of the structured log so the
+    // post-condition check targets the exact interface this test
+    // brought up (avoids racing against parallel test runs that
+    // might also be creating `pppN` units).
+    let ifname = extract_kv(&attach_line, "ifname").unwrap_or_else(|| {
+        panic!("no 'ifname=' field in attach log line: {attach_line}")
+    });
+
+    // RADIUS-side post-conditions: exactly one Access-Request, for
+    // our user, with a matching PAP password.
+    let seen = radius.seen();
+    assert_eq!(
+        seen.len(),
+        1,
+        "expected exactly one RADIUS request; got {}: {seen:#?}",
+        seen.len()
+    );
+    let req = &seen[0];
+    assert_eq!(
+        req.username.as_deref(),
+        Some(TEST_USER),
+        "RADIUS User-Name mismatch: {req:#?}"
+    );
     assert!(
-        saw_session,
-        "expected 'session accepted' in server logs after sstpc connect.\n\
-         sstpc stdout:\n{stdout}\nsstpc stderr:\n{stderr}\n\
-         server logs:\n{}",
-        server.drain_logs().join("\n")
+        matches!(req.pap_outcome, Some(PapOutcome::Match)),
+        "RADIUS PAP outcome != Match: {req:#?}"
     );
 
-    // FUTURE: once the session driver lands, replace the next two
-    // assertions with a positive check on `radius.seen()` (PAP
-    // outcome == Match for `alice`) and on sstpc's exit status.
-    let seen = radius.seen();
-    eprintln!("dummy RADIUS observed {} requests: {seen:#?}", seen.len());
+    // Kernel-side post-condition: the netdev the server logged
+    // exists and carries the Framed-IP-Address as its P2P peer.
+    let ip_out = Command::new("ip")
+        .args(["-o", "addr", "show", "dev", &ifname])
+        .output()
+        .expect("invoke `ip addr show`");
+    assert!(
+        ip_out.status.success(),
+        "`ip addr show {ifname}` failed: {:?}",
+        String::from_utf8_lossy(&ip_out.stderr)
+    );
+    let addr_str = String::from_utf8_lossy(&ip_out.stdout);
+    let needle = format!("peer {TEST_FRAMED_IP}");
+    assert!(
+        addr_str.contains(&needle),
+        "expected `{needle}` on {ifname}, got:\n{addr_str}"
+    );
+}
+
+/// Extract `key=value` from a tracing-formatted log line. Returns the
+/// trimmed value (terminated by whitespace) or `None` if the key is
+/// absent. Used by the e2e test to pluck `ifname=ppp0` out of the
+/// "kernel PPP unit attached" line.
+fn extract_kv(line: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    let start = line.find(&needle)? + needle.len();
+    let rest = &line[start..];
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
 }
 
 /// SSTP HTTPS preamble (MS-SSTP §3.2.4.1 / §4.1): send the canonical

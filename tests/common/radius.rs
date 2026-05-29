@@ -22,6 +22,10 @@ use radius_tokio::server::{
 use radius_tokio::{AttributesView, Code};
 use tokio::task::JoinHandle;
 
+/// Re-exported for tests so they can match against `pap_outcome`
+/// without depending on `radius_tokio` directly.
+pub use radius_tokio::auth::VerifyOutcome as PapOutcome;
+
 pub const DEFAULT_SECRET: &[u8] = b"testing123";
 
 /// Captured information about one inbound request. Kept narrow on

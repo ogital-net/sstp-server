@@ -19,6 +19,7 @@ mod kppp;
 mod metrics;
 mod net;
 mod ppp;
+mod privdrop;
 mod session;
 mod sstp;
 
@@ -36,6 +37,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
+use crate::auth::bridge::AuthBridge;
 use crate::cli::{Config, LogFormat, ParseOutcome};
 use crate::crypto::tls::SslContext;
 use crate::session::{DisconnectReason, Registry};
@@ -81,10 +83,19 @@ fn main() -> ExitCode {
     exit
 }
 
+#[allow(clippy::too_many_lines)] // boot sequence: linear top-to-bottom, splitting hurts readability
 fn run(config: &Config) -> ExitCode {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let registry = Registry::new();
     let started = std::time::Instant::now();
+
+    // ---- Phase 1: privileged setup (still as root if so launched) ----
+    //
+    // Everything that needs CAP_NET_BIND_SERVICE, root-readable key
+    // files, or write access to `/run/` must happen here. After this
+    // block we may `setuid` away to an unprivileged user; only
+    // CAP_NET_ADMIN is retained, since per-session `/dev/ppp` ioctls
+    // and netlink RTM_NEWADDR still need it.
 
     // Build the shared TLS server context once. `SslContext` is cheap to
     // clone (it's an `SSL_CTX_up_ref` under the hood) and is documented
@@ -98,8 +109,94 @@ fn run(config: &Config) -> ExitCode {
         }
     };
 
+    // RADIUS shared secret — env-only, never argv. Read here so the
+    // server fails fast if it's missing, before any sockets are bound.
+    let radius_secret = match std::env::var(cli::SSTP_RADIUS_SECRET) {
+        Ok(s) if !s.is_empty() => s.into_bytes(),
+        _ => {
+            tracing::error!(
+                env_var = cli::SSTP_RADIUS_SECRET,
+                "RADIUS shared secret not set; refusing to start"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let radius_secret: std::sync::Arc<[u8]> = radius_secret.into();
+    let radius_servers: Vec<(std::net::SocketAddr, std::sync::Arc<[u8]>)> = config
+        .radius
+        .iter()
+        .map(|addr| (*addr, std::sync::Arc::clone(&radius_secret)))
+        .collect();
+
+    // Bind one SO_REUSEPORT std listener per I/O worker. Done now,
+    // before any tokio runtime exists, so we can hand the listeners
+    // to workers post-`privdrop` — they'd lack CAP_NET_BIND_SERVICE
+    // by then.
+    let mut listeners: Vec<std::net::TcpListener> = Vec::with_capacity(config.io_threads.get());
+    for id in 0..config.io_threads.get() {
+        match net::bind_reuseport_std(config.listen) {
+            Ok(l) => listeners.push(l),
+            Err(e) => {
+                tracing::error!(worker = id, error = %e, listen = %config.listen, "failed to bind listener");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // Resolve the drop target (if any) before opening the control
+    // socket, so we can chown the socket file to the right owner
+    // straight after `bind()`.
+    let drop_identity = match resolve_drop_identity(config) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to resolve --user/--group");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Pre-bind the control socket (typically under `/run/`, which is
+    // root-only writable). Chown to the drop target so the dropped
+    // user can `unlink()` it on shutdown.
+    let control_bound = match config.control_socket.as_deref() {
+        Some(path) => {
+            let owner = drop_identity.map(|id| (id.uid, id.gid));
+            match control::bind(path, owner) {
+                Ok(l) => Some((path.to_path_buf(), l)),
+                Err(e) => {
+                    tracing::error!(error = %e, path = %path.display(), "failed to bind control socket");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        None => None,
+    };
+
+    // ---- Phase 2: drop privileges (still single-threaded) ----
+    if let Some(id) = drop_identity {
+        if let Err(e) = privdrop::drop_to(id, &[privdrop::CAP_NET_ADMIN]) {
+            tracing::error!(error = %e, "privilege drop failed");
+            return ExitCode::from(1);
+        }
+        info!(
+            uid = id.uid,
+            gid = id.gid,
+            user = %privdrop::name_for_uid(id.uid),
+            retained_caps = "CAP_NET_ADMIN",
+            "dropped privileges"
+        );
+    }
+
+    // Probe the SSTP kernel module once at startup so the operator
+    // sees a single boot-time line about which data path is in play.
+    // The per-session attach in `kppp::session::KpppSession::bring_up`
+    // also gates on this, but the startup log is what an operator
+    // looks for when troubleshooting.
+    let effective_data_path = resolve_data_path_mode(config.data_path);
+
+    // ---- Phase 3: spin up runtimes and worker threads ----
+
     // Auth runtime: multi-threaded so a slow RADIUS server can't head-of-line
-    // block. M4 will spawn the actual auth tasks here.
+    // block.
     let auth_runtime = Builder::new_multi_thread()
         .worker_threads(config.auth_threads.get())
         .thread_name("sstp-auth")
@@ -107,21 +204,46 @@ fn run(config: &Config) -> ExitCode {
         .build()
         .expect("build auth runtime");
 
-    // I/O workers: one current_thread runtime per worker thread, each with
-    // its own LocalSet. Every worker binds an SO_REUSEPORT listener on the
-    // configured address; the kernel hashes incoming SYNs across them so
-    // the worker that accepts a connection also owns it for life.
+    let auth_bridge = match auth_runtime.block_on(AuthBridge::spawn(
+        auth_runtime.handle(),
+        "0.0.0.0:0".parse().expect("valid bind addr"),
+        radius_servers,
+    )) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to bind RADIUS client socket");
+            return ExitCode::from(1);
+        }
+    };
+
+    // I/O workers: one current_thread runtime per worker thread, each
+    // with its own LocalSet. Each worker `adopt()`s the std listener
+    // we pre-bound above.
     let mut workers = Vec::with_capacity(config.io_threads.get());
-    for id in 0..config.io_threads.get() {
+    for (id, std_listener) in listeners.into_iter().enumerate() {
         let rx = shutdown_tx.subscribe();
         let listen_addr = config.listen;
+        let local_ip = config.local_ip;
+        let data_path = effective_data_path;
         let worker_registry = registry.clone();
         let worker_shutdown = shutdown_tx.clone();
         let worker_tls = tls_ctx.clone();
+        let worker_auth = auth_bridge.clone();
         let handle = thread::Builder::new()
             .name(format!("sstp-io-{id}"))
             .spawn(move || {
-                io_worker_main(id, listen_addr, rx, worker_registry, worker_shutdown, worker_tls);
+                io_worker_main(
+                    id,
+                    listen_addr,
+                    std_listener,
+                    rx,
+                    worker_registry,
+                    worker_shutdown,
+                    worker_tls,
+                    worker_auth,
+                    local_ip,
+                    data_path,
+                );
             })
             .expect("spawn I/O worker");
         workers.push(handle);
@@ -129,7 +251,6 @@ fn run(config: &Config) -> ExitCode {
 
     let shutdown_for_signal = shutdown_tx.clone();
     let drain_registry = registry.clone();
-    let control_socket_path = config.control_socket.clone();
     let control_state = control::ControlState {
         registry: registry.clone(),
         shutdown_tx: shutdown_tx.clone(),
@@ -139,12 +260,12 @@ fn run(config: &Config) -> ExitCode {
     };
     let control_shutdown_rx = shutdown_tx.subscribe();
     auth_runtime.block_on(async move {
-        // Spawn the control socket if configured. Failures to bind are
-        // logged but do not abort the server — the data plane keeps
-        // running.
-        if let Some(path) = control_socket_path {
+        // Hand the pre-bound control socket to a runtime task. Failures
+        // here can only come from `from_std`, which only fails if the
+        // OS refuses to register the fd — extremely unusual.
+        if let Some((path, listener)) = control_bound {
             tokio::spawn(async move {
-                if let Err(e) = control::serve(&path, control_state, control_shutdown_rx).await {
+                if let Err(e) = control::serve(path, listener, control_state, control_shutdown_rx).await {
                     warn!(error = %e, "control socket failed");
                 }
             });
@@ -185,13 +306,73 @@ fn run(config: &Config) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Resolve `--user` / `--group` into a [`privdrop::Identity`]. Returns
+/// `Ok(None)` when no `--user` was supplied (privdrop is opt-in).
+fn resolve_drop_identity(config: &Config) -> Result<Option<privdrop::Identity>, privdrop::DropError> {
+    let Some(user) = config.drop_user.as_deref() else {
+        return Ok(None);
+    };
+    let mut id = privdrop::lookup_user(user)?;
+    if let Some(group) = config.drop_group.as_deref() {
+        id.gid = privdrop::lookup_group(group)?;
+    }
+    Ok(Some(id))
+}
+
+/// Probe `/dev/sstp` once at boot and reconcile with the operator's
+/// `--data-path` choice. Returns the effective mode the per-session
+/// bring-up will pass to [`kppp::datapath::DataPath::open`].
+///
+/// `Auto` collapses to either `Auto` (kmod present) or `Userspace`
+/// (kmod absent) so each session attach doesn't have to re-probe and
+/// re-log. `Kernel` and `Userspace` pass through; explicit `Kernel`
+/// with no kmod is logged as an error but not aborted here — the
+/// per-session attach will fail loudly per connection, which is the
+/// right granularity to alert on.
+fn resolve_data_path_mode(requested: cli::DataPathMode) -> cli::DataPathMode {
+    use cli::DataPathMode;
+    use kppp::sstp_kmod::{self, KmodError};
+
+    match (requested, sstp_kmod::probe()) {
+        (DataPathMode::Userspace, _) => {
+            info!("data-path: userspace (operator-selected)");
+            DataPathMode::Userspace
+        }
+        (DataPathMode::Kernel, Ok(())) => {
+            info!("data-path: kernel (sstp kmod present at /dev/sstp)");
+            DataPathMode::Kernel
+        }
+        (DataPathMode::Kernel, Err(e)) => {
+            tracing::error!(error = %e, "data-path: kernel requested but /dev/sstp probe failed; per-session attaches will fail");
+            DataPathMode::Kernel
+        }
+        (DataPathMode::Auto, Ok(())) => {
+            info!("data-path: auto (sstp kmod available; sessions use /dev/ppp by default and attempt kernel attach only when negotiated TLS is kTLS-compatible)");
+            DataPathMode::Auto
+        }
+        (DataPathMode::Auto, Err(KmodError::NotAvailable)) => {
+            info!("data-path: userspace (sstp kmod not loaded; falling back to /dev/ppp copy)");
+            DataPathMode::Userspace
+        }
+        (DataPathMode::Auto, Err(e)) => {
+            warn!(error = %e, "data-path: /dev/sstp present but unusable; falling back to userspace");
+            DataPathMode::Userspace
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // worker boot: every arg is essential per-worker context
 fn io_worker_main(
     id: usize,
     listen: std::net::SocketAddr,
+    std_listener: std::net::TcpListener,
     mut shutdown: broadcast::Receiver<()>,
     registry: Registry,
     shutdown_tx: broadcast::Sender<()>,
     tls_ctx: SslContext,
+    auth_bridge: AuthBridge,
+    local_ip: std::net::Ipv4Addr,
+    data_path: cli::DataPathMode,
 ) {
     let rt: Runtime = Builder::new_current_thread()
         .enable_all()
@@ -200,18 +381,19 @@ fn io_worker_main(
         .expect("build I/O worker runtime");
     let local = LocalSet::new();
     local.block_on(&rt, async move {
-        let listener = match net::bind_reuseport(listen) {
+        let listener = match net::adopt(std_listener) {
             Ok(l) => l,
             Err(e) => {
-                tracing::error!(worker = id, error = %e, "failed to bind listener");
+                tracing::error!(worker = id, error = %e, "failed to register listener with tokio");
                 return;
             }
         };
         info!(worker = id, listen = %listen, "listener ready");
-        accept_loop(id, listener, &mut shutdown, registry, shutdown_tx, tls_ctx).await;
+        accept_loop(id, listener, &mut shutdown, registry, shutdown_tx, tls_ctx, auth_bridge, local_ip, data_path).await;
     });
 }
 
+#[allow(clippy::too_many_arguments)] // accept loop: every arg is essential per-worker context
 async fn accept_loop(
     worker_id: usize,
     listener: tokio::net::TcpListener,
@@ -219,6 +401,9 @@ async fn accept_loop(
     registry: Registry,
     shutdown_tx: broadcast::Sender<()>,
     tls_ctx: SslContext,
+    auth_bridge: AuthBridge,
+    local_ip: std::net::Ipv4Addr,
+    data_path: cli::DataPathMode,
 ) {
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
     loop {
@@ -242,8 +427,9 @@ async fn accept_loop(
                     let drain_rx = shutdown_tx.subscribe();
                     let registry = registry.clone();
                     let session_tls = tls_ctx.clone();
+                    let session_auth = auth_bridge.clone();
                     let handle = tokio::task::spawn_local(session::run(
-                        stream, peer, id, registry, control_rx, drain_rx, session_tls,
+                        stream, peer, id, registry, control_rx, drain_rx, session_tls, session_auth, local_ip, data_path,
                     ));
                     tasks.push(handle);
                 }

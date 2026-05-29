@@ -77,15 +77,19 @@ pub struct ControlState {
     pub auth_threads: usize,
 }
 
-/// Bind the control socket and run the accept loop until `shutdown_rx`
-/// fires. The socket file is removed on exit.
-pub async fn serve(
+/// Bind the control socket file synchronously and return both the
+/// `std::os::unix::net::UnixListener` (so the caller can register it
+/// with a tokio runtime after `privdrop`) and the path to the socket
+/// file (re-emitted so callers don't have to track it separately).
+///
+/// Removes a stale socket file from a previous run, sets `0660`
+/// permissions, and `chown`s the socket to `(uid, gid)` when the
+/// owner is provided — useful when the daemon will `setuid` away
+/// from root after this call.
+pub fn bind(
     path: &Path,
-    state: ControlState,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) -> Result<(), BindError> {
-    // Remove a stale socket file from a previous run. EEXIST is the
-    // common case; ENOENT is fine; anything else is fatal.
+    owner: Option<(libc::uid_t, libc::gid_t)>,
+) -> Result<std::os::unix::net::UnixListener, BindError> {
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(BindError::Remove {
@@ -95,13 +99,53 @@ pub async fn serve(
         }
     }
 
-    let listener = UnixListener::bind(path).map_err(|source| BindError::Bind {
+    let listener = std::os::unix::net::UnixListener::bind(path).map_err(|source| {
+        BindError::Bind {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    listener.set_nonblocking(true).map_err(|source| BindError::Bind {
         path: path.to_path_buf(),
         source,
     })?;
     let perms = std::fs::Permissions::from_mode(SOCKET_MODE);
     std::fs::set_permissions(path, perms).map_err(|source| BindError::Permissions {
         path: path.to_path_buf(),
+        source,
+    })?;
+    if let Some((uid, gid)) = owner {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(
+            |source| BindError::Permissions {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, source),
+            },
+        )?;
+        // SAFETY: `chown` takes a NUL-terminated path and uid/gid
+        // values; we own `c_path` for the duration of the call.
+        let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+        if rc != 0 {
+            return Err(BindError::Permissions {
+                path: path.to_path_buf(),
+                source: std::io::Error::last_os_error(),
+            });
+        }
+    }
+    Ok(listener)
+}
+
+/// Run the accept loop over a pre-bound listener until `shutdown_rx`
+/// fires. `path` is only used so the socket file can be unlinked on
+/// shutdown — the caller is responsible for having already opened
+/// the socket via [`bind`].
+pub async fn serve(
+    path: PathBuf,
+    listener: std::os::unix::net::UnixListener,
+    state: ControlState,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> Result<(), BindError> {
+    let listener = UnixListener::from_std(listener).map_err(|source| BindError::Bind {
+        path: path.clone(),
         source,
     })?;
     info!(path = %path.display(), mode = format!("{:o}", SOCKET_MODE), "control socket ready");
@@ -127,7 +171,7 @@ pub async fn serve(
         }
     }
 
-    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(&path);
     Ok(())
 }
 
@@ -362,7 +406,8 @@ mod tests {
         let (state, shutdown_rx) = test_state();
         let sock_clone = sock.clone();
         let task = tokio::spawn(async move {
-            serve(&sock_clone, state, shutdown_rx).await.unwrap();
+            let listener = bind(&sock_clone, None).unwrap();
+            serve(sock_clone, listener, state, shutdown_rx).await.unwrap();
         });
         // Wait for bind.
         for _ in 0..50 {

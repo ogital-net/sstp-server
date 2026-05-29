@@ -8,8 +8,11 @@
 //!   probe failures are propagated as errors.
 //! - [`DataPathMode::Userspace`] — always use the userspace copier,
 //!   no kmod probe attempted.
-//! - [`DataPathMode::Auto`] (the default) — try the kernel path; on
-//!   any error log a single warning and fall back to userspace.
+//! - [`DataPathMode::Auto`] (the default) — callers may choose to
+//!   route a given session straight to userspace (for example when
+//!   negotiated TLS parameters are outside the current kTLS allow-list)
+//!   or ask `open()` to attempt kernel attach. On attach failure, log
+//!   a warning and fall back to userspace.
 //!
 //! The userspace copier is a thin wrapper around the existing
 //! `/dev/ppp` unit fd. The session task feeds it demuxed PPP payload
@@ -56,8 +59,9 @@ pub enum DataPath {
 }
 
 impl DataPath {
-    /// Attach `tcp_fd` (a kTLS-equipped TCP socket) and `unit` (a
-    /// `/dev/ppp` unit fd) to the chosen data path.
+    /// Attach `tcp_fd` (a kTLS-equipped TCP socket when the kernel
+    /// path is requested) and `unit` (a `/dev/ppp` unit fd) to the
+    /// chosen data path.
     ///
     /// `flags` and `mtu` are forwarded to the kmod attach for the
     /// kernel path; the userspace path ignores `flags` (kTLS is

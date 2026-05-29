@@ -96,6 +96,20 @@ kmod compiles, exercises attach/detach lifecycle and the session_fd
 event surface, but stubs the per-frame demux and TX paths (TODOs
 tagged `v0.1` in `kmod/sstp_demux.c` and `kmod/sstp_chan.c`).
 
+**Runtime selection.** The data path is selected via `-D/--data-path
+{auto,kernel,userspace}` (default `auto`). At startup the process
+probes `/dev/sstp` once and logs the outcome (`data-path: kernel
+(sstp kmod present at /dev/sstp)`, `data-path: userspace (sstp kmod
+not loaded; falling back to /dev/ppp copy)`, etc.). Per-session
+bring-up routes through `kppp::datapath::DataPath::open` which, in
+`auto` mode, attempts `SSTP_IOC_ATTACH` against `/dev/sstp` and falls
+back to the userspace `pppN`-fd copy loop on any kmod error (warn
+log). `kernel` forces the attach (sessions fail without the kmod);
+`userspace` skips the probe entirely. Because kTLS is not yet
+plumbed into `TlsStream`, kernel-mode attach currently returns
+`EOPNOTSUPP` and fallback fires per session — the wiring is in place
+for when kTLS lands.
+
 ### Crypto
 
 - All cryptographic operations live in a single in-tree `crypto` module that
@@ -212,6 +226,8 @@ push policy into RADIUS, not to add a config parser.
 -A, --acct <host:port>      RADIUS accounting server (repeatable, optional)
 -t, --threads <n>           I/O worker count (default: auto, see below)
     --auth-threads <n>      Auth runtime threads (default: max(2, ncpus/4))
+-u, --user <name>           Drop privileges to this user after binding sockets
+-g, --group <name>           Group to drop to (defaults to the user's primary GID)
     --control-socket <path> Stats/admin socket (default: /run/sstp-server.sock)
     --no-control-socket     Disable the control socket entirely
     --log-format <fmt>      text | json | auto (default: auto)
@@ -251,6 +267,30 @@ The `-t` / `--threads` flag overrides; the default is derived at startup:
 Deployments on dedicated hardware will commonly want `-t $(nproc)` minus
 whatever the operator wants to leave for the kernel softirq / NAPI cores,
 plus an `--auth-threads` override if RADIUS latency is unusual.
+
+### Privilege drop
+
+When `-u/--user` is supplied (optionally with `-g/--group`), the server
+performs an in-process `setuid` after binding the privileged resources
+that need root — the listening TCP sockets, the TLS key file, and the
+control socket under `/run/`. The drop runs **single-threaded**, before
+any `tokio` runtime is constructed: the boot sequence is (1) load TLS
+material, (2) read `SSTP_RADIUS_SECRET`, (3) `bind(2)` one
+`SO_REUSEPORT` listener per I/O worker, (4) resolve the target uid/gid,
+(5) bind + `fchown` the control socket, (6) `setresgid`/`setresuid` +
+`capset`, (7) construct auth runtime + spawn workers.
+
+`CAP_NET_ADMIN` is the only capability retained across the drop. It is
+required per-session for `/dev/ppp` `PPPIOCNEWUNIT` and for the netlink
+`RTM_NEWADDR` / link-up sequence in `kppp::netlink`. The kernel rule
+that drove this design (`prctl(PR_SET_KEEPCAPS, 1)` before the setuid,
+then `capset` to the keep set afterwards) is implemented in `privdrop`.
+
+Without `-u`, no drop happens and the process keeps whatever capabilities
+it started with. For systemd deployments this is the equivalent of
+omitting `User=` from the unit file and using
+`AmbientCapabilities=CAP_NET_ADMIN` instead; both approaches are
+supported.
 
 ### Secrets
 
@@ -736,31 +776,134 @@ Ordered by dependency:
       in-process with a `Reject("auth backend not wired (M6e)")` —
       M6e replaces the rejector with a `radius-tokio` round-trip
       without changing the oneshot signature.
-- [ ] **M6e — RADIUS bridge integration.** `auth::client::authenticate_pap`
-      runs on the auth runtime; on Access-Accept the resulting
-      `AuthAccept` (with `Framed-IP-Address`, optional DNS / WINS,
-      MPPE keys if present) is sent back to the session task via a
-      `oneshot`. The session task then drives IPCP with those
-      addresses and emits SSTP `Call-Connected` (M6f).
-- [ ] **M6f — SSTP Crypto Binding `Call-Connected`.** Derive HLAK
-      from the TLS exporter (no MSK with PAP, so HLAK is the EKM
-      bytes per [MS-SSTP] §3.2.5.2.1.1); compute the
-      `Crypto-Binding` HMAC; build and send the `Call-Connected`
-      packet. State machine transitions to `Server_Call_Connected`.
-- [ ] **M6g — Kernel PPP unit bring-up.** Allocate a `pppN` unit via
-      `kppp::Unit::new`, push the negotiated MRU and IP addresses
-      through `kppp::netlink`. For v0.1 the userspace data path keeps
-      reading frames from TLS, demuxing, and writing PPP packets to
-      the unit fd (`pppd`-over-pty model). Tear down the unit on
-      session close.
-- [ ] **M6h — Graduate the integration test.** Replace the soft
-      forward-looking assertions in `tests/e2e.rs` with positive
-      checks: `radius.seen()` contains exactly one Access-Request
-      with `username == "alice"` and `pap_outcome == Match`; `sstpc`
-      exits 0; the kernel has a `pppN` interface with the assigned
-      `Framed-IP-Address`. Drop the runtime skip on root / `/dev/ppp`
-      from the harness and instead require those preconditions in
-      the dev container.
+- [x] **M6e — RADIUS bridge integration.** New
+      [src/auth/bridge.rs](src/auth/bridge.rs) defines `AuthBridge`,
+      a cloneable cross-runtime dispatcher. `AuthBridge::spawn`
+      (async) binds a single [`RadiusClient`] UDP socket on the auth
+      runtime, then spawns a long-lived dispatcher task there that
+      consumes `PapJob`s from a bounded MPSC queue and fans each one
+      out to a per-request `tokio::spawn` so a slow authenticator
+      can't head-of-line block the queue. `submit_pap(username,
+      password, peer, nas_identifier)` returns an `AuthVerdict`
+      directly (the oneshot is internal). Failover is across all
+      `--radius` servers in CLI order; an authoritative Access-Reject
+      from any server short-circuits (no fallback for policy
+      rejects), transport errors fall through to the next server,
+      and an exhausted list surfaces as
+      `Reject("auth failed: …")`. MPPE keys (`MS-MPPE-Send-Key` /
+      `-Recv-Key`) are already decoded into `AuthAccept` by
+      [src/auth/reply.rs](src/auth/reply.rs) and will feed the
+      Crypto Binding HLAK in M6f. Wired through `main::run` (loads
+      `SSTP_RADIUS_SECRET` at startup — empty / missing aborts) and
+      down through `io_worker_main` → `accept_loop` → `session::run`
+      → `drive_sstp`. The PAP rejector in `handle_ppp_step` is now
+      `auth.bridge.submit_pap(...).await`; verdicts log at info
+      (`RADIUS Access-Accept ip=...` / `RADIUS Access-Reject
+      reason=...`) and feed straight back into `Ppp::on_auth_result`.
+- [x] **M6f — SSTP Crypto Binding `Call-Connected`.** Server cert
+      SHA-256 is computed once at startup in
+      [src/crypto/tls.rs](src/crypto/tls.rs) (`leaf_cert_hash_sha256`
+      via `SSL_CTX_get0_certificate` + `i2d_X509`) and cached on
+      `SslContext`. The session task snapshots it before consuming
+      `tls_ctx` and hands it to `StateMachine::new(cert_hash_sha256)`
+      (signature broadened so `on_call_connect_request` can populate
+      the binding state directly). When a `Call-Connected` packet
+      arrives, `drive_sstp` copies the 112-byte buffer, zeroes the
+      Compound MAC field at offsets 80..112 ([MS-SSTP] §2.2.11 /
+      §3.2.5.2.3) and calls `StateMachine::verify_call_connected`,
+      which computes the expected HMAC via existing
+      `sstp::binding::verify` and either advances to
+      `Server_Call_Connected` (`NotifyHigher::SstpEstablished`,
+      Hello-timer armed) or starts an abort with the appropriate
+      `Status-Info`. v0.1 covers PAP-only: HLAK defaults to 32 zero
+      octets (ServerBypassHLAuth per §3.2.5.2.2), which matches what
+      Windows clients send when offered PAP. MS-CHAPv2 / EAP populate
+      HLAK from MPPE keys / MSK in a later milestone via
+      `on_inner_auth_completed`. New positive-path unit test
+      `call_connected_with_valid_binding_advances_to_connected` and
+      `kmod`-free integration coverage through the existing
+      `sstpc_pap_login` e2e test (which now exercises the Crypto
+      Binding round-trip end-to-end).
+- [x] **M6g — Kernel PPP unit bring-up.** New
+      [src/kppp/session.rs](src/kppp/session.rs) houses `KpppSession`,
+      which on construction allocates a fresh `/dev/ppp` unit via
+      `kppp::Unit::new`, calls `Unit::set_mru(1500)`, opens a one-shot
+      `RtNetlink` socket and runs `bring_up(ifindex, &SessionIpConfig
+      { local, peer, netmask: None, mtu: Some(1500) })` to push the
+      P2P address pair + `IFLA_MTU` + `IFF_UP`. The unit fd is then
+      `try_clone_to_owned`'d (sharing the open-file-description, so
+      `O_NONBLOCK` carries over) and wrapped in a
+      `tokio::io::unix::AsyncFd` registered for both READABLE and
+      WRITABLE. `write_frame` / `read_frame` are thin `async_io`
+      wrappers around `libc::write` / `libc::read`; one `// SAFETY:`
+      comment per FFI block. New CLI flag `-i/--local-ip <ipv4>`
+      (required) supplies the server-side address shared across every
+      `pppN` netdev; plumbed through `Config` → `io_worker_main` →
+      `accept_loop` → `session::run` → `drive_sstp`.
+
+      The session driver in [src/session.rs](src/session.rs) gains a
+      `kppp: Option<KpppSession>` slot and a 2 KiB `kppp_buf`. On
+      `PppEvent::NetworkUp(addrs)` (emitted by the in-process PPP FSM
+      once IPCP converges, see M6d), `handle_ppp_step` calls
+      `KpppSession::bring_up(local_ip, Ipv4Addr::from(addrs.ip))` and
+      stashes the result. A bring-up failure (no `/dev/ppp`, no
+      `CAP_NET_ADMIN`, netlink rejection) is fatal to the session —
+      logged at warn and the driver tears down.
+
+      The userspace data-path runs through `drive_sstp`'s main
+      `select!`: a new `KpppRead(io::Result<usize>)` branch wraps
+      `kppp.as_ref().unwrap().read_frame(&mut kppp_buf)` in an `async
+      { match kppp { Some(k) => …, None => pending().await } }` block
+      so the arm stays `Poll::Pending` until bring-up. Frames read
+      from the kernel are written verbatim into a fresh SSTP data
+      packet via the existing `write_ppp_as_sstp_data` helper.
+      Conversely, every inbound SSTP `Data` packet is dispatched
+      through `crate::ppp::frame::decode_frame` to read the Protocol
+      field; if it's `ProtocolId::Ip` and `kppp` is `Some`, the raw
+      payload is written straight to the unit fd via
+      `KpppSession::write_frame` and the in-process PPP plane is
+      bypassed (avoids double-handling IP traffic). Control / auth
+      protocols (LCP, IPCP, PAP) continue through `Ppp::on_frame` as
+      before, so post-network LCP echo replies still work.
+
+      Teardown is RAII: dropping `KpppSession` drops the wrapped
+      `Unit`, which closes the `/dev/ppp` fd and causes the kernel to
+      remove `pppN`. The `RegistrationGuard` in `session::run`
+      already runs on panic-unwind, so an unrelated session-task
+      panic still releases the netdev. The e2e harness in
+      [tests/common/spawn.rs](tests/common/spawn.rs) was updated to
+      pass `--local-ip 10.255.255.1`; the existing `sstpc_pap_login`
+      test now exercises the full path (kernel unit creation +
+      netlink bring-up) when run with root + `/dev/ppp`, and skips
+      cleanly otherwise.
+- [x] **M6h — Graduate the integration test.** The
+      [tests/e2e.rs](tests/e2e.rs) `sstpc_pap_login` test now drives
+      the full PAP path end-to-end and asserts: exactly one RADIUS
+      `Access-Request` with `User-Name == "alice"` and `pap_outcome
+      == PapOutcome::Match`; the server logged "kernel PPP unit
+      attached" (M6g); the resulting `pppN` netdev exists and
+      carries `TEST_FRAMED_IP` (10.99.0.42) as its P2P peer per
+      `ip -o addr show dev <ifname>`. The interface name is plucked
+      from the structured log via `extract_kv(line, "ifname")` so
+      parallel test runs targeting different units don't collide.
+      `sstpc`'s exit status is deliberately not asserted — the
+      harness SIGKILLs it once the kernel unit appears (a clean
+      exit would require driving `sstpc`'s own teardown).
+      [tests/common/radius.rs](tests/common/radius.rs) re-exports
+      `radius_tokio::auth::VerifyOutcome` as `PapOutcome` so the
+      e2e test doesn't have to depend on `radius_tokio` directly.
+
+      The runtime skip on root / `/dev/ppp` / `sstpc-on-PATH` is
+      *kept* (vs. the original M6h plan to drop it) because the
+      reference dev container ships an OrbStack-style kernel
+      (`6.6.119-0-virt`) without `ppp_generic` and no way to
+      `modprobe` it. The `which()` probe was hardened to fall
+      back to `/home/vscode/.local/bin`, `/opt/sstp-client/sbin`,
+      `/usr/local/sbin`, `/usr/sbin`, `/sbin` so the VS Code task
+      runner's stripped `PATH` doesn't masquerade as a missing
+      binary. On a host with `/dev/ppp` and root the assertions
+      run for real; everywhere else the test prints `SKIP …` with
+      the precise blocker and returns.
 
 ### M7 — Control socket
 - [x] Unix socket bind at `--control-socket` path, `0660` perms.

@@ -12,4 +12,4 @@
 pub mod listener;
 
 #[allow(unused_imports)]
-pub use listener::{ListenError, bind_reuseport};
+pub use listener::{ListenError, adopt, bind_reuseport_std};

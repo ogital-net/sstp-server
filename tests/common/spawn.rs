@@ -72,6 +72,11 @@ impl ServerBuilder {
         cmd.arg("--listen").arg(self.listen.to_string());
         cmd.arg("--cert").arg(&self.cert);
         cmd.arg("--key").arg(&self.key);
+        // M6g: --local-ip is required at startup. Tests don't actually
+        // need the netdev to come up (PPP IPCP wouldn't progress that
+        // far in the smoke tests), but the binary refuses to start
+        // without it.
+        cmd.arg("--local-ip").arg("10.255.255.1");
         for r in &self.radius {
             cmd.arg("--radius").arg(r.to_string());
         }

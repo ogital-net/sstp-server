@@ -16,7 +16,7 @@
 // until M1+ wires them up.
 #![allow(dead_code)]
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::thread::available_parallelism;
@@ -53,6 +53,9 @@ OPTIONS:
     -F, --log-format <fmt>       text | json | auto (default: auto)
     -L, --log-file <path>        Log to file instead of stderr
     -D, --data-path <mode>       auto | kernel | userspace (default: auto)
+    -i, --local-ip <ipv4>        Server-side IPv4 for every pppN interface (required)
+    -u, --user <name>            Drop privileges to this user after binding sockets (root only)
+    -g, --group <name>           Group to drop to (defaults to the user's primary GID)
     -v                           Increase verbosity (-v, -vv, -vvv)
     -q, --quiet                  Errors only
     -h, --help                   Print this help and exit
@@ -85,7 +88,10 @@ s:(control-socket)\
 n(no-control-socket)\
 F:(log-format)\
 L:(log-file)\
-D:(data-path)";
+D:(data-path)\
+i:(local-ip)\
+u:(user)\
+g:(group)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
@@ -121,6 +127,18 @@ pub struct Config {
     pub log_file: Option<PathBuf>,
     pub log_level: LevelFilter,
     pub data_path: DataPathMode,
+    /// Server-side IPv4 address for every `pppN` interface we bring
+    /// up. Required: the kernel needs a P2P address pair to set on
+    /// the netdev, and the peer half comes from RADIUS
+    /// (`Framed-IP-Address`); the local half has no useful default
+    /// at startup.
+    pub local_ip: Ipv4Addr,
+    /// Unprivileged user to drop to after startup. `None` keeps the
+    /// current uid. When set, the daemon must be started as root.
+    pub drop_user: Option<String>,
+    /// Group to drop to. Defaults to the user's primary group when
+    /// `drop_user` is set; ignored when `drop_user` is `None`.
+    pub drop_group: Option<String>,
 }
 
 #[derive(Debug)]
@@ -206,6 +224,9 @@ where
     let mut log_format = LogFormat::Auto;
     let mut log_file: Option<PathBuf> = None;
     let mut data_path = DataPathMode::Auto;
+    let mut local_ip: Option<String> = None;
+    let mut drop_user: Option<String> = None;
+    let mut drop_group: Option<String> = None;
     let mut verbose: i32 = 0;
     let mut quiet = false;
 
@@ -256,6 +277,9 @@ where
                 };
             }
             'L' => log_file = opt.into_arg().map(cow_to_path),
+            'i' => local_ip = opt.into_arg().map(std::borrow::Cow::into_owned),
+            'u' => drop_user = opt.into_arg().map(std::borrow::Cow::into_owned),
+            'g' => drop_group = opt.into_arg().map(std::borrow::Cow::into_owned),
             'D' => {
                 let raw = opt.arg().unwrap_or("");
                 data_path = match raw {
@@ -294,6 +318,10 @@ where
     if radius.is_empty() {
         return Err(ParseError::MissingRequired { flag: "radius" });
     }
+    let local_ip_raw = local_ip.ok_or(ParseError::MissingRequired { flag: "local-ip" })?;
+    let local_ip: Ipv4Addr = local_ip_raw
+        .parse()
+        .map_err(|e| ParseError::invalid("local-ip", local_ip_raw.as_str(), e))?;
 
     let listen = parse_sockaddr("listen", listen.as_deref().unwrap_or(DEFAULT_LISTEN))?;
     let radius = radius
@@ -328,6 +356,9 @@ where
         log_file,
         log_level,
         data_path,
+        local_ip,
+        drop_user,
+        drop_group,
     })))
 }
 
@@ -415,6 +446,8 @@ mod tests {
             "/etc/sstp/key.pem",
             "-r",
             "127.0.0.1:1812",
+            "-i",
+            "10.0.0.1",
         ]
     }
 
@@ -453,16 +486,36 @@ mod tests {
 
     #[test]
     fn missing_cert() {
-        let err = run(&["sstp-server", "-k", "/k", "-r", "1.2.3.4:1812"]).unwrap_err();
+        let err = run(&["sstp-server", "-k", "/k", "-r", "1.2.3.4:1812", "-i", "10.0.0.1"])
+            .unwrap_err();
         assert!(matches!(err, ParseError::MissingRequired { flag: "cert" }));
     }
 
     #[test]
     fn missing_radius() {
-        let err = run(&["sstp-server", "-c", "/c", "-k", "/k"]).unwrap_err();
+        let err =
+            run(&["sstp-server", "-c", "/c", "-k", "/k", "-i", "10.0.0.1"]).unwrap_err();
         assert!(matches!(
             err,
             ParseError::MissingRequired { flag: "radius" }
+        ));
+    }
+
+    #[test]
+    fn missing_local_ip() {
+        let err = run(&[
+            "sstp-server",
+            "-c",
+            "/c",
+            "-k",
+            "/k",
+            "-r",
+            "1.2.3.4:1812",
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ParseError::MissingRequired { flag: "local-ip" }
         ));
     }
 

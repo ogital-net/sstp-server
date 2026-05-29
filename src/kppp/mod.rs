@@ -46,6 +46,7 @@
 pub mod datapath;
 pub mod ioctl;
 pub mod netlink;
+pub mod session;
 pub mod sstp_kmod;
 pub mod unit;
 

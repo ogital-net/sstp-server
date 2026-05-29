@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 pub mod accounting;
+pub mod bridge;
 pub mod client;
 pub mod coa;
 pub mod request;

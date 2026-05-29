@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use super::ffi::{Ssl, SslCtx};
+use super::hash::Sha256;
 
 #[derive(Debug, Error)]
 pub enum TlsError {
@@ -39,6 +40,11 @@ pub enum TlsError {
 #[derive(Clone)]
 pub struct SslContext {
     inner: SslCtx,
+    /// SHA-256 of the leaf certificate's DER encoding. Used as the
+    /// server cert hash carried in the SSTP Crypto Binding attribute
+    /// ([MS-SSTP] §2.2.7 / §3.2.5.2). Computed once at context build
+    /// time; the cert never changes for the life of a context.
+    cert_hash_sha256: [u8; 32],
 }
 
 impl SslContext {
@@ -97,7 +103,36 @@ impl SslContext {
             )));
         }
 
-        Ok(Self { inner: ctx })
+        // Disable the server-side session cache. AWS-LC guards the
+        // cache (hashtable + LRU + stats counters) with a single
+        // CRYPTO_MUTEX touched by every `SSL_new` / `SSL_free` /
+        // handshake completion, which becomes the dominant cross-worker
+        // contention point at high accept rates because all I/O workers
+        // share one `SSL_CTX` via `SSL_CTX_up_ref`. We don't benefit
+        // from the cache: TLS 1.3 (the modern path for Windows SSTP
+        // clients) uses stateless tickets, and TLS 1.2 cache-based
+        // resumption only helps repeat connections to the same worker
+        // — SSTP tunnels are multi-hour, so resumption rate is
+        // microscopic regardless.
+        // SAFETY: ctx valid; SSL_SESS_CACHE_OFF is a well-known constant.
+        unsafe {
+            aws::SSL_CTX_set_session_cache_mode(ctx.as_ptr(), aws::SSL_SESS_CACHE_OFF);
+        }
+
+        let cert_hash_sha256 = leaf_cert_hash_sha256(&ctx)?;
+
+        Ok(Self {
+            inner: ctx,
+            cert_hash_sha256,
+        })
+    }
+
+    /// SHA-256 of the leaf certificate's DER encoding, the value the
+    /// server places in the SSTP Crypto Binding cert-hash field
+    /// ([MS-SSTP] §2.2.7).
+    #[must_use]
+    pub fn cert_hash_sha256(&self) -> [u8; 32] {
+        self.cert_hash_sha256
     }
 
     /// Accept a TLS connection on an already-accepted TCP stream.
@@ -128,6 +163,45 @@ impl SslContext {
         handshake(&mut s).await?;
         Ok(s)
     }
+}
+
+/// Compute SHA-256 of the leaf certificate's DER encoding for an
+/// already-loaded `SSL_CTX`. Used to populate
+/// [`SslContext::cert_hash_sha256`].
+fn leaf_cert_hash_sha256(ctx: &SslCtx) -> Result<[u8; 32], TlsError> {
+    // SAFETY: ctx is a valid SSL_CTX with a cert loaded; the returned
+    // pointer is borrowed (no _free required) per AWS-LC docs.
+    let x509 = unsafe { aws::SSL_CTX_get0_certificate(ctx.as_ptr()) };
+    if x509.is_null() {
+        return Err(TlsError::Init(
+            "SSL_CTX_get0_certificate returned null".into(),
+        ));
+    }
+    // Two-call pattern: pass a null `outp` to learn the length, then
+    // a real buffer to receive the bytes. AWS-LC writes the DER bytes
+    // and advances `outp` past the end, so we hold an `original`
+    // pointer to recover the start of the buffer.
+    // SAFETY: x509 is valid; passing `null` as outp asks for length only.
+    let len = unsafe { aws::i2d_X509(x509, std::ptr::null_mut()) };
+    if len <= 0 {
+        return Err(TlsError::Init(format!(
+            "i2d_X509 length probe failed: {}",
+            last_error()
+        )));
+    }
+    // `len` is `c_int`, validated positive above; usize conversion is sound.
+    #[allow(clippy::cast_sign_loss)]
+    let mut der = vec![0u8; len as usize];
+    let mut out_ptr = der.as_mut_ptr();
+    // SAFETY: x509 is valid; out_ptr points to a writable buffer of
+    // `len` bytes; AWS-LC advances `*outp` past the end on success.
+    let written = unsafe { aws::i2d_X509(x509, &raw mut out_ptr) };
+    if written != len {
+        return Err(TlsError::Init(format!(
+            "i2d_X509 wrote {written} bytes, expected {len}"
+        )));
+    }
+    Ok(Sha256::digest(&der))
 }
 
 fn path_to_cstring(p: &Path) -> Result<std::ffi::CString, TlsError> {
@@ -162,7 +236,89 @@ pub struct TlsStream {
     ssl: Ssl,
 }
 
+/// Negotiated TLS parameters relevant to deciding whether we should
+/// attempt the SSTP kernel data path for this session.
+#[derive(Debug, Clone)]
+pub struct KtlsEligibility {
+    pub compatible: bool,
+    pub tls_version: String,
+    pub cipher: String,
+}
+
+impl KtlsEligibility {
+    fn unknown() -> Self {
+        Self {
+            compatible: false,
+            tls_version: "unknown".into(),
+            cipher: "unknown".into(),
+        }
+    }
+}
+
 impl TlsStream {
+    /// Borrow the underlying TCP fd. Required by the SSTP kernel
+    /// module's `SSTP_IOC_ATTACH` ioctl: the kmod takes ownership of
+    /// the kernel-side socket and runs the steady-state SSTP/kTLS
+    /// path itself. Userspace continues to hold its `TcpStream` for
+    /// the control path until the data path is fully cut over.
+    pub fn tcp_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.fd.get_ref().as_fd()
+    }
+
+    /// Return whether the negotiated TLS session parameters are a
+    /// reasonable kTLS candidate for the in-tree SSTP kernel module.
+    ///
+    /// v0.1 uses a conservative allow-list (AES-GCM suites for
+    /// TLS 1.2/1.3). Sessions outside this set stay on `/dev/ppp`
+    /// userspace forwarding even when `/dev/sstp` is present.
+    #[must_use]
+    pub fn ktls_eligibility(&self) -> KtlsEligibility {
+        // SAFETY: ssl is valid for the life of this TlsStream.
+        let cipher = unsafe { aws::SSL_get_current_cipher(self.ssl.as_ptr()) };
+        if cipher.is_null() {
+            return KtlsEligibility::unknown();
+        }
+
+        // SAFETY: non-null `cipher` comes from libssl; name pointer is
+        // NUL-terminated and borrowed for the lifetime of the cipher.
+        let cipher_name = unsafe {
+            CStr::from_ptr(aws::SSL_CIPHER_get_name(cipher))
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        // SAFETY: ssl is valid; SSL_get_version returns a borrowed
+        // NUL-terminated string such as "TLSv1.3".
+        let version_name = unsafe {
+            let p = aws::SSL_get_version(self.ssl.as_ptr());
+            if p.is_null() {
+                "unknown".into()
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+
+        let compatible = matches!(version_name.as_str(), "TLSv1.2" | "TLSv1.3")
+            && matches!(
+                cipher_name.as_str(),
+                "TLS_AES_128_GCM_SHA256"
+                    | "TLS_AES_256_GCM_SHA384"
+                    | "ECDHE-RSA-AES128-GCM-SHA256"
+                    | "ECDHE-RSA-AES256-GCM-SHA384"
+                    | "ECDHE-ECDSA-AES128-GCM-SHA256"
+                    | "ECDHE-ECDSA-AES256-GCM-SHA384"
+                    | "AES128-GCM-SHA256"
+                    | "AES256-GCM-SHA384"
+            );
+
+        KtlsEligibility {
+            compatible,
+            tls_version: version_name,
+            cipher: cipher_name,
+        }
+    }
+
     /// RFC 5705 / TLS 1.3 §7.5 keying material exporter. Used by SSTP
     /// for CMK derivation when no inner-method MSK is available
     /// ([MS-SSTP] §3.2.5.2).

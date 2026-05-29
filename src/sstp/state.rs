@@ -158,6 +158,11 @@ impl AbortReason {
 #[derive(Debug)]
 pub struct StateMachine {
     state: State,
+    /// SHA-256 of the leaf TLS certificate's DER, snapshotted from the
+    /// [`SslContext`](crate::crypto::tls::SslContext) at session
+    /// construction. Bound into the per-connection [`ServerBindingState`]
+    /// the instant `Call-Connect-Request` initialises it.
+    server_cert_hash_sha256: [u8; 32],
     /// Server-generated nonce sent in Call Connect Ack. Set on
     /// `accept_connect_request`, used by Call Connected verification.
     binding: Option<ServerBindingState>,
@@ -168,9 +173,15 @@ impl StateMachine {
     /// connection. Per §3.3.1.1.1 the FSM begins in
     /// `Server_Call_Disconnected`; the driving task calls
     /// [`StateMachine::on_https_accepted`] once TLS finishes.
-    pub fn new() -> Self {
+    ///
+    /// `cert_hash_sha256` is the SHA-256 of the leaf TLS certificate
+    /// DER ([MS-SSTP] §2.2.7); the FSM places it into the binding
+    /// state when `Call-Connect-Request` arrives so the subsequent
+    /// `Call-Connected` Crypto Binding can be verified.
+    pub fn new(cert_hash_sha256: [u8; 32]) -> Self {
         Self {
             state: State::ServerCallDisconnected,
+            server_cert_hash_sha256: cert_hash_sha256,
             binding: None,
         }
     }
@@ -307,11 +318,13 @@ impl StateMachine {
         let n = encode_call_connect_ack(tx, hash_bitmask, &nonce);
         debug_assert_eq!(n, CALL_CONNECT_ACK_LEN);
         // Stash binding state for Call Connected verification. The
-        // cert hash is supplied later by the connection owner via
-        // [`StateMachine::set_server_cert_hash`].
+        // leaf cert hash was supplied at FSM construction
+        // ([`StateMachine::new`]); the binding's hash protocol field
+        // commits to SHA-256 because that's the only protocol we
+        // advertise above.
         self.binding = Some(ServerBindingState {
             server_nonce: nonce,
-            server_cert_hash: Vec::new(),
+            server_cert_hash: self.server_cert_hash_sha256.to_vec(),
             server_hash_protocol_supported: hash_bitmask,
             hlak: None,
         });
@@ -568,7 +581,7 @@ impl StateMachine {
 
 impl Default for StateMachine {
     fn default() -> Self {
-        Self::new()
+        Self::new([0u8; 32])
     }
 }
 
@@ -609,7 +622,7 @@ mod tests {
     use crate::sstp::msg::parse_control;
 
     fn fresh_post_handshake() -> StateMachine {
-        let mut sm = StateMachine::new();
+        let mut sm = StateMachine::new([0u8; 32]);
         let out = sm.on_https_accepted();
         assert_eq!(sm.state(), State::ServerConnectRequestPending);
         assert_eq!(
@@ -777,4 +790,47 @@ mod tests {
 
     // Local re-export so the test file doesn't depend on the public name.
     const CALL_CONNECTED_LEN_LOCAL: usize = crate::sstp::msg::CALL_CONNECTED_LEN;
+
+    #[test]
+    fn call_connected_with_valid_binding_advances_to_connected() {
+        use crate::crypto::HmacSha256;
+        use crate::crypto::hmac::prf_plus_sha256_cmk;
+        use crate::sstp::binding::CMK_SEED;
+        use crate::sstp::msg::{encode_call_connected_pre_mac, install_compound_mac};
+
+        let cert_hash = [0xabu8; 32];
+        let mut sm = StateMachine::new(cert_hash);
+        let _ = sm.on_https_accepted();
+        let mut tx = [0u8; 128];
+        let _ = sm.on_message(
+            ControlMessage::CallConnectRequest {
+                protocol_id: SSTP_ENCAPSULATED_PROTOCOL_PPP,
+            },
+            &mut tx,
+        );
+        assert_eq!(sm.state(), State::ServerCallConnectedPending);
+
+        let nonce = sm.binding.as_ref().unwrap().server_nonce;
+        let mut buf = [0u8; CALL_CONNECTED_LEN_LOCAL];
+        encode_call_connected_pre_mac(&mut buf, CERT_HASH_PROTOCOL_SHA256, &nonce, &cert_hash);
+        // HLAK = zeros (no inner-method MSK / PAP path).
+        let hlak = [0u8; 32];
+        let cmk = prf_plus_sha256_cmk(&hlak, CMK_SEED);
+        let mac = HmacSha256::oneshot(&cmk, &buf);
+        // Parse the *zeroed-MAC* form for the Crypto Binding view,
+        // then hand the matching MAC-zeroed bytes to verify.
+        let zeroed = buf;
+        install_compound_mac(&mut buf, &mac);
+        let (Packet::Control(c), _) = Packet::parse(&buf).unwrap() else {
+            panic!()
+        };
+        let ControlMessage::CallConnected(cb) = parse_control(c).unwrap() else {
+            panic!("not call connected")
+        };
+        let out = sm.verify_call_connected(cb, &zeroed, &mut tx);
+        assert_eq!(sm.state(), State::ServerCallConnected);
+        assert_eq!(out.notify, Some(NotifyHigher::SstpEstablished));
+        assert_eq!(out.timer_stop, Some(Timer::Negotiation));
+        assert_eq!(out.timer_start, Some((Timer::Hello, TIMER_VAL_HELLO)));
+    }
 }

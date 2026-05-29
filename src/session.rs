@@ -20,16 +20,19 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
+use crate::auth::bridge::AuthBridge;
+use crate::cli::DataPathMode;
 use crate::crypto::tls::{SslContext, TlsStream};
+use crate::kppp::session::KpppSession;
 use crate::metrics;
 use crate::ppp::{AuthVerdict, Ppp, PppEvent, PppStep, TimerOwner};
 use crate::sstp::preamble;
@@ -193,6 +196,7 @@ impl Registry {
 /// preamble (M6b), SSTP state machine (M6c) and PPP drive (M6d) land
 /// next; until they do, the task discards inbound application bytes
 /// after logging the first read.
+#[allow(clippy::too_many_arguments)] // session entry point: every arg is essential context
 pub async fn run(
     stream: TcpStream,
     peer: SocketAddr,
@@ -201,6 +205,9 @@ pub async fn run(
     mut control_rx: mpsc::Receiver<ControlCommand>,
     mut drain_rx: broadcast::Receiver<()>,
     tls_ctx: SslContext,
+    auth_bridge: AuthBridge,
+    local_ip: Ipv4Addr,
+    data_path: DataPathMode,
 ) {
     info!(%id, %peer, "session accepted");
 
@@ -208,6 +215,10 @@ pub async fn run(
         registry: &registry,
         id,
     };
+
+    // Snapshot the server cert hash before consuming the TLS context
+    // — we hand it to the SSTP FSM once Call Connect Request lands.
+    let cert_hash = tls_ctx.cert_hash_sha256();
 
     // Phase 1: TLS handshake. Failures here are common in practice
     // (port scanners, readiness probes, TLS-version mismatches) so
@@ -272,7 +283,7 @@ pub async fn run(
     // a PPP layer the FSM sits in `Server_Call_Connected_Pending`
     // until the negotiation timer fires and the abort sequence
     // drains the connection.
-    drive_sstp(id, tls, control_rx, drain_rx).await;
+    drive_sstp(id, peer, tls, control_rx, drain_rx, auth_bridge, cert_hash, local_ip, data_path).await;
 
     info!(%id, "session ended");
 }
@@ -288,11 +299,17 @@ pub async fn run(
 /// fire, TLS read) into one or more FSM steps, then writes any
 /// outbound packets back through the TLS stream.
 #[allow(clippy::too_many_lines)] // straight-line event dispatch; splitting hurts readability
+#[allow(clippy::too_many_arguments)] // session driver entry point: every arg is essential context
 async fn drive_sstp(
     id: SessionId,
+    peer: SocketAddr,
     mut tls: TlsStream,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     mut drain_rx: broadcast::Receiver<()>,
+    auth_bridge: AuthBridge,
+    cert_hash: [u8; 32],
+    local_ip: Ipv4Addr,
+    data_path: DataPathMode,
 ) {
     use std::future::poll_fn;
     use std::pin::Pin;
@@ -300,21 +317,28 @@ async fn drive_sstp(
     use tokio::time::Sleep;
 
     use crate::sstp::frame::SSTP_MAX_PACKET_LEN;
+    use crate::sstp::msg::CALL_CONNECTED_LEN;
     use crate::sstp::state::Timer;
-    use crate::sstp::{Packet, StateMachine, parse_control};
+    use crate::sstp::{ControlMessage, Packet, StateMachine, parse_control};
 
-    let mut ssm = StateMachine::new();
+    let mut ssm = StateMachine::new(cert_hash);
     let mut tx_buf = [0u8; SSTP_MAX_PACKET_LEN];
     let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 4096];
     let mut sstp_timer: Option<(Timer, Pin<Box<Sleep>>)> = None;
     let mut ppp: Option<Ppp> = None;
     let mut ppp_timer: Option<(TimerOwner, Pin<Box<Sleep>>)> = None;
+    let mut kppp: Option<KpppSession> = None;
+    let mut kppp_buf = [0u8; 2048];
+    let auth = AuthCtx { peer, bridge: &auth_bridge };
 
     // Spec entry point: `New HTTPS Connection Received` (§3.3.2.1).
     let initial = ssm.on_https_accepted();
-    if !handle_sstp_step(id, &mut tls, &initial, &tx_buf, &mut sstp_timer, &mut ppp, &mut ppp_timer)
-        .await
+    if !handle_sstp_step(
+        id, &mut tls, &initial, &tx_buf, &mut sstp_timer, &mut ppp, &mut ppp_timer, &auth,
+        local_ip, &mut kppp, data_path,
+    )
+    .await
     {
         return;
     }
@@ -334,12 +358,23 @@ async fn drive_sstp(
                 Some((_, sleep)) => sleep.as_mut().poll(cx),
                 None => Poll::Pending,
             });
+            // Read one PPP frame from the kernel `pppN` unit fd when
+            // present *and* we're on the userspace data path. In
+            // kernel mode the SSTP kmod owns the byte path and there
+            // is nothing for us to copy.
+            let kppp_read_fut = async {
+                match kppp.as_ref() {
+                    Some(k) if !k.is_kernel() => k.read_frame(&mut kppp_buf).await,
+                    _ => std::future::pending::<std::io::Result<usize>>().await,
+                }
+            };
             tokio::select! {
                 biased;
                 _ = drain_rx.recv() => DriverEvent::Drain,
                 c = control_rx.recv() => DriverEvent::Control(c),
                 () = sstp_timer_fut => DriverEvent::SstpTimer,
                 () = ppp_timer_fut => DriverEvent::PppTimer,
+                r = kppp_read_fut => DriverEvent::KpppRead(r),
                 r = tls.read(&mut chunk) => DriverEvent::Read(r),
             }
         };
@@ -356,6 +391,10 @@ async fn drive_sstp(
                     &mut sstp_timer,
                     &mut ppp,
                     &mut ppp_timer,
+                    &auth,
+                    local_ip,
+                    &mut kppp,
+                    data_path,
                 )
                 .await
                 {
@@ -373,6 +412,10 @@ async fn drive_sstp(
                     &mut sstp_timer,
                     &mut ppp,
                     &mut ppp_timer,
+                    &auth,
+                    local_ip,
+                    &mut kppp,
+                    data_path,
                 )
                 .await
                 {
@@ -397,6 +440,10 @@ async fn drive_sstp(
                     &mut sstp_timer,
                     &mut ppp,
                     &mut ppp_timer,
+                    &auth,
+                    local_ip,
+                    &mut kppp,
+                    data_path,
                 )
                 .await
                 {
@@ -410,9 +457,31 @@ async fn drive_sstp(
                 debug!(%id, ?owner, "PPP timer expired");
                 if let Some(p) = ppp.as_mut() {
                     let step = p.on_timer(owner);
-                    if !handle_ppp_step(id, &mut tls, p, step, &mut ppp_timer).await {
+                    if !handle_ppp_step(id, &mut tls, p, step, &mut ppp_timer, &auth, local_ip, &mut kppp, data_path).await {
                         return;
                     }
+                }
+            }
+            DriverEvent::KpppRead(Err(e)) => {
+                // Transient read error on the kernel unit fd; log and
+                // keep going. A persistent failure will fall out via
+                // the next TLS write or session teardown.
+                warn!(%id, error = %e, "kernel PPP unit read failed");
+            }
+            DriverEvent::KpppRead(Ok(0)) => {
+                // EOF on a /dev/ppp unit fd is unusual; treat as a
+                // hard error and tear the session down.
+                warn!(%id, "kernel PPP unit returned EOF");
+                return;
+            }
+            DriverEvent::KpppRead(Ok(n)) => {
+                if let Err(e) = write_ppp_as_sstp_data(&mut tls, &kppp_buf[..n]).await {
+                    warn!(%id, error = %e, "TLS write of kernel-PPP frame failed");
+                    return;
+                }
+                if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut tls).await {
+                    warn!(%id, error = %e, "TLS flush after kernel-PPP frame failed");
+                    return;
                 }
             }
             DriverEvent::Read(Ok(0)) => {
@@ -444,7 +513,9 @@ async fn drive_sstp(
                             // Data packets restart the hello timer
                             // once SSTP is `Server_Call_Connected`,
                             // and (when PPP is running) feed into the
-                            // PPP demux.
+                            // PPP demux — except for IP frames once
+                            // the kernel PPP unit is up, which are
+                            // written straight to the unit fd.
                             let out = ssm.on_data_packet();
                             if !handle_sstp_step(
                                 id,
@@ -454,14 +525,32 @@ async fn drive_sstp(
                                 &mut sstp_timer,
                                 &mut ppp,
                                 &mut ppp_timer,
+                                &auth,
+                                local_ip,
+                                &mut kppp,
+                                data_path,
                             )
                             .await
                             {
                                 return;
                             }
-                            if let Some(p) = ppp.as_mut() {
+                            let mut routed_to_kernel = false;
+                            if let Some(k) = kppp.as_ref()
+                                && !k.is_kernel()
+                                && let Ok(frame) = crate::ppp::frame::decode_frame(payload)
+                                && frame.protocol
+                                    == crate::ppp::frame::ProtocolId::Ip.as_u16()
+                            {
+                                if let Err(e) = k.write_frame(payload).await {
+                                    warn!(%id, error = %e, "kernel PPP unit write failed");
+                                }
+                                routed_to_kernel = true;
+                            }
+                            if !routed_to_kernel
+                                && let Some(p) = ppp.as_mut()
+                            {
                                 let step = p.on_frame(payload);
-                                if !handle_ppp_step(id, &mut tls, p, step, &mut ppp_timer).await {
+                                if !handle_ppp_step(id, &mut tls, p, step, &mut ppp_timer, &auth, local_ip, &mut kppp, data_path).await {
                                     return;
                                 }
                             }
@@ -470,7 +559,23 @@ async fn drive_sstp(
                         Ok((Packet::Control(ctrl), length)) => {
                             match parse_control(ctrl) {
                                 Ok(msg) => {
-                                    let out = ssm.on_message(msg, &mut tx_buf);
+                                    let out = match msg {
+                                        // Call-Connected carries the Crypto
+                                        // Binding the server must verify
+                                        // against the raw packet with the
+                                        // Compound MAC field zeroed
+                                        // ([MS-SSTP] §3.2.5.2.3). The MAC
+                                        // sits at offsets 80..112 of the
+                                        // 112-byte packet (§2.2.11).
+                                        ControlMessage::CallConnected(cb) => {
+                                            debug_assert_eq!(length, CALL_CONNECTED_LEN);
+                                            let mut zeroed = [0u8; CALL_CONNECTED_LEN];
+                                            zeroed.copy_from_slice(&rx_buf[..CALL_CONNECTED_LEN]);
+                                            zeroed[80..112].fill(0);
+                                            ssm.verify_call_connected(cb, &zeroed, &mut tx_buf)
+                                        }
+                                        other => ssm.on_message(other, &mut tx_buf),
+                                    };
                                     if !handle_sstp_step(
                                         id,
                                         &mut tls,
@@ -479,6 +584,10 @@ async fn drive_sstp(
                                         &mut sstp_timer,
                                         &mut ppp,
                                         &mut ppp_timer,
+                                        &auth,
+                                        local_ip,
+                                        &mut kppp,
+                                        data_path,
                                     )
                                     .await
                                     {
@@ -507,6 +616,7 @@ enum DriverEvent {
     Control(Option<ControlCommand>),
     SstpTimer,
     PppTimer,
+    KpppRead(std::io::Result<usize>),
     Read(std::io::Result<usize>),
 }
 
@@ -526,6 +636,10 @@ async fn handle_sstp_step(
     )>,
     ppp: &mut Option<Ppp>,
     ppp_timer: &mut Option<(TimerOwner, std::pin::Pin<Box<tokio::time::Sleep>>)>,
+    auth: &AuthCtx<'_>,
+    local_ip: Ipv4Addr,
+    kppp: &mut Option<KpppSession>,
+    data_path: DataPathMode,
 ) -> bool {
     let outcome = apply_step(id, tls, out, tx_buf, sstp_timer).await;
     if !outcome.keep_going {
@@ -546,6 +660,10 @@ async fn handle_sstp_step(
             ppp.as_mut().expect("just inserted"),
             step,
             ppp_timer,
+            auth,
+            local_ip,
+            kppp,
+            data_path,
         )
         .await
         {
@@ -556,16 +674,23 @@ async fn handle_sstp_step(
 }
 
 /// Apply a [`PppStep`]: write each frame as an SSTP data packet,
-/// update the PPP timer slot, and act on any [`PppEvent`]. The PAP
-/// auth event is currently fulfilled in-process with a Reject so the
-/// session tears down cleanly until M6e replaces this rejector with
-/// a RADIUS round-trip.
+/// update the PPP timer slot, and act on any [`PppEvent`]. PAP
+/// credentials are dispatched to the [`AuthBridge`] (M6e); the
+/// returned verdict is fed back into the PPP driver via
+/// [`Ppp::on_auth_result`], which produces the next [`PppStep`]
+/// (PAP-Ack/-Nak plus, on accept, IPCP `Configure-Request`).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // straight-line event handling in one place for state clarity
 async fn handle_ppp_step(
     id: SessionId,
     tls: &mut TlsStream,
     ppp: &mut Ppp,
     mut step: PppStep,
     ppp_timer: &mut Option<(TimerOwner, std::pin::Pin<Box<tokio::time::Sleep>>)>,
+    auth: &AuthCtx<'_>,
+    local_ip: Ipv4Addr,
+    kppp: &mut Option<KpppSession>,
+    data_path: DataPathMode,
 ) -> bool {
     use tokio::time::{Instant, sleep_until};
 
@@ -598,38 +723,74 @@ async fn handle_ppp_step(
         let finished = step.finished;
 
         match event {
-            Some(PppEvent::NeedPapAuth { peer_id, password: _ }) => {
-                // M6e seam: build a oneshot, hand the credentials to
-                // the auth runtime via the oneshot::Sender. For v0.1
-                // there is no auth backend wired, so we fulfil the
-                // oneshot in-process with a Reject and feed the
-                // verdict back into PPP. The shape of the oneshot is
-                // preserved so M6e is a drop-in replacement.
-                let (tx, rx) = oneshot::channel::<AuthVerdict>();
+            Some(PppEvent::NeedPapAuth { peer_id, password }) => {
                 let user = String::from_utf8_lossy(&peer_id).into_owned();
-                info!(
-                    %id,
-                    user = %user,
-                    "PAP credentials received; auth backend not wired (M6e)"
-                );
-                let _ = tx.send(AuthVerdict::Reject {
-                    message: b"auth backend not wired (M6e)".to_vec(),
-                });
-                let verdict = rx
-                    .await
-                    .unwrap_or_else(|_| AuthVerdict::Reject {
-                        message: b"auth backend dropped".to_vec(),
-                    });
+                info!(%id, user = %user, "PAP credentials received; dispatching to RADIUS");
+                let verdict = auth
+                    .bridge
+                    .submit_pap(user.clone(), password, auth.peer, None)
+                    .await;
+                match &verdict {
+                    AuthVerdict::Accept { addrs } => {
+                        info!(%id, user = %user, ip = ?addrs.ip, "RADIUS Access-Accept");
+                    }
+                    AuthVerdict::Reject { message } => {
+                        let msg = String::from_utf8_lossy(message);
+                        info!(%id, user = %user, reason = %msg, "RADIUS Access-Reject");
+                    }
+                }
                 step = ppp.on_auth_result(verdict);
                 // Loop to render the new step.
                 continue;
             }
             Some(PppEvent::NetworkUp(addrs)) => {
-                info!(
-                    %id,
-                    ip = ?addrs.ip,
-                    "PPP network up; kernel-PPP bring-up deferred (M6g)"
-                );
+                let peer_ip = Ipv4Addr::from(addrs.ip);
+                if kppp.is_some() {
+                    debug!(%id, ip = %peer_ip, "spurious NetworkUp after kernel PPP unit already attached");
+                } else {
+                    let ktls = tls.ktls_eligibility();
+                    let effective_data_path = match data_path {
+                        DataPathMode::Auto if !ktls.compatible => {
+                            info!(
+                                %id,
+                                tls_version = %ktls.tls_version,
+                                cipher = %ktls.cipher,
+                                "kTLS-incompatible TLS session; using /dev/ppp userspace data path"
+                            );
+                            DataPathMode::Userspace
+                        }
+                        m => m,
+                    };
+                    if matches!(data_path, DataPathMode::Kernel) && !ktls.compatible {
+                        warn!(
+                            %id,
+                            tls_version = %ktls.tls_version,
+                            cipher = %ktls.cipher,
+                            "kernel data path forced by config, but negotiated TLS session is outside v0.1 kTLS allow-list"
+                        );
+                    }
+
+                    match KpppSession::bring_up(effective_data_path, tls.tcp_fd(), local_ip, peer_ip) {
+                        Ok(k) => {
+                            info!(
+                                %id,
+                                ifname = %k.ifname(),
+                                ifindex = k.ifindex(),
+                                local = %local_ip,
+                                peer = %peer_ip,
+                                tls_version = %ktls.tls_version,
+                                cipher = %ktls.cipher,
+                                kernel_path = k.is_kernel(),
+                                "kernel PPP unit attached"
+                            );
+                            *kppp = Some(k);
+                        }
+                        Err(e) => {
+                            warn!(%id, error = %e, "kernel PPP unit bring-up failed; tearing session down");
+                            return false;
+                        }
+                    }
+                }
             }
             None => {}
         }
@@ -640,6 +801,15 @@ async fn handle_ppp_step(
         }
         return true;
     }
+}
+
+/// Per-session context the PPP driver needs in order to submit auth
+/// requests across runtime boundaries. Cheap to construct (one
+/// `SocketAddr` copy plus a borrowed [`AuthBridge`] handle) and held
+/// only for the duration of [`drive_sstp`].
+struct AuthCtx<'a> {
+    peer: SocketAddr,
+    bridge: &'a AuthBridge,
 }
 
 /// Wrap a raw PPP frame in an SSTP data packet and write it to TLS.
