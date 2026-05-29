@@ -84,15 +84,17 @@ recoup later.
 
 **Future kmod ABI.** The intended kernel-side interface for v0.x is
 sketched in [kernel-abi/sstp.h](kernel-abi/sstp.h) as a draft UAPI
-header. Userspace will hand the kernel a TLS-equipped TCP fd plus the
-negotiated PPP unit via an `SSTP_IOC_ATTACH` ioctl on `/dev/sstp`; the
-kernel then registers an SSTP PPP channel against that unit and runs
-the steady-state data path (kTLS decrypt → SSTP demux → `ppp_input`)
-without userspace involvement. The header is non-normative until the
-module actually exists, but it pins down the shape so the userspace
-side we ship in v0.1 can be written with that handoff in mind. See the
-header for open questions (kTLS vs in-kmod TLS, channel-vs-unit
-ownership split, etc.).
+header, with a v0.1 lifecycle-only kmod skeleton under [kmod/](kmod/)
+that builds against any Linux 6.12+ tree with `CONFIG_PPP=m`.
+Userspace will hand the kernel a kTLS-equipped TCP fd plus the
+negotiated PPP unit via an `SSTP_IOC_ATTACH` ioctl on `/dev/sstp`;
+the kernel then registers an SSTP PPP channel against that unit and
+runs the steady-state data path (kTLS decrypt → SSTP demux →
+`ppp_input`) without userspace involvement. The header is
+non-normative until the module is feature-complete; the current
+kmod compiles, exercises attach/detach lifecycle and the session_fd
+event surface, but stubs the per-frame demux and TX paths (TODOs
+tagged `v0.1` in `kmod/sstp_demux.c` and `kmod/sstp_chan.c`).
 
 ### Crypto
 
@@ -648,20 +650,54 @@ PR with tests where the surface allows. Check items off as they merge.
       releases its netdev as it unwinds.
 
 ### M6 — Session glue & lifecycle
-- [ ] Per-connection task on the accepting I/O worker that owns the
+- [x] Per-connection task on the accepting I/O worker that owns the
       TCP socket, TLS state, SSTP state machine, and PPP control plane.
-- [ ] Bounded MPSC for cross-worker control: shutdown, CoA disconnect,
+      v0.1: scaffold in `src/session.rs`. `session::run` is spawned via
+      `tokio::task::spawn_local` from the accept loop, holds an RAII
+      `RegistrationGuard` so the global `Registry` cannot leak entries
+      on panic, and selects on `(stream, control_rx, drain_rx)`. The
+      TLS handshake → SSTP demux → PPP drive loop is the next TODO
+      inside that task; the structural plumbing around it is done.
+- [x] Bounded MPSC for cross-worker control: shutdown, CoA disconnect,
       `disable session` from the control socket.
-- [ ] Graceful drain: stop accepting on SIGTERM / `shutdown` command,
+      `SessionHandle` wraps an `mpsc::Sender<ControlCommand>` (depth 4,
+      `try_send` drops on full / closed) and is cloneable across
+      runtimes. `Registry::broadcast_disconnect` fans out to every
+      live session; targeted teardown is `Registry::get(id).try_send`.
+- [x] Graceful drain: stop accepting on SIGTERM / `shutdown` command,
       send PPP LCP Terminate-Request, wait up to N seconds, then exit.
+      `main::run` broadcasts the shutdown signal (workers stop
+      accepting), then `Registry::broadcast_disconnect(ServerShutdown)`
+      asks every session to tear down. Both `main` and each worker's
+      accept loop bound the wait at `DRAIN_GRACE` (10 s) before
+      abandoning stuck tasks. The actual PPP `LCP Terminate-Request`
+      lands when the session task drives the PPP FSM end-to-end.
 
 ### M7 — Control socket
-- [ ] Unix socket bind at `--control-socket` path, `0660` perms.
-- [ ] Line-oriented dispatcher running on the auth runtime.
-- [ ] Commands: `show info`, `show stat`, `show sess`, `show sess <id>`,
-      `disable session <id>`, `shutdown`.
-- [ ] Pre-rendered metric snapshot to keep `show stat` allocation-free
-      on the registry side.
+- [x] Unix socket bind at `--control-socket` path, `0660` perms.
+      `src/control.rs::serve` removes any stale socket file, binds
+      `UnixListener`, sets `PermissionsExt::from_mode(0o660)`, and
+      removes the file on graceful exit. Logged at info.
+- [x] Line-oriented dispatcher running on the auth runtime.
+      Spawned from `main::run` on the auth runtime via
+      `tokio::spawn`; per-connection tasks use `BufReader::read_line`
+      with a 1 KiB line cap. Every command produces a response
+      terminated by an empty line; `shutdown` closes the connection.
+- [x] Commands: `show info`, `show stat`, `show sess`, `show sess <id>`,
+      `disable session <id>`, `shutdown`. Plus `help`. Unknown
+      commands return `Error: unknown command (try 'help')` and the
+      connection stays open. `shutdown` reuses the same
+      `broadcast::Sender<()>` the SIGTERM path uses, so the drain
+      logic in `main::run` is shared.
+- [x] Pre-rendered metric snapshot to keep `show stat` allocation-free
+      on the registry side. Metrics live in `src/metrics.rs` as
+      `pub static Counter`/`Gauge` newtypes around `AtomicU64`/`I64`
+      with `Ordering::Relaxed`. Call sites do
+      `metrics::CONNECTIONS_ACCEPTED.inc()` \(no `&'static str`
+      lookup, no recorder install\); `metrics::render_stats` is the
+      only allocator and runs once per `show stat`. Wired into the
+      session accept/teardown path (`session::spawn_handle` and the
+      `RegistrationGuard`).
 
 ### M8 — Benchmarks & hardening
 - [ ] `benches/` with a synthetic SSTP client to measure connection-setup

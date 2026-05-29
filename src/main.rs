@@ -13,28 +13,37 @@
 
 mod auth;
 mod cli;
+mod control;
 mod crypto;
 mod kppp;
+mod metrics;
 mod net;
 mod ppp;
+mod session;
 mod sstp;
 
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 use std::thread;
+use std::time::Duration;
 
 use tokio::runtime::{Builder, Runtime};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::broadcast;
-use tokio::task::LocalSet;
+use tokio::task::{JoinHandle, LocalSet};
 use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::cli::{Config, LogFormat, ParseOutcome};
+use crate::session::{DisconnectReason, Registry};
 
 const LOG_QUEUE_LINES: usize = 8192;
+/// Grace period after broadcasting drain before forcibly tearing down
+/// remaining sessions. Mirrors the typical PPP `Max-Terminate` budget
+/// (RFC 1661 §4.1: 2 retransmits × 3 s) with headroom for TLS close.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 fn main() -> ExitCode {
     // Developer convenience: populate env from `.env` if present. No-op in
@@ -73,6 +82,8 @@ fn main() -> ExitCode {
 
 fn run(config: &Config) -> ExitCode {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let registry = Registry::new();
+    let started = std::time::Instant::now();
 
     // Auth runtime: multi-threaded so a slow RADIUS server can't head-of-line
     // block. M4 will spawn the actual auth tasks here.
@@ -91,17 +102,61 @@ fn run(config: &Config) -> ExitCode {
     for id in 0..config.io_threads.get() {
         let rx = shutdown_tx.subscribe();
         let listen_addr = config.listen;
+        let worker_registry = registry.clone();
+        let worker_shutdown = shutdown_tx.clone();
         let handle = thread::Builder::new()
             .name(format!("sstp-io-{id}"))
-            .spawn(move || io_worker_main(id, listen_addr, rx))
+            .spawn(move || io_worker_main(id, listen_addr, rx, worker_registry, worker_shutdown))
             .expect("spawn I/O worker");
         workers.push(handle);
     }
 
     let shutdown_for_signal = shutdown_tx.clone();
+    let drain_registry = registry.clone();
+    let control_socket_path = config.control_socket.clone();
+    let control_state = control::ControlState {
+        registry: registry.clone(),
+        shutdown_tx: shutdown_tx.clone(),
+        started,
+        io_threads: config.io_threads.get(),
+        auth_threads: config.auth_threads.get(),
+    };
+    let control_shutdown_rx = shutdown_tx.subscribe();
     auth_runtime.block_on(async move {
-        wait_for_shutdown().await;
+        // Spawn the control socket if configured. Failures to bind are
+        // logged but do not abort the server — the data plane keeps
+        // running.
+        if let Some(path) = control_socket_path {
+            tokio::spawn(async move {
+                if let Err(e) = control::serve(&path, control_state, control_shutdown_rx).await {
+                    warn!(error = %e, "control socket failed");
+                }
+            });
+        }
+        wait_for_shutdown(shutdown_tx.subscribe()).await;
+        // Phase 1: tell workers to stop accepting and tell every live
+        // session to begin graceful teardown.
         let _ = shutdown_for_signal.send(());
+        let initial = drain_registry.len();
+        if initial > 0 {
+            info!(active_sessions = initial, "draining sessions");
+            drain_registry.broadcast_disconnect(DisconnectReason::ServerShutdown);
+            // Phase 2: poll the registry until it empties or the grace
+            // period elapses. Polling is fine — drain is a once-per-
+            // process event and there are at most a few thousand
+            // sessions in flight.
+            let deadline = tokio::time::Instant::now() + DRAIN_GRACE;
+            while !drain_registry.is_empty() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let remaining = drain_registry.len();
+            if remaining > 0 {
+                warn!(
+                    remaining,
+                    "drain grace period elapsed; sessions will be dropped"
+                );
+            }
+        }
     });
 
     auth_runtime.shutdown_background();
@@ -114,7 +169,13 @@ fn run(config: &Config) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn io_worker_main(id: usize, listen: std::net::SocketAddr, mut shutdown: broadcast::Receiver<()>) {
+fn io_worker_main(
+    id: usize,
+    listen: std::net::SocketAddr,
+    mut shutdown: broadcast::Receiver<()>,
+    registry: Registry,
+    shutdown_tx: broadcast::Sender<()>,
+) {
     let rt: Runtime = Builder::new_current_thread()
         .enable_all()
         .thread_name(format!("sstp-io-{id}"))
@@ -130,7 +191,7 @@ fn io_worker_main(id: usize, listen: std::net::SocketAddr, mut shutdown: broadca
             }
         };
         info!(worker = id, listen = %listen, "listener ready");
-        accept_loop(id, listener, &mut shutdown).await;
+        accept_loop(id, listener, &mut shutdown, registry, shutdown_tx).await;
     });
 }
 
@@ -138,22 +199,34 @@ async fn accept_loop(
     worker_id: usize,
     listener: tokio::net::TcpListener,
     shutdown: &mut broadcast::Receiver<()>,
+    registry: Registry,
+    shutdown_tx: broadcast::Sender<()>,
 ) {
+    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
     loop {
+        // Reap completed tasks opportunistically so the Vec doesn't
+        // grow without bound under steady-state load.
+        tasks.retain(|h| !h.is_finished());
+
         tokio::select! {
             biased;
             _ = shutdown.recv() => {
-                info!(worker = worker_id, "accept loop draining");
-                return;
+                info!(
+                    worker = worker_id,
+                    in_flight = tasks.len(),
+                    "accept loop draining"
+                );
+                break;
             }
             res = listener.accept() => match res {
                 Ok((stream, peer)) => {
-                    // M6 will spawn a per-connection !Send task here.
-                    // For now: log, drop the stream so the peer sees an
-                    // immediate FIN — useful as a smoke test of the
-                    // listener wiring without pulling in TLS/SSTP yet.
-                    info!(worker = worker_id, %peer, "accepted connection (no handler yet)");
-                    drop(stream);
+                    let (id, control_rx) = session::spawn_handle(&registry, peer);
+                    let drain_rx = shutdown_tx.subscribe();
+                    let registry = registry.clone();
+                    let handle = tokio::task::spawn_local(session::run(
+                        stream, peer, id, registry, control_rx, drain_rx,
+                    ));
+                    tasks.push(handle);
                 }
                 Err(e) => {
                     // Per-connection errors (EMFILE, ECONNABORTED) are
@@ -163,9 +236,29 @@ async fn accept_loop(
             }
         }
     }
+
+    // Drain phase: wait for active session tasks to finish. Each one
+    // already received the broadcast on its own `drain_rx`, so they
+    // should be heading for the exit. We bound the wait at DRAIN_GRACE
+    // so a stuck task can't keep us from exiting.
+    if !tasks.is_empty() {
+        let deadline = tokio::time::Instant::now() + DRAIN_GRACE;
+        for h in tasks {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, h).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(worker = worker_id, error = %e, "session task panicked"),
+                Err(_) => {
+                    warn!(worker = worker_id, "drain timeout; abandoning session task");
+                    break;
+                }
+            }
+        }
+    }
+    info!(worker = worker_id, "accept loop exited");
 }
 
-async fn wait_for_shutdown() {
+async fn wait_for_shutdown(mut admin_rx: broadcast::Receiver<()>) {
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(e) => {
@@ -177,6 +270,7 @@ async fn wait_for_shutdown() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("received SIGINT, shutting down"),
         _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
+        _ = admin_rx.recv() => info!("received control-socket shutdown, shutting down"),
     }
 }
 
