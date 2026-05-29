@@ -249,6 +249,16 @@ pub async fn run(
     };
     info!(%id, "TLS handshake completed");
 
+    // kTLS install is *not* invoked here — it happens at kernel-
+    // mode kmod attach inside [`handle_ppp_step`], paired with the
+    // TX-path swap to raw `write(2)` via [`TxStream::ktls_tx`].
+    // Installing it earlier would mean either (a) libssl `SSL_write`
+    // double-encrypting on subsequent control writes, or (b) needing
+    // the raw-fd TX path to be ready before we know whether the
+    // session will go kernel-mode at all. Under `--data-path auto`,
+    // sessions that fall back to TUN keep using libssl end-to-end
+    // and never install kTLS at all.
+
     // Phase 2: SSTP HTTPS preamble (MS-SSTP §3.2.4.1 / §4.1). The
     // client posts to the well-known URI with `Content-Length:
     // ULONGLONG_MAX`; we validate and respond with `HTTP/1.1 200`.
@@ -303,7 +313,7 @@ pub async fn run(
 async fn drive_sstp(
     id: SessionId,
     peer: SocketAddr,
-    mut tls: TlsStream,
+    tls: TlsStream,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     mut drain_rx: broadcast::Receiver<()>,
     auth_bridge: AuthBridge,
@@ -312,14 +322,27 @@ async fn drive_sstp(
     data_path: DataPathMode,
 ) {
     use std::future::poll_fn;
+    use std::os::fd::OwnedFd;
     use std::pin::Pin;
     use std::task::Poll;
+    use tokio::io::unix::AsyncFd;
     use tokio::time::Sleep;
 
-    use crate::sstp::frame::SSTP_MAX_PACKET_LEN;
+    use crate::kppp::sstp_kmod::{EventRaw, EventType, SSTP_CONTROL_MAX};
+    use crate::sstp::frame::{SSTP_HEADER_LEN, SSTP_MAX_PACKET_LEN, write_header};
     use crate::sstp::msg::CALL_CONNECTED_LEN;
     use crate::sstp::state::Timer;
-    use crate::sstp::{ControlMessage, Packet, StateMachine, parse_control};
+    use crate::sstp::{
+        ControlMessage, Packet, StateMachine, parse_control, parse_control_payload,
+    };
+
+    // Wrap the libssl-backed TLS stream in a `TxStream`. While
+    // `tx.ktls_tx` is `None`, writes go through libssl as usual;
+    // once kernel mode is brought up and kTLS is installed (inside
+    // [`handle_ppp_step`] at `NetworkUp`), `tx.ktls_tx` becomes
+    // `Some(AsyncFd)` and outbound bytes route through raw
+    // `write(2)` on the TCP fd with the kernel doing AEAD.
+    let mut tx = TxStream::new(tls);
 
     let mut ssm = StateMachine::new(cert_hash);
     let mut tx_buf = [0u8; SSTP_MAX_PACKET_LEN];
@@ -330,6 +353,16 @@ async fn drive_sstp(
     let mut ppp_timer: Option<(TimerOwner, Pin<Box<Sleep>>)> = None;
     let mut kppp: Option<KpppSession> = None;
     let mut kppp_buf = [0u8; 2048];
+    // Set once a kernel-mode `KpppSession` is brought up: a
+    // duplicate of the kmod's anon-inode session fd wrapped for
+    // tokio readability polling. While `Some`, `tx.tls.read()` is
+    // gated off (the kmod owns the byte path) and incoming SSTP
+    // control packets arrive as `SSTP_EVT_CONTROL_PACKET` events.
+    let mut kmod_async_fd: Option<AsyncFd<OwnedFd>> = None;
+    // Scratch buffer for `SSTP_IOC_RECV_CONTROL`. Sized at the
+    // kernel's `SSTP_CONTROL_MAX` so the ioctl never returns
+    // `EMSGSIZE`.
+    let mut ctrl_buf = vec![0u8; SSTP_CONTROL_MAX];
     // Mainline `/dev/ppp` unit fds return `Ok(0)` from `read(2)` —
     // the unit fd does not deliver TX frames in userspace (that's a
     // channel-fd path, which requires our SSTP kmod). Until the
@@ -342,7 +375,7 @@ async fn drive_sstp(
     // Spec entry point: `New HTTPS Connection Received` (§3.3.2.1).
     let initial = ssm.on_https_accepted();
     if !handle_sstp_step(
-        id, &mut tls, &initial, &tx_buf, &mut sstp_timer, &mut ppp, &mut ppp_timer, &auth,
+        id, &mut tx, &initial, &tx_buf, &mut sstp_timer, &mut ppp, &mut ppp_timer, &auth,
         local_ip, &mut kppp, data_path,
     )
     .await
@@ -351,6 +384,32 @@ async fn drive_sstp(
     }
 
     loop {
+        // Lazily wrap the kmod session fd in an `AsyncFd` once a
+        // kernel-mode `KpppSession` is brought up. Doing it here
+        // (rather than at bring-up time) keeps `handle_ppp_step` free
+        // of tokio I/O construction and lets the driver fall back
+        // cleanly if the dup fails.
+        if kmod_async_fd.is_none()
+            && let Some(k) = kppp.as_ref()
+            && k.is_kernel()
+        {
+            match k.kmod_async_fd() {
+                Ok(Some(af)) => {
+                    debug!(%id, "kmod session fd registered for tokio readability polling");
+                    kmod_async_fd = Some(af);
+                }
+                Ok(None) => {
+                    // is_kernel() said yes but kmod_async_fd() said
+                    // no — programming error in KpppSession.
+                    warn!(%id, "kernel-mode KpppSession yielded no kmod fd; tearing session down");
+                    return;
+                }
+                Err(e) => {
+                    warn!(%id, error = %e, "failed to register kmod fd with tokio");
+                    return;
+                }
+            }
+        }
         // Wrap each optional timer in a poll_fn so the corresponding
         // select branch is `Poll::Pending` forever when no timer is
         // armed. Borrows on the timer slots end at the `select!`
@@ -377,6 +436,31 @@ async fn drive_sstp(
                     _ => std::future::pending::<std::io::Result<usize>>().await,
                 }
             };
+            // In kernel mode the kmod has consumed the TCP byte
+            // path; `SSL_read` on the same socket would either
+            // hang (kernel-TLS RX delivers bytes via the kmod's
+            // sk_data_ready callback, not back up through libssl)
+            // or get desynced. Gate `tls.read()` to pending and
+            // route inbound SSTP control packets through the kmod
+            // event channel instead.
+            let tls_read_fut = async {
+                if kmod_async_fd.is_some() {
+                    std::future::pending::<std::io::Result<usize>>().await
+                } else {
+                    tx.tls.read(&mut chunk).await
+                }
+            };
+            // Wait for the kmod session fd to become readable;
+            // resolves to the readability guard so we can
+            // `clear_ready()` after draining all queued events to
+            // `EAGAIN`. Pending forever when `kmod_async_fd` is
+            // `None`.
+            let kmod_fut = async {
+                match kmod_async_fd.as_ref() {
+                    Some(af) => Some(af.readable().await),
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 biased;
                 _ = drain_rx.recv() => DriverEvent::Drain,
@@ -384,7 +468,40 @@ async fn drive_sstp(
                 () = sstp_timer_fut => DriverEvent::SstpTimer,
                 () = ppp_timer_fut => DriverEvent::PppTimer,
                 r = kppp_read_fut => DriverEvent::KpppRead(r),
-                r = tls.read(&mut chunk) => DriverEvent::Read(r),
+                g = kmod_fut => {
+                    // Drain events into a Vec while we still hold
+                    // the readiness guard, then clear readiness in
+                    // one shot. The kmod's control queue is bounded
+                    // (SSTP_CTRL_Q_CAP) so the Vec stays tiny.
+                    let mut events: Vec<EventRaw> = Vec::new();
+                    let mut io_err: Option<std::io::Error> = None;
+                    match g {
+                        Some(Err(e)) => io_err = Some(e),
+                        Some(Ok(mut guard)) => {
+                            loop {
+                                match kppp.as_ref().and_then(|k| {
+                                    k.read_event().transpose()
+                                }) {
+                                    None => {
+                                        // Queue empty (Ok(None))
+                                        // *or* kppp went away mid-
+                                        // iteration. Clear and bail.
+                                        guard.clear_ready();
+                                        break;
+                                    }
+                                    Some(Ok(ev)) => events.push(ev),
+                                    Some(Err(e)) => {
+                                        io_err = Some(std::io::Error::other(e.to_string()));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        None => unreachable!("kmod_fut returned None despite Some(AsyncFd)"),
+                    }
+                    DriverEvent::KmodEvents { events, io_err }
+                },
+                r = tls_read_fut => DriverEvent::Read(r),
             }
         };
 
@@ -394,7 +511,7 @@ async fn drive_sstp(
                 let out = ssm.on_higher_layer_disconnect(&mut tx_buf);
                 if !handle_sstp_step(
                     id,
-                    &mut tls,
+                    &mut tx,
                     &out,
                     &tx_buf,
                     &mut sstp_timer,
@@ -415,7 +532,7 @@ async fn drive_sstp(
                 let out = ssm.on_higher_layer_disconnect(&mut tx_buf);
                 if !handle_sstp_step(
                     id,
-                    &mut tls,
+                    &mut tx,
                     &out,
                     &tx_buf,
                     &mut sstp_timer,
@@ -443,7 +560,7 @@ async fn drive_sstp(
                 let out = ssm.on_timer(which, &mut tx_buf);
                 if !handle_sstp_step(
                     id,
-                    &mut tls,
+                    &mut tx,
                     &out,
                     &tx_buf,
                     &mut sstp_timer,
@@ -466,7 +583,7 @@ async fn drive_sstp(
                 debug!(%id, ?owner, "PPP timer expired");
                 if let Some(p) = ppp.as_mut() {
                     let step = p.on_timer(owner);
-                    if !handle_ppp_step(id, &mut tls, p, step, &mut ppp_timer, &auth, local_ip, &mut kppp, data_path).await {
+                    if !handle_ppp_step(id, &mut tx, p, step, &mut ppp_timer, &auth, local_ip, &mut kppp, data_path).await {
                         return;
                     }
                 }
@@ -490,13 +607,116 @@ async fn drive_sstp(
                 kppp_read_disabled = true;
             }
             DriverEvent::KpppRead(Ok(n)) => {
-                if let Err(e) = write_ppp_as_sstp_data(&mut tls, &kppp_buf[..n]).await {
+                if let Err(e) = write_ppp_as_sstp_data(&mut tx, &kppp_buf[..n]).await {
                     warn!(%id, error = %e, "TLS write of kernel-PPP frame failed");
                     return;
                 }
-                if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut tls).await {
+                if let Err(e) = tx.flush().await {
                     warn!(%id, error = %e, "TLS flush after kernel-PPP frame failed");
                     return;
+                }
+            }
+            DriverEvent::KmodEvents { events, io_err } => {
+                if let Some(e) = io_err {
+                    warn!(%id, error = %e, "kmod event poll failed; tearing session down");
+                    return;
+                }
+                for ev in events {
+                    match EventType::from_u32(ev.r#type) {
+                        Some(EventType::ControlPacket) => {
+                            let n = match kppp
+                                .as_ref()
+                                .expect("kmod event without KpppSession")
+                                .recv_control(&mut ctrl_buf)
+                            {
+                                Ok(Some(n)) => n,
+                                Ok(None) => continue, // raced with another drain
+                                Err(e) => {
+                                    warn!(%id, error = %e, "SSTP_IOC_RECV_CONTROL failed");
+                                    return;
+                                }
+                            };
+                            let payload = &ctrl_buf[..n];
+                            let msg = match parse_control_payload(payload) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    warn!(%id, error = %e, "kmod control packet parse failed");
+                                    return;
+                                }
+                            };
+                            let out = match msg {
+                                // CallConnected's Crypto-Binding HMAC
+                                // is computed over the full 112-byte
+                                // packet (header included) with the
+                                // Compound MAC field at [80..112]
+                                // zeroed ([MS-SSTP] §3.2.5.2.3). The
+                                // kmod stripped the 4-byte header, so
+                                // reconstruct it.
+                                ControlMessage::CallConnected(cb) => {
+                                    if payload.len() + SSTP_HEADER_LEN
+                                        != CALL_CONNECTED_LEN
+                                    {
+                                        warn!(
+                                            %id,
+                                            got = payload.len() + SSTP_HEADER_LEN,
+                                            want = CALL_CONNECTED_LEN,
+                                            "CallConnected wrong length"
+                                        );
+                                        return;
+                                    }
+                                    let mut zeroed = [0u8; CALL_CONNECTED_LEN];
+                                    let (hdr, body) =
+                                        zeroed.split_at_mut(SSTP_HEADER_LEN);
+                                    let hdr: &mut [u8; SSTP_HEADER_LEN] =
+                                        hdr.try_into().expect("SSTP_HEADER_LEN slice");
+                                    write_header(hdr, true, CALL_CONNECTED_LEN);
+                                    body.copy_from_slice(payload);
+                                    zeroed[80..112].fill(0);
+                                    ssm.verify_call_connected(cb, &zeroed, &mut tx_buf)
+                                }
+                                other => ssm.on_message(other, &mut tx_buf),
+                            };
+                            if !handle_sstp_step(
+                                id,
+                                &mut tx,
+                                &out,
+                                &tx_buf,
+                                &mut sstp_timer,
+                                &mut ppp,
+                                &mut ppp_timer,
+                                &auth,
+                                local_ip,
+                                &mut kppp,
+                                data_path,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                        }
+                        Some(EventType::PeerClosed) => {
+                            info!(%id, "kmod: peer closed TCP connection");
+                            return;
+                        }
+                        Some(EventType::TlsFatalAlert) => {
+                            warn!(%id, alert = ev.arg, "kmod: TLS fatal alert");
+                            return;
+                        }
+                        Some(EventType::ProtocolError) => {
+                            warn!(%id, code = ev.arg, "kmod: SSTP protocol error");
+                            return;
+                        }
+                        Some(EventType::TlsRekeyNeeded) => {
+                            // TODO: extract new traffic secrets and
+                            // push fresh TLS_TX/TLS_RX setsockopts.
+                            // Until then a rekey is fatal.
+                            warn!(%id, "kmod: TLS KeyUpdate requested (rekey not implemented; tearing down)");
+                            return;
+                        }
+                        None => {
+                            warn!(%id, ty = ev.r#type, "kmod: unknown event type");
+                        }
+                    }
                 }
             }
             DriverEvent::Read(Ok(0)) => {
@@ -534,7 +754,7 @@ async fn drive_sstp(
                             let out = ssm.on_data_packet();
                             if !handle_sstp_step(
                                 id,
-                                &mut tls,
+                                &mut tx,
                                 &out,
                                 &tx_buf,
                                 &mut sstp_timer,
@@ -565,7 +785,7 @@ async fn drive_sstp(
                                 && let Some(p) = ppp.as_mut()
                             {
                                 let step = p.on_frame(payload);
-                                if !handle_ppp_step(id, &mut tls, p, step, &mut ppp_timer, &auth, local_ip, &mut kppp, data_path).await {
+                                if !handle_ppp_step(id, &mut tx, p, step, &mut ppp_timer, &auth, local_ip, &mut kppp, data_path).await {
                                     return;
                                 }
                             }
@@ -593,7 +813,7 @@ async fn drive_sstp(
                                     };
                                     if !handle_sstp_step(
                                         id,
-                                        &mut tls,
+                                        &mut tx,
                                         &out,
                                         &tx_buf,
                                         &mut sstp_timer,
@@ -632,6 +852,13 @@ enum DriverEvent {
     SstpTimer,
     PppTimer,
     KpppRead(std::io::Result<usize>),
+    /// Kmod session fd became readable; the select arm body has
+    /// already drained all queued events to `EAGAIN` and cleared
+    /// readiness on the guard.
+    KmodEvents {
+        events: Vec<crate::kppp::sstp_kmod::EventRaw>,
+        io_err: Option<std::io::Error>,
+    },
     Read(std::io::Result<usize>),
 }
 
@@ -642,7 +869,7 @@ enum DriverEvent {
 #[allow(clippy::too_many_arguments)]
 async fn handle_sstp_step(
     id: SessionId,
-    tls: &mut TlsStream,
+    tx: &mut TxStream,
     out: &crate::sstp::StepOut,
     tx_buf: &[u8],
     sstp_timer: &mut Option<(
@@ -656,7 +883,7 @@ async fn handle_sstp_step(
     kppp: &mut Option<KpppSession>,
     data_path: DataPathMode,
 ) -> bool {
-    let outcome = apply_step(id, tls, out, tx_buf, sstp_timer).await;
+    let outcome = apply_step(id, tx, out, tx_buf, sstp_timer).await;
     if !outcome.keep_going {
         return false;
     }
@@ -671,7 +898,7 @@ async fn handle_sstp_step(
         *ppp = Some(new_ppp);
         if !handle_ppp_step(
             id,
-            tls,
+            tx,
             ppp.as_mut().expect("just inserted"),
             step,
             ppp_timer,
@@ -698,7 +925,7 @@ async fn handle_sstp_step(
 #[allow(clippy::too_many_lines)] // straight-line event handling in one place for state clarity
 async fn handle_ppp_step(
     id: SessionId,
-    tls: &mut TlsStream,
+    tx: &mut TxStream,
     ppp: &mut Ppp,
     mut step: PppStep,
     ppp_timer: &mut Option<(TimerOwner, std::pin::Pin<Box<tokio::time::Sleep>>)>,
@@ -713,13 +940,13 @@ async fn handle_ppp_step(
     // the driver and may produce more frames and another event.
     loop {
         for frame in &step.frames {
-            if let Err(e) = write_ppp_as_sstp_data(tls, frame).await {
+            if let Err(e) = write_ppp_as_sstp_data(tx, frame).await {
                 warn!(%id, error = %e, "TLS write of PPP frame failed");
                 return false;
             }
         }
         if !step.frames.is_empty() {
-            if let Err(e) = tokio::io::AsyncWriteExt::flush(tls).await {
+            if let Err(e) = tx.flush().await {
                 warn!(%id, error = %e, "TLS flush failed");
                 return false;
             }
@@ -763,7 +990,7 @@ async fn handle_ppp_step(
                 if kppp.is_some() {
                     debug!(%id, ip = %peer_ip, "spurious NetworkUp after kernel PPP unit already attached");
                 } else {
-                    let ktls = tls.ktls_eligibility();
+                    let ktls = tx.tls.ktls_eligibility();
                     let effective_data_path = match data_path {
                         DataPathMode::Auto if !ktls.compatible => {
                             info!(
@@ -785,7 +1012,64 @@ async fn handle_ppp_step(
                         );
                     }
 
-                    match KpppSession::bring_up(effective_data_path, tls.tcp_fd(), local_ip, peer_ip) {
+                    // Install kTLS on the TCP socket before the
+                    // kmod attach when kernel mode is in play. The
+                    // kmod's `SSTP_IOC_ATTACH` requires kTLS RX+TX
+                    // to be installed up-front (it returns
+                    // `EOPNOTSUPP` otherwise). After install,
+                    // libssl's `SSL_write` would produce
+                    // double-encrypted bytes, so the matching TX
+                    // path swap (dup the TCP fd into
+                    // `TxStream::ktls_tx`; raw `write(2)` from
+                    // there, kernel does the AEAD) happens here
+                    // too. Under `--data-path auto` we skip the
+                    // install entirely so the TUN-fallback path
+                    // keeps using libssl as before.
+                    if matches!(effective_data_path, DataPathMode::Kernel)
+                        && ktls.compatible
+                    {
+                        if let Err(e) = tx.tls.install_ktls() {
+                            warn!(%id, error = %e, "kTLS install failed; cannot bring up kernel data path");
+                            return false;
+                        }
+                        info!(
+                            %id,
+                            tls_version = %ktls.tls_version,
+                            cipher = %ktls.cipher,
+                            "kTLS installed on TCP socket"
+                        );
+                        // Dup the TCP fd into an `O_NONBLOCK`
+                        // owned fd registered with tokio for
+                        // write-readiness. From this point on
+                        // `TxStream::write_all` routes outbound
+                        // bytes through raw `write(2)` so kTLS
+                        // does the encryption. The TcpStream's
+                        // own fd stays open (the kmod takes a
+                        // borrowed-fd reference at attach), so
+                        // the dup is just for the async write
+                        // path.
+                        let dup = match tx.tls.tcp_fd().try_clone_to_owned() {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!(%id, error = %e, "failed to dup TCP fd for kTLS TX");
+                                return false;
+                            }
+                        };
+                        let async_fd = match tokio::io::unix::AsyncFd::with_interest(
+                            dup,
+                            tokio::io::Interest::WRITABLE,
+                        ) {
+                            Ok(af) => af,
+                            Err(e) => {
+                                warn!(%id, error = %e, "failed to register kTLS TX fd with tokio");
+                                return false;
+                            }
+                        };
+                        tx.ktls_tx = Some(async_fd);
+                        debug!(%id, "kTLS TX writer installed; libssl bypassed on outbound");
+                    }
+
+                    match KpppSession::bring_up(effective_data_path, tx.tls.tcp_fd(), local_ip, peer_ip) {
                         Ok(k) => {
                             info!(
                                 %id,
@@ -828,9 +1112,7 @@ struct AuthCtx<'a> {
 }
 
 /// Wrap a raw PPP frame in an SSTP data packet and write it to TLS.
-async fn write_ppp_as_sstp_data(tls: &mut TlsStream, payload: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-
+async fn write_ppp_as_sstp_data(tx: &mut TxStream, payload: &[u8]) -> std::io::Result<()> {
     use crate::sstp::frame::{SSTP_HEADER_LEN, SSTP_MAX_PACKET_LEN, write_header};
 
     let total = SSTP_HEADER_LEN + payload.len();
@@ -840,8 +1122,8 @@ async fn write_ppp_as_sstp_data(tls: &mut TlsStream, payload: &[u8]) -> std::io:
     );
     let mut header = [0u8; SSTP_HEADER_LEN];
     write_header(&mut header, false, total);
-    tls.write_all(&header).await?;
-    tls.write_all(payload).await?;
+    tx.write_all(&header).await?;
+    tx.write_all(payload).await?;
     Ok(())
 }
 
@@ -852,7 +1134,7 @@ async fn write_ppp_as_sstp_data(tls: &mut TlsStream, payload: &[u8]) -> std::io:
 /// [`handle_sstp_step`]).
 async fn apply_step(
     id: SessionId,
-    tls: &mut TlsStream,
+    tx: &mut TxStream,
     out: &crate::sstp::StepOut,
     tx_buf: &[u8],
     active_timer: &mut Option<(
@@ -860,17 +1142,16 @@ async fn apply_step(
         std::pin::Pin<Box<tokio::time::Sleep>>,
     )>,
 ) -> SstpOutcome {
-    use tokio::io::AsyncWriteExt;
     use tokio::time::{Instant, sleep_until};
 
     use crate::sstp::state::{NotifyHigher, Terminate};
 
     if out.send_len > 0 {
-        if let Err(e) = tls.write_all(&tx_buf[..out.send_len]).await {
+        if let Err(e) = tx.write_all(&tx_buf[..out.send_len]).await {
             warn!(%id, error = %e, "TLS write failed");
             return SstpOutcome::stop();
         }
-        if let Err(e) = tls.flush().await {
+        if let Err(e) = tx.flush().await {
             warn!(%id, error = %e, "TLS flush failed");
             return SstpOutcome::stop();
         }
@@ -914,6 +1195,102 @@ async fn apply_step(
             SstpOutcome::stop()
         }
     }
+}
+
+/// Outbound byte stream for the session driver. Wraps the
+/// [`TlsStream`] and, once the SSTP kmod has taken over the data
+/// path, an [`AsyncFd`] over a duplicate of the underlying TCP fd.
+///
+/// Why two paths: kTLS on the TCP socket replaces libssl's
+/// record-layer encryption with a kernel-side implementation. After
+/// `setsockopt(SOL_TLS, TLS_TX, ...)` libssl no longer encrypts on
+/// write, so `SSL_write` would emit double-encrypted gibberish.
+/// The fix is to bypass libssl entirely on the write side and use
+/// `write(2)` directly on the TCP fd; the kernel does the AEAD.
+///
+/// The read side stays on `TlsStream` only when the kmod is *not*
+/// in charge: once it is, [`drive_sstp`] gates `tls.read` to
+/// `Pending` and pulls inbound SSTP control packets out of the
+/// kmod's event channel instead.
+struct TxStream {
+    tls: TlsStream,
+    /// `Some` once kTLS TX has been installed on the TCP socket
+    /// (which, in v0.1, only happens at kernel-mode kmod attach).
+    /// Holds an `O_NONBLOCK` dup of the TCP fd registered with
+    /// tokio for write-readiness polling.
+    ktls_tx: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+}
+
+impl TxStream {
+    fn new(tls: TlsStream) -> Self {
+        Self { tls, ktls_tx: None }
+    }
+
+    /// Write `bytes` to the wire in full. Routes through `SSL_write`
+    /// when `ktls_tx` is `None` and through raw `write(2)` on the
+    /// dup'd TCP fd (kernel does the kTLS AEAD) otherwise.
+    async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(fd) = self.ktls_tx.as_ref() {
+            ktls_write_all(fd, bytes).await
+        } else {
+            use tokio::io::AsyncWriteExt;
+            self.tls.write_all(bytes).await
+        }
+    }
+
+    /// Drain any libssl buffering. No-op once kTLS TX is installed
+    /// — raw `write(2)` is unbuffered at this layer.
+    async fn flush(&mut self) -> std::io::Result<()> {
+        if self.ktls_tx.is_some() {
+            Ok(())
+        } else {
+            use tokio::io::AsyncWriteExt;
+            self.tls.flush().await
+        }
+    }
+}
+
+/// Raw kTLS write loop. The TCP socket is `O_NONBLOCK` (via the
+/// `AsyncFd` registration), so a full send buffer surfaces as
+/// `WouldBlock` and we re-arm. Short writes are normal and looped
+/// until the buffer drains.
+async fn ktls_write_all(
+    fd: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    mut buf: &[u8],
+) -> std::io::Result<()> {
+    use std::io;
+    use std::os::fd::AsRawFd;
+
+    while !buf.is_empty() {
+        let mut guard = fd.writable().await?;
+        let res = guard.try_io(|inner| {
+            // SAFETY: `inner.get_ref().as_raw_fd()` is an open fd
+            // owned by the `AsyncFd`; `buf` is a valid borrowed
+            // slice of `buf.len()` bytes. `write(2)` returns the
+            // number of bytes consumed or -1; we read `errno` only
+            // on -1.
+            let n = unsafe {
+                libc::write(
+                    inner.get_ref().as_raw_fd(),
+                    buf.as_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                #[allow(clippy::cast_sign_loss)] // n >= 0 from above
+                Ok(n as usize)
+            }
+        });
+        match res {
+            Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(Ok(n)) => buf = &buf[n..],
+            Ok(Err(e)) => return Err(e),
+            Err(_would_block) => {} // re-arm on next loop iteration
+        }
+    }
+    Ok(())
 }
 
 /// Outcome of one SSTP FSM step from the session driver's view.

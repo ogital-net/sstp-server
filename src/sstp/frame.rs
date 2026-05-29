@@ -109,7 +109,7 @@ pub struct ControlPacket<'a> {
 impl<'a> ControlPacket<'a> {
     /// Parse a control packet body (everything after the 4-byte outer
     /// header). Caller has already validated the length.
-    fn parse_body(body: &'a [u8]) -> Result<Self, ParseError> {
+    pub(crate) fn parse_body(body: &'a [u8]) -> Result<Self, ParseError> {
         if body.len() < SSTP_CONTROL_EXTRA_LEN {
             return Err(ParseError::Truncated);
         }

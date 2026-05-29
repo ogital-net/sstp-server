@@ -20,7 +20,9 @@ use std::ffi::CStr;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
-use super::ioctl::{ioc_read, ioc_readwrite, ioc_write};
+use super::ioctl::{
+    PPPIOCATTCHAN, PPPIOCCONNECT, ioc_read, ioc_readwrite, ioc_write, ioctl_set_int,
+};
 
 const DEV_SSTP: &CStr = c"/dev/sstp";
 
@@ -50,6 +52,15 @@ const SSTP_IOC_ATTACH: libc::c_ulong = ioc_readwrite::<SstpAttachRaw>(SSTP_IOC_M
 const SSTP_IOC_DETACH: libc::c_ulong = ioc_write::<SstpDetachRaw>(SSTP_IOC_MAGIC, 0x81);
 const SSTP_IOC_GETSTATS: libc::c_ulong = ioc_read::<SstpStats>(SSTP_IOC_MAGIC, 0x82);
 const SSTP_IOC_GET_CHAN_INDEX: libc::c_ulong = ioc_read::<libc::c_int>(SSTP_IOC_MAGIC, 0x83);
+const SSTP_IOC_RECV_CONTROL: libc::c_ulong =
+    ioc_readwrite::<SstpRecvControlRaw>(SSTP_IOC_MAGIC, 0x84);
+
+/// Maximum SSTP control-packet payload userspace may need to drain.
+/// Matches `SSTP_CONTROL_MAX` in `kernel-abi/sstp.h`. The kernel
+/// rejects `recv_control` calls whose `buf_len` is below the queued
+/// payload's length with `EMSGSIZE` (and requeues the frame), so the
+/// caller's buffer must be sized at least this large.
+pub const SSTP_CONTROL_MAX: usize = 4096;
 
 /// Wire-compatible mirror of `struct sstp_attach`.
 #[repr(C)]
@@ -69,6 +80,15 @@ struct SstpAttachRaw {
 #[derive(Debug, Clone, Copy, Default)]
 struct SstpDetachRaw {
     reserved: [u32; 4],
+}
+
+/// Wire-compatible mirror of `struct sstp_recv_control`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct SstpRecvControlRaw {
+    buf_len: u32,
+    payload_len: u32,
+    buf: u64,
 }
 
 /// Counters returned by `SSTP_IOC_GETSTATS`. Matches `struct sstp_stats`.
@@ -95,6 +115,10 @@ pub enum EventType {
     TlsFatalAlert = 2,
     TlsRekeyNeeded = 3,
     ProtocolError = 4,
+    /// A control packet (C=1) was demuxed by the kmod and queued for
+    /// userspace. The event's `arg` is the payload length; drain it
+    /// with [`KmodSession::recv_control`].
+    ControlPacket = 5,
 }
 
 impl EventType {
@@ -105,6 +129,7 @@ impl EventType {
             2 => Some(Self::TlsFatalAlert),
             3 => Some(Self::TlsRekeyNeeded),
             4 => Some(Self::ProtocolError),
+            5 => Some(Self::ControlPacket),
             _ => None,
         }
     }
@@ -147,6 +172,15 @@ pub enum KmodError {
         #[source]
         source: io::Error,
     },
+    /// Binding the kernel SSTP channel to the userspace PPP unit
+    /// failed. Returned wrapped errno from `PPPIOCATTCHAN` or
+    /// `PPPIOCCONNECT` on a fresh `/dev/ppp` handle.
+    #[error("binding channel to PPP unit ({what}): {source}")]
+    ChannelBind {
+        what: &'static str,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Cheap probe: try to open `/dev/sstp` and immediately close it.
@@ -173,6 +207,11 @@ pub fn probe() -> Result<(), KmodError> {
 #[derive(Debug)]
 pub struct KmodSession {
     session_fd: OwnedFd,
+    /// `/dev/ppp` fd that anchors the channel↔unit binding. Closing
+    /// it disconnects the channel from the unit; we hold it for the
+    /// session's lifetime so the kernel keeps the PPP data path
+    /// wired together.
+    chan_fd: OwnedFd,
     chan_index: i32,
     ppp_unit: i32,
 }
@@ -208,7 +247,7 @@ impl KmodSession {
         // SAFETY: `dev` is a freshly-opened `/dev/sstp` fd. `req`
         // matches the kernel's `struct sstp_attach` byte-for-byte
         // (verified by mirroring `kernel-abi/sstp.h`). `SSTP_IOC_ATTACH`
-        // is `_IOWR(...)` of `sizeof(SstpAttachRaw)` (32 bytes), so the
+        // is `_IOWR(...)` of `sizeof(SstpAttachRaw)` (40 bytes), so the
         // kernel both reads and writes that many bytes through our
         // pointer. `req` is properly aligned and fully initialized.
         let rc = unsafe { libc::ioctl(dev.as_raw_fd(), SSTP_IOC_ATTACH, &raw mut req) };
@@ -228,10 +267,29 @@ impl KmodSession {
         let session_fd = unsafe { OwnedFd::from_raw_fd(req.session_fd) };
         drop(dev);
 
+        // The kmod opens the session fd in blocking mode; mark it
+        // O_NONBLOCK so async drivers can `read(2)` events without
+        // stalling the I/O worker. `read_event` translates EAGAIN
+        // into `Ok(None)`.
+        set_nonblock(session_fd.as_fd()).map_err(|source| KmodError::Ioctl {
+            what: "fcntl(O_NONBLOCK) on session_fd",
+            source,
+        })?;
+
         let chan_index = chan_index_for(session_fd.as_fd())?;
+
+        // Bind the kernel SSTP channel to the userspace PPP unit.
+        // The kmod registers a channel in attach but does not bind
+        // it to a unit — that is userspace's responsibility per the
+        // ppp_generic ABI. Open a fresh `/dev/ppp` fd, attach it to
+        // the kmod's channel with PPPIOCATTCHAN, then connect that
+        // channel to the unit with PPPIOCCONNECT. The fd must stay
+        // open for the session's lifetime; closing it disconnects.
+        let chan_fd = bind_channel_to_unit(chan_index, ppp_unit)?;
 
         Ok(Self {
             session_fd,
+            chan_fd,
             chan_index,
             ppp_unit,
         })
@@ -303,9 +361,9 @@ impl KmodSession {
     }
 
     /// Read one event from the session fd. Returns `None` on
-    /// `EAGAIN` (set `O_NONBLOCK` first to avoid blocking). The fd is
-    /// opened blocking by default; polling externally is the usual
-    /// pattern.
+    /// `EAGAIN`. The fd is set non-blocking at attach time, so this
+    /// is safe to call from an async context wrapped in
+    /// `tokio::io::unix::AsyncFd::readable().await`.
     pub fn read_event(&self) -> Result<Option<EventRaw>, KmodError> {
         let mut buf = [0u8; std::mem::size_of::<EventRaw>()];
         // SAFETY: `self.session_fd` is valid; `buf` is sized exactly
@@ -344,6 +402,50 @@ impl KmodSession {
         let ev = unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<EventRaw>()) };
         Ok(Some(ev))
     }
+
+    /// Drain one queued SSTP control packet (C=1, header already
+    /// stripped by the kmod) into `buf`. Returns the number of
+    /// payload bytes written, or `None` if the queue is empty.
+    ///
+    /// `buf` must be at least [`SSTP_CONTROL_MAX`] bytes; smaller
+    /// buffers risk `EMSGSIZE` for a frame the kmod will then
+    /// requeue for retry. Pair with a wait on `SSTP_EVT_CONTROL_PACKET`
+    /// surfaced through [`Self::read_event`].
+    pub fn recv_control(&self, buf: &mut [u8]) -> Result<Option<usize>, KmodError> {
+        let mut req = SstpRecvControlRaw {
+            buf_len: u32::try_from(buf.len()).unwrap_or(u32::MAX),
+            payload_len: 0,
+            buf: buf.as_mut_ptr() as u64,
+        };
+        // SAFETY: `self.session_fd` is a valid open fd. `SSTP_IOC_RECV_CONTROL`
+        // is `_IOWR(...)` of `sizeof(SstpRecvControlRaw)` (16 bytes);
+        // the kernel both reads and writes that many bytes through
+        // our pointer. `req.buf` points at `buf`, which lives for the
+        // duration of this call (the kernel only dereferences it
+        // synchronously inside the ioctl).
+        let rc = unsafe {
+            libc::ioctl(
+                self.session_fd.as_raw_fd(),
+                SSTP_IOC_RECV_CONTROL,
+                &raw mut req,
+            )
+        };
+        if rc < 0 {
+            return Err(KmodError::Ioctl {
+                what: "SSTP_IOC_RECV_CONTROL",
+                source: io::Error::last_os_error(),
+            });
+        }
+        if rc == 0 {
+            return Ok(None);
+        }
+        // The ioctl returns the payload length on success; the same
+        // value lands in `req.payload_len`. Trust either, but assert
+        // they agree to catch ABI drift early.
+        debug_assert_eq!(u32::try_from(rc).unwrap_or(u32::MAX), req.payload_len);
+        #[allow(clippy::cast_sign_loss)]
+        Ok(Some(rc as usize))
+    }
 }
 
 fn chan_index_for(session_fd: BorrowedFd<'_>) -> Result<i32, KmodError> {
@@ -372,6 +474,57 @@ fn open_dev_sstp() -> io::Result<OwnedFd> {
     }
     // SAFETY: `raw` is a freshly-opened fd we own.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Open `/dev/ppp`, attach to the kmod's PPP channel by index, and
+/// connect that channel to the given PPP unit. Returns the channel
+/// fd, which must outlive the session — closing it disconnects the
+/// channel.
+fn bind_channel_to_unit(chan_index: i32, ppp_unit: i32) -> Result<OwnedFd, KmodError> {
+    // SAFETY: static NUL-terminated `CStr`; `open(2)` returns a fresh
+    // fd or -1.
+    let raw = unsafe {
+        libc::open(
+            c"/dev/ppp".as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(KmodError::ChannelBind {
+            what: "open(/dev/ppp)",
+            source: io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: `raw` is a freshly opened fd we own.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    ioctl_set_int(fd.as_fd(), PPPIOCATTCHAN, chan_index).map_err(|source| {
+        KmodError::ChannelBind {
+            what: "PPPIOCATTCHAN",
+            source,
+        }
+    })?;
+    ioctl_set_int(fd.as_fd(), PPPIOCCONNECT, ppp_unit).map_err(|source| {
+        KmodError::ChannelBind {
+            what: "PPPIOCCONNECT",
+            source,
+        }
+    })?;
+    Ok(fd)
+}
+
+fn set_nonblock(fd: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: `fd` is a valid open fd for the duration of the call.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -412,5 +565,35 @@ mod tests {
     #[ignore = "requires CAP_NET_ADMIN and the sstp kernel module"]
     fn probe_succeeds_when_loaded() {
         probe().expect("/dev/sstp probe");
+    }
+
+    /// Pin the SSTP ioctl numbers against the values the kernel
+    /// computes for `_IOR/_IOW/_IOWR` over the matching structs.
+    /// Independent of architecture (the kmod is `__u`-typed
+    /// throughout, so `sizeof` is fixed). Numbers must stay in lock
+    /// step with `kernel-abi/sstp.h`.
+    #[test]
+    fn sstp_ioctl_numbers_match_kernel() {
+        // _IOWR('S', 0x80, struct sstp_attach) — 40 bytes
+        assert_eq!(SSTP_IOC_ATTACH, 0xc028_5380);
+        // _IOW('S', 0x81, struct sstp_detach) — 16 bytes
+        assert_eq!(SSTP_IOC_DETACH, 0x4010_5381);
+        // _IOR('S', 0x82, struct sstp_stats) — 128 bytes
+        assert_eq!(SSTP_IOC_GETSTATS, 0x8080_5382);
+        // _IOR('S', 0x83, __s32) — 4 bytes
+        assert_eq!(SSTP_IOC_GET_CHAN_INDEX, 0x8004_5383);
+        // _IOWR('S', 0x84, struct sstp_recv_control) — 16 bytes
+        assert_eq!(SSTP_IOC_RECV_CONTROL, 0xc010_5384);
+    }
+
+    #[test]
+    fn recv_control_struct_is_16_bytes() {
+        assert_eq!(core::mem::size_of::<SstpRecvControlRaw>(), 16);
+    }
+
+    #[test]
+    fn control_packet_event_round_trips() {
+        assert_eq!(EventType::from_u32(5), Some(EventType::ControlPacket));
+        assert_eq!(EventType::ControlPacket as u32, 5);
     }
 }

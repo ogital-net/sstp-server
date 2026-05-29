@@ -30,7 +30,7 @@ use crate::cli::DataPathMode;
 use super::SessionIpConfig;
 use super::datapath::{DataPath, DataPathError};
 use super::netlink::{NetlinkError, RtNetlink};
-use super::sstp_kmod::SSTP_F_PFC;
+use super::sstp_kmod::{EventRaw, KmodError, SSTP_F_PFC};
 use super::tun::{TunError, TunSession};
 use super::unit::{Unit, UnitError};
 
@@ -244,6 +244,67 @@ impl KpppSession {
     #[must_use]
     pub fn is_tun(&self) -> bool {
         matches!(&self.inner, Backend::Tun(_))
+    }
+
+    /// Borrow the kmod session fd when running in kernel mode. The
+    /// session driver wraps this in [`AsyncFd`] (READABLE) and
+    /// `select!`s on it; readable means there is at least one event
+    /// queued for [`Self::read_event`] to drain.
+    ///
+    /// Returns `None` for TUN and userspace-PPP backends.
+    #[must_use]
+    pub fn kmod_fd(&self) -> Option<BorrowedFd<'_>> {
+        match &self.inner {
+            Backend::Ppp(p) => match &p.path {
+                DataPath::Kernel(s) => Some(s.as_fd()),
+                DataPath::Userspace(_) => None,
+            },
+            Backend::Tun(_) => None,
+        }
+    }
+
+    /// Dup the kmod session fd and wrap it in an [`AsyncFd`] for the
+    /// session driver's `select!`. Returns `Ok(None)` for non-kernel
+    /// backends. The dup shares the open-file-description, including
+    /// the `O_NONBLOCK` flag set by [`KmodSession::attach`].
+    pub fn kmod_async_fd(&self) -> io::Result<Option<AsyncFd<OwnedFd>>> {
+        let Some(fd) = self.kmod_fd() else {
+            return Ok(None);
+        };
+        let dup = fd.try_clone_to_owned()?;
+        let async_fd = AsyncFd::with_interest(dup, Interest::READABLE)?;
+        Ok(Some(async_fd))
+    }
+
+    /// Drain one event from the kmod session fd. Returns `None` on
+    /// `EAGAIN` (queue empty) or when the backend is not kernel
+    /// mode. The fd is non-blocking; pair with an `AsyncFd::readable`
+    /// wait in the caller's `select!`.
+    pub fn read_event(&self) -> Result<Option<EventRaw>, KmodError> {
+        match &self.inner {
+            Backend::Ppp(p) => match &p.path {
+                DataPath::Kernel(s) => s.read_event(),
+                DataPath::Userspace(_) => Ok(None),
+            },
+            Backend::Tun(_) => Ok(None),
+        }
+    }
+
+    /// Drain one queued SSTP control packet (`C=1`, header already
+    /// stripped by the kmod) into `buf`. Returns the number of
+    /// payload bytes written, `None` if the queue is empty, or
+    /// `None` for non-kernel-mode backends.
+    ///
+    /// Pair with a `SSTP_EVT_CONTROL_PACKET` event seen via
+    /// [`Self::read_event`].
+    pub fn recv_control(&self, buf: &mut [u8]) -> Result<Option<usize>, KmodError> {
+        match &self.inner {
+            Backend::Ppp(p) => match &p.path {
+                DataPath::Kernel(s) => s.recv_control(buf),
+                DataPath::Userspace(_) => Ok(None),
+            },
+            Backend::Tun(_) => Ok(None),
+        }
     }
 
     /// Write one PPP frame to the backing data path.

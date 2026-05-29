@@ -125,6 +125,15 @@ pub fn parse_control(pkt: ControlPacket<'_>) -> Result<ControlMessage<'_>, Parse
     }
 }
 
+/// Parse a control packet from a payload buffer that has already had
+/// the 4-byte outer SSTP header stripped. This is the form the kernel
+/// module delivers via `SSTP_IOC_RECV_CONTROL`: it pre-validates the
+/// framing and hands userspace only `[MessageType (2) | NumAttrs (2)
+/// | Attrs...]`.
+pub fn parse_control_payload(payload: &[u8]) -> Result<ControlMessage<'_>, ParseError> {
+    parse_control(ControlPacket::parse_body(payload)?)
+}
+
 // -- Encoders --------------------------------------------------------------
 
 /// Total wire size of a Call Connect Ack ([MS-SSTP] §2.2.10).

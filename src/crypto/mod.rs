@@ -10,6 +10,7 @@
 pub mod ffi;
 pub mod hash;
 pub mod hmac;
+pub mod ktls;
 pub mod rand;
 pub mod tls;
 

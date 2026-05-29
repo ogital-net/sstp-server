@@ -19,5 +19,5 @@ pub mod state;
 
 pub use attr::{AttrIter, Attribute, AttributeId, CryptoBinding, CryptoBindingReq, StatusInfo};
 pub use frame::{ControlPacket, Packet, ParseError, SSTP_HEADER_LEN, SSTP_VERSION_1_0};
-pub use msg::{ControlMessage, MessageType, parse_control};
+pub use msg::{ControlMessage, MessageType, parse_control, parse_control_payload};
 pub use state::{State, StateMachine, StepOut, Timer};
