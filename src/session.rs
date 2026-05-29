@@ -273,7 +273,10 @@ pub async fn run(
             // client surfaces a meaningful message instead of a
             // bare TCP reset. I/O errors get no response — the
             // socket is already broken.
-            if matches!(e, preamble::PreambleError::Bad(_) | preamble::PreambleError::TooLarge) {
+            if matches!(
+                e,
+                preamble::PreambleError::Bad(_) | preamble::PreambleError::TooLarge
+            ) {
                 let _ = preamble::write_error_response(&mut tls).await;
             }
             return;
@@ -293,7 +296,18 @@ pub async fn run(
     // a PPP layer the FSM sits in `Server_Call_Connected_Pending`
     // until the negotiation timer fires and the abort sequence
     // drains the connection.
-    drive_sstp(id, peer, tls, control_rx, drain_rx, auth_bridge, cert_hash, local_ip, data_path).await;
+    drive_sstp(
+        id,
+        peer,
+        tls,
+        control_rx,
+        drain_rx,
+        auth_bridge,
+        cert_hash,
+        local_ip,
+        data_path,
+    )
+    .await;
 
     info!(%id, "session ended");
 }
@@ -332,9 +346,7 @@ async fn drive_sstp(
     use crate::sstp::frame::{SSTP_HEADER_LEN, SSTP_MAX_PACKET_LEN, write_header};
     use crate::sstp::msg::CALL_CONNECTED_LEN;
     use crate::sstp::state::Timer;
-    use crate::sstp::{
-        ControlMessage, Packet, StateMachine, parse_control, parse_control_payload,
-    };
+    use crate::sstp::{ControlMessage, Packet, StateMachine, parse_control, parse_control_payload};
 
     // Wrap the libssl-backed TLS stream in a `TxStream`. While
     // `tx.ktls_tx` is `None`, writes go through libssl as usual;
@@ -370,13 +382,25 @@ async fn drive_sstp(
     // this flag after the first spurious EOF and stop polling the
     // unit fd to keep the control plane alive.
     let mut kppp_read_disabled = false;
-    let auth = AuthCtx { peer, bridge: &auth_bridge };
+    let auth = AuthCtx {
+        peer,
+        bridge: &auth_bridge,
+    };
 
     // Spec entry point: `New HTTPS Connection Received` (§3.3.2.1).
     let initial = ssm.on_https_accepted();
     if !handle_sstp_step(
-        id, &mut tx, &initial, &tx_buf, &mut sstp_timer, &mut ppp, &mut ppp_timer, &auth,
-        local_ip, &mut kppp, data_path,
+        id,
+        &mut tx,
+        &initial,
+        &tx_buf,
+        &mut sstp_timer,
+        &mut ppp,
+        &mut ppp_timer,
+        &auth,
+        local_ip,
+        &mut kppp,
+        data_path,
     )
     .await
     {
@@ -583,7 +607,19 @@ async fn drive_sstp(
                 debug!(%id, ?owner, "PPP timer expired");
                 if let Some(p) = ppp.as_mut() {
                     let step = p.on_timer(owner);
-                    if !handle_ppp_step(id, &mut tx, p, step, &mut ppp_timer, &auth, local_ip, &mut kppp, data_path).await {
+                    if !handle_ppp_step(
+                        id,
+                        &mut tx,
+                        p,
+                        step,
+                        &mut ppp_timer,
+                        &auth,
+                        local_ip,
+                        &mut kppp,
+                        data_path,
+                    )
+                    .await
+                    {
                         return;
                     }
                 }
@@ -653,9 +689,7 @@ async fn drive_sstp(
                                 // kmod stripped the 4-byte header, so
                                 // reconstruct it.
                                 ControlMessage::CallConnected(cb) => {
-                                    if payload.len() + SSTP_HEADER_LEN
-                                        != CALL_CONNECTED_LEN
-                                    {
+                                    if payload.len() + SSTP_HEADER_LEN != CALL_CONNECTED_LEN {
                                         warn!(
                                             %id,
                                             got = payload.len() + SSTP_HEADER_LEN,
@@ -665,8 +699,7 @@ async fn drive_sstp(
                                         return;
                                     }
                                     let mut zeroed = [0u8; CALL_CONNECTED_LEN];
-                                    let (hdr, body) =
-                                        zeroed.split_at_mut(SSTP_HEADER_LEN);
+                                    let (hdr, body) = zeroed.split_at_mut(SSTP_HEADER_LEN);
                                     let hdr: &mut [u8; SSTP_HEADER_LEN] =
                                         hdr.try_into().expect("SSTP_HEADER_LEN slice");
                                     write_header(hdr, true, CALL_CONNECTED_LEN);
@@ -773,19 +806,28 @@ async fn drive_sstp(
                             if let Some(k) = kppp.as_ref()
                                 && !k.is_kernel()
                                 && let Ok(frame) = crate::ppp::frame::decode_frame(payload)
-                                && frame.protocol
-                                    == crate::ppp::frame::ProtocolId::Ip.as_u16()
+                                && frame.protocol == crate::ppp::frame::ProtocolId::Ip.as_u16()
                             {
                                 if let Err(e) = k.write_frame(payload).await {
                                     warn!(%id, error = %e, "kernel PPP unit write failed");
                                 }
                                 routed_to_kernel = true;
                             }
-                            if !routed_to_kernel
-                                && let Some(p) = ppp.as_mut()
-                            {
+                            if !routed_to_kernel && let Some(p) = ppp.as_mut() {
                                 let step = p.on_frame(payload);
-                                if !handle_ppp_step(id, &mut tx, p, step, &mut ppp_timer, &auth, local_ip, &mut kppp, data_path).await {
+                                if !handle_ppp_step(
+                                    id,
+                                    &mut tx,
+                                    p,
+                                    step,
+                                    &mut ppp_timer,
+                                    &auth,
+                                    local_ip,
+                                    &mut kppp,
+                                    data_path,
+                                )
+                                .await
+                                {
                                     return;
                                 }
                             }
@@ -991,15 +1033,28 @@ async fn handle_ppp_step(
                     debug!(%id, ip = %peer_ip, "spurious NetworkUp after kernel PPP unit already attached");
                 } else {
                     let ktls = tx.tls.ktls_eligibility();
+                    // Resolve Auto definitively at session time based on
+                    // the negotiated cipher: kTLS-compatible sessions
+                    // escalate to Kernel (kmod presence was already
+                    // confirmed at boot, see main::resolve_data_path_mode);
+                    // incompatible ones fall back to TUN. Once kTLS is
+                    // installed there is no rollback path — the TLS
+                    // socket is in `tls` ULP mode and libssl can no
+                    // longer encrypt/decrypt — so the decision must be
+                    // final before `install_ktls` runs.
                     let effective_data_path = match data_path {
-                        DataPathMode::Auto if !ktls.compatible => {
-                            info!(
-                                %id,
-                                tls_version = %ktls.tls_version,
-                                cipher = %ktls.cipher,
-                                "kTLS-incompatible TLS session; using /dev/ppp userspace data path"
-                            );
-                            DataPathMode::Userspace
+                        DataPathMode::Auto => {
+                            if ktls.compatible {
+                                DataPathMode::Kernel
+                            } else {
+                                info!(
+                                    %id,
+                                    tls_version = %ktls.tls_version,
+                                    cipher = %ktls.cipher,
+                                    "kTLS-incompatible TLS session; falling back to TUN data path"
+                                );
+                                DataPathMode::Tun
+                            }
                         }
                         m => m,
                     };
@@ -1025,9 +1080,7 @@ async fn handle_ppp_step(
                     // too. Under `--data-path auto` we skip the
                     // install entirely so the TUN-fallback path
                     // keeps using libssl as before.
-                    if matches!(effective_data_path, DataPathMode::Kernel)
-                        && ktls.compatible
-                    {
+                    if matches!(effective_data_path, DataPathMode::Kernel) && ktls.compatible {
                         if let Err(e) = tx.tls.install_ktls() {
                             warn!(%id, error = %e, "kTLS install failed; cannot bring up kernel data path");
                             return false;
@@ -1069,7 +1122,12 @@ async fn handle_ppp_step(
                         debug!(%id, "kTLS TX writer installed; libssl bypassed on outbound");
                     }
 
-                    match KpppSession::bring_up(effective_data_path, tx.tls.tcp_fd(), local_ip, peer_ip) {
+                    match KpppSession::bring_up(
+                        effective_data_path,
+                        tx.tls.tcp_fd(),
+                        local_ip,
+                        peer_ip,
+                    ) {
                         Ok(k) => {
                             info!(
                                 %id,
@@ -1158,9 +1216,7 @@ async fn apply_step(
     }
 
     if let Some(stop) = out.timer_stop
-        && active_timer
-            .as_ref()
-            .is_some_and(|(t, _)| *t == stop)
+        && active_timer.as_ref().is_some_and(|(t, _)| *t == stop)
     {
         *active_timer = None;
     }
@@ -1327,7 +1383,10 @@ impl Drop for RegistrationGuard<'_> {
 
 /// Helper used by the accept loop: build a [`SessionHandle`] +
 /// matching control receiver, and register the handle.
-pub fn spawn_handle(registry: &Registry, peer: SocketAddr) -> (SessionId, mpsc::Receiver<ControlCommand>) {
+pub fn spawn_handle(
+    registry: &Registry,
+    peer: SocketAddr,
+) -> (SessionId, mpsc::Receiver<ControlCommand>) {
     let id = SessionId::next();
     let (tx, rx) = mpsc::channel(CONTROL_CHANNEL_DEPTH);
     registry.register(SessionHandle { id, peer, tx });

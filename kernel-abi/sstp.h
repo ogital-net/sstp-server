@@ -1,13 +1,11 @@
 /* SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0
  *
- * sstp.h — UAPI for a future in-kernel SSTP channel driver.
+ * sstp.h — UAPI for the in-tree SSTP channel driver.
  *
- * **STATUS: DRAFT.** This header is not implemented anywhere yet. It
- * exists to anchor the eventual sstp-server v0.x kernel-module data
- * path against a concrete ABI so the userspace side can be written
- * with that handoff in mind. Numbers, struct layouts, and even the
- * top-level model are subject to change until the kmod is real and a
- * kernel maintainer has weighed in.
+ * **STATUS: v0.2 release-candidate.** This is the userspace ABI
+ * shipped by the sstp.ko kernel module under [kmod/](../kmod/) and
+ * consumed by the sstp-server userspace daemon. Frozen for v0.x;
+ * incompatible changes bump SSTP_ABI_VERSION_MAJOR.
  *
  * ============================================================
  * Model
@@ -23,11 +21,10 @@
  *      cryptographically subtle. None of this is on the data path.
  *
  *   2. After IPCP, userspace opens `/dev/sstp` and issues
- *      `SSTP_IOC_ATTACH` (below), handing in:
- *        - the raw TCP socket fd carrying the TLS session, with
- *          kTLS RX/TX crypto already installed via
- *          `setsockopt(SOL_TLS, ...)` by the userspace TLS library,
- *        - the PPP unit number to bind to.
+ *      `SSTP_IOC_ATTACH` (below), handing in the raw TCP socket fd
+ *      carrying the TLS session, with kTLS RX/TX crypto already
+ *      installed via `setsockopt(SOL_TLS, ...)` by the userspace TLS
+ *      library.
  *
  *      kTLS is the **only** supported handoff. If the negotiated
  *      cipher suite or TLS version is not kTLS-eligible (today:
@@ -36,19 +33,31 @@
  *      slow path. Pulling a userspace TLS stack into the kernel
  *      is explicitly out of scope.
  *
- *   3. The kernel registers a PPP channel for that unit
- *      (`ppp_register_channel`), takes over reads from the TCP
- *      socket, runs AEAD decrypt via kTLS, demuxes SSTP frames,
- *      and pushes IP packets straight at the `pppN` netdev.
- *      Transmit is the reverse path. Per-packet userspace
- *      involvement drops to zero.
+ *   3. The kernel registers a PPP channel (`ppp_register_channel`)
+ *      and returns a fresh session fd. Userspace fetches the
+ *      channel index via `SSTP_IOC_GET_CHAN_INDEX`, then binds the
+ *      channel to its already-created `pppN` unit using the
+ *      standard ppp_generic ABI (`PPPIOCATTCHAN` on a fresh
+ *      `/dev/ppp` fd, then `PPPIOCCONNECT` against the unit
+ *      number). The kmod intentionally does *not* own the unit
+ *      binding — `ppp_connect_channel()` is unexported in mainline
+ *      ppp_generic, and routing the bind through `vfs_ioctl()` from
+ *      kernel context is not worth the simplicity tradeoff.
  *
- *   4. Userspace keeps the control plane: SSTP keep-alives, Crypto
+ *   4. Once the channel↔unit binding is in place, the kernel takes
+ *      over reads from the TCP socket, runs AEAD decrypt via kTLS,
+ *      demuxes SSTP frames, and pushes IP packets straight at the
+ *      `pppN` netdev. Transmit is the reverse path. Per-packet
+ *      userspace involvement drops to zero on the data plane.
+ *
+ *   5. Userspace keeps the control plane: SSTP keep-alives, Crypto
  *      Binding verification (already done at handoff), graceful
- *      shutdown via `SSTP_IOC_DETACH`. The kernel signals
- *      exceptional conditions (TLS fatal alert, peer FIN, etc.)
- *      back to userspace via `POLLIN` on a control fd returned
- *      from `SSTP_IOC_ATTACH`.
+ *      shutdown via close-on-session_fd. The kernel signals
+ *      exceptional conditions (TLS fatal alert, peer FIN, control
+ *      packets, KeyUpdate) back to userspace via `POLLIN` on the
+ *      session fd; events are read with `read(2)` and the queued
+ *      control-packet payloads are drained with
+ *      `SSTP_IOC_RECV_CONTROL`.
  *
  * This mirrors the `pppol2tp` shape (userspace negotiates, kernel
  * runs steady-state) and is intentionally narrow — we don't carry
@@ -99,38 +108,33 @@
  *
  * Bumped on any incompatible change to the structs below.
  * Userspace MUST refuse to attach if the running kernel reports
- * a different major; minor bumps are additive (new optional
- * fields in tail-padded structs).
+ * a different major.
+ *
+ * History:
+ *   0.1  initial draft (never released).
+ *   0.2  RC: drop unused `ppp_unit` / `flags` / `reserved` fields
+ *        from `struct sstp_attach`; drop `struct sstp_detach`
+ *        entirely (close-on-fd is the supported teardown);
+ *        replace `sstp_stats.reserved[]` with `evt_dropped`.
  * ---------------------------------------------------------------- */
 
 #define SSTP_ABI_VERSION_MAJOR  0
-#define SSTP_ABI_VERSION_MINOR  1
-
-/* ----------------------------------------------------------------
- * Flags for struct sstp_attach.flags
- * ---------------------------------------------------------------- */
-
-/* Peer negotiated PPP header compression (PFC, RFC 1661 §6.5).
- * Kernel parser accepts both 1-byte and 2-byte protocol fields. */
-#define SSTP_F_PFC          (1u << 0)
-
-/* Peer negotiated address-and-control compression (ACFC, RFC 1661
- * §6.6). Kernel parser accepts frames with the leading FF 03 elided. */
-#define SSTP_F_ACFC         (1u << 1)
-
-/* Reserved for IPV6CP — flips on the kernel's IPv6 fast path. */
-#define SSTP_F_IPV6         (1u << 2)
+#define SSTP_ABI_VERSION_MINOR  2
 
 /* ----------------------------------------------------------------
  * Attach payload
  *
- * Passed by pointer to SSTP_IOC_ATTACH. All fields are populated
- * by userspace; the kernel writes back a session fd via the
- * `session_fd` field on success.
+ * Passed by pointer to SSTP_IOC_ATTACH. Caller fills `abi_major`,
+ * `abi_minor`, `tcp_fd`, and `mtu`; kernel writes back
+ * `session_fd` on success.
  * ---------------------------------------------------------------- */
 
 struct sstp_attach {
-	/* Input: caller's view of the ABI. Kernel verifies. */
+	/* Input: caller's view of the ABI. Kernel verifies that
+	 * `abi_major` matches `SSTP_ABI_VERSION_MAJOR`; `abi_minor`
+	 * is informational and the kernel echoes its own minor on
+	 * the way out (caller may use it to gate optional features
+	 * once a 0.x with optional bits ships). */
 	__u16   abi_major;
 	__u16   abi_minor;
 
@@ -145,48 +149,18 @@ struct sstp_attach {
 	 * its fd after the ioctl returns. */
 	__s32   tcp_fd;
 
-	/* Input: PPP unit number returned by PPPIOCGUNIT on the
-	 * userspace unit fd. Currently advisory — the kernel registers
-	 * an SSTP channel and exposes its index via
-	 * SSTP_IOC_GET_CHAN_INDEX; userspace is responsible for binding
-	 * that channel to this unit via PPPIOCATTCHAN / PPPIOCCONNECT
-	 * on its own /dev/ppp handle. The field is retained so a
-	 * future revision can move the bind into the kernel without an
-	 * ABI break; today it is only sanity-checked (>= 0). */
-	__s32   ppp_unit;
-
-	/* Input: SSTP_F_* flags (see above). */
-	__u32   flags;
-
 	/* Input: MTU negotiated by LCP. Kernel uses this to size
-	 * SKB allocations on the receive path. 0 = use default
-	 * (1500). */
+	 * SKB allocations on the receive path and as the registered
+	 * channel's `mtu`. 0 = use default (1500). */
 	__u32   mtu;
 
 	/* Output: session fd. Polling this returns POLLIN when the
 	 * kernel needs userspace attention (peer disconnect, fatal
-	 * TLS alert, kTLS rekey required). Reading returns a
-	 * `struct sstp_event` (TBD). Closing this fd detaches the
-	 * channel and releases the references taken at attach. */
+	 * TLS alert, kTLS rekey required, queued control packet).
+	 * Reading returns one `struct sstp_event`. Closing this fd
+	 * detaches the channel and releases the references taken at
+	 * attach. */
 	__s32   session_fd;
-
-	/* Reserved — must be zero. Future versions may use these
-	 * for e.g. an EAP session key for periodic rekey, or an
-	 * accounting handoff fd. */
-	__u32   reserved[4];
-};
-
-/* ----------------------------------------------------------------
- * Detach payload (currently empty)
- *
- * SSTP_IOC_DETACH is issued on the session_fd returned by attach.
- * Closing the fd has the same effect; the explicit ioctl exists
- * so userspace can wait for the in-flight kernel work to drain
- * before closing.
- * ---------------------------------------------------------------- */
-
-struct sstp_detach {
-	__u32   reserved[4];
 };
 
 /* ----------------------------------------------------------------
@@ -208,7 +182,8 @@ struct sstp_stats {
 	__u64   sstp_malformed;         /* bad length, bad version, ... */
 	__u64   ppp_frames_rx;          /* PPP frames pushed up to ppp_generic */
 	__u64   ppp_frames_tx;          /* PPP frames received from ppp_generic */
-	__u64   reserved[8];
+	__u64   evt_dropped;            /* events coalesced/dropped because the
+	                                 * userspace event ring was full */
 };
 
 /* ----------------------------------------------------------------
@@ -223,7 +198,13 @@ struct sstp_stats {
 #define SSTP_IOC_MAGIC          'S'
 
 #define SSTP_IOC_ATTACH         _IOWR(SSTP_IOC_MAGIC, 0x80, struct sstp_attach)
-#define SSTP_IOC_DETACH         _IOW (SSTP_IOC_MAGIC, 0x81, struct sstp_detach)
+
+/* Detach: take no payload, just signal the kernel that userspace is
+ * about to close the session fd. Closing the fd alone is enough; the
+ * explicit ioctl exists so a caller that wants to see the in-flight
+ * work drained can sequence detach → poll-for-POLLHUP → close. */
+#define SSTP_IOC_DETACH         _IO  (SSTP_IOC_MAGIC, 0x81)
+
 #define SSTP_IOC_GETSTATS       _IOR (SSTP_IOC_MAGIC, 0x82, struct sstp_stats)
 
 /* Returns the PPP channel index assigned by `ppp_register_channel()`
@@ -236,9 +217,10 @@ struct sstp_stats {
 /* Pull one queued SSTP control packet (C=1, header stripped) into
  * the user-supplied buffer. Returns the payload length on success,
  * 0 if the queue is empty, or -errno. The caller's buffer must be
- * at least SSTP_CONTROL_MAX bytes to avoid -EMSGSIZE on large
- * frames. Issued on the session_fd; pair with a poll() on the
- * event fd for SSTP_EVT_CONTROL_PACKET. */
+ * at least SSTP_CONTROL_MAX bytes; smaller buffers cause the
+ * frame to be dropped (not requeued) with -EMSGSIZE. Issued on
+ * the session_fd; pair with a poll() on the event fd for
+ * SSTP_EVT_CONTROL_PACKET. */
 #define SSTP_CONTROL_MAX        4096
 
 struct sstp_recv_control {
@@ -276,34 +258,5 @@ struct sstp_event {
 	__u32   arg;      /* type-specific payload, e.g. TLS alert code */
 	__u64   timestamp_ns; /* CLOCK_MONOTONIC */
 };
-
-/* ============================================================
- * Open questions
- * ============================================================
- *
- * 1. **PPP channel vs PPP unit ownership.**
- *    The model above keeps the unit in userspace and registers a
- *    *channel* against it. Cleaner inversion: kernel owns both,
- *    userspace just hands in the negotiated config (MRU, ACCM,
- *    IPCP-resolved addresses). Decision punted until the kmod
- *    is real; today's `Unit` type in `crate::kppp` covers either.
- *
- * 2. **Per-session vs shared event fd.**
- *    `epoll` against N session_fds is the obvious shape and
- *    matches our per-core tokio worker layout. A single shared
- *    fd would need its own demux scheme. Default: per-session.
- *
- * 3. **Accounting.**
- *    Byte counters live on the `pppN` netdev (kernel maintains
- *    them already). RADIUS Interim-Update payloads come from
- *    `rtnetlink` IFLA_STATS64, not from this device. Nothing in
- *    this header needs to change for accounting.
- *
- * 4. **Capability model.**
- *    `/dev/sstp` open requires CAP_NET_ADMIN. Attach additionally
- *    requires the calling process to own (or have inherited) both
- *    `tcp_fd` and the PPP unit fd `ppp_unit` refers to. No
- *    cross-namespace handoff in v0.
- */
 
 #endif /* _UAPI_LINUX_SSTP_H */

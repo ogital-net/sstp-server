@@ -65,10 +65,7 @@ pub mod pap {
         let (header, body) = decode_header(buf, Code::AuthenticateRequest)?;
         // Peer-ID-Length(1) + Peer-Id(N) + Passwd-Length(1) + Password(M).
         if body.is_empty() {
-            return Err(Error::Truncated {
-                need: 1,
-                have: 0,
-            });
+            return Err(Error::Truncated { need: 1, have: 0 });
         }
         let peer_len = body[0] as usize;
         if body.len() < 1 + peer_len + 1 {
@@ -97,12 +94,7 @@ pub mod pap {
     /// Encode an Authenticate-Ack / -Nak ([RFC 1334] §2.2.2 / §2.2.3).
     /// `message` is the user-facing message field (may be empty).
     /// Returns the number of bytes written.
-    pub fn encode_response(
-        out: &mut [u8],
-        code: Code,
-        identifier: u8,
-        message: &[u8],
-    ) -> usize {
+    pub fn encode_response(out: &mut [u8], code: Code, identifier: u8, message: &[u8]) -> usize {
         assert!(
             matches!(code, Code::AuthenticateAck | Code::AuthenticateNak),
             "PAP response must be Ack or Nak"
@@ -221,12 +213,10 @@ pub mod chap {
 
     /// Decode a Challenge or Response packet (they share the layout).
     pub fn decode_challenge_response(buf: &[u8]) -> Result<ChallengeResponse<'_>, Error> {
-        let (header, body) = decode_header(buf, &[Code::Challenge.as_u8(), Code::Response.as_u8()])?;
+        let (header, body) =
+            decode_header(buf, &[Code::Challenge.as_u8(), Code::Response.as_u8()])?;
         if body.is_empty() {
-            return Err(Error::Truncated {
-                need: 1,
-                have: 0,
-            });
+            return Err(Error::Truncated { need: 1, have: 0 });
         }
         let value_size = body[0] as usize;
         if body.len() < 1 + value_size {
@@ -283,12 +273,7 @@ pub mod chap {
     /// Encode a Success or Failure packet ([RFC 1994] §4.2 / §4.3).
     /// The message field is opaque text (e.g. MS-CHAPv2 places an
     /// `S=<authenticator>` string here).
-    pub fn encode_terminal(
-        out: &mut [u8],
-        code: Code,
-        identifier: u8,
-        message: &[u8],
-    ) -> usize {
+    pub fn encode_terminal(out: &mut [u8], code: Code, identifier: u8, message: &[u8]) -> usize {
         assert!(
             matches!(code, Code::Success | Code::Failure),
             "CHAP terminal encoder rejects Challenge/Response"
@@ -523,7 +508,9 @@ mod tests {
     #[test]
     fn pap_decode_authenticate_request() {
         // Code=1, Id=7, Len=14, peer_len=4, peer="user", pw_len=4, pw="pass"
-        let buf = [0x01, 0x07, 0x00, 0x0e, 0x04, b'u', b's', b'e', b'r', 0x04, b'p', b'a', b's', b's'];
+        let buf = [
+            0x01, 0x07, 0x00, 0x0e, 0x04, b'u', b's', b'e', b'r', 0x04, b'p', b'a', b's', b's',
+        ];
         let r = pap::decode_authenticate_request(&buf).unwrap();
         assert_eq!(r.identifier, 7);
         assert_eq!(r.peer_id, b"user");

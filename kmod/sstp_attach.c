@@ -11,6 +11,7 @@
 #include <linux/atomic.h>
 #include <linux/err.h>
 #include <linux/errno.h>
+#include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/net.h>
@@ -110,10 +111,7 @@ long sstp_do_attach(struct file *misc_file,
 
 	if (a.abi_major != SSTP_ABI_VERSION_MAJOR)
 		return -EINVAL;
-	if (a.reserved[0] || a.reserved[1] ||
-	    a.reserved[2] || a.reserved[3])
-		return -EINVAL;
-	if (a.tcp_fd < 0 || a.ppp_unit < 0)
+	if (a.tcp_fd < 0)
 		return -EINVAL;
 
 	s = kzalloc(sizeof(*s), GFP_KERNEL);
@@ -121,13 +119,11 @@ long sstp_do_attach(struct file *misc_file,
 		return -ENOMEM;
 
 	kref_init(&s->ref);
-	spin_lock_init(&s->stats_lock);
 	spin_lock_init(&s->evt_lock);
 	spin_lock_init(&s->ctrl_q_lock);
 	init_waitqueue_head(&s->evt_wait);
 	mutex_init(&s->close_lock);
 	INIT_WORK(&s->rx_work, sstp_rx_worker);
-	s->flags = a.flags;
 	s->mtu = a.mtu ? a.mtu : 1500;
 
 	s->rx_buf = kmalloc(SSTP_RX_BUF_CAP, GFP_KERNEL);
@@ -163,7 +159,11 @@ long sstp_do_attach(struct file *misc_file,
 	s->chan.private = s;
 	s->chan.ops = &sstp_chan_ops;
 	s->chan.mtu = s->mtu;
-	s->chan.hdrlen = 2; /* PPP protocol id; SSTP framing is added below */
+	/* hdrlen is the headroom ppp_generic reserves on outbound skbs
+	 * so a channel can `skb_push` its framing inline. We do *not*
+	 * push — the SSTP 4-byte header is sent as a separate kvec in
+	 * `kernel_sendmsg` — so 0 is the honest answer. */
+	s->chan.hdrlen = 0;
 
 	ret = ppp_register_channel(&s->chan);
 	if (ret)
@@ -204,12 +204,16 @@ long sstp_do_attach(struct file *misc_file,
 
 	fd_install(session_fd, session_file);
 	a.session_fd = session_fd;
+	/* Echo our minor back to userspace so the caller can gate
+	 * optional features once 0.x grows them. */
+	a.abi_minor = SSTP_ABI_VERSION_MINOR;
 	if (copy_to_user(uarg, &a, sizeof(a))) {
-		/* User vanished between the copy_from_user and now. The
-		 * fd is already installed; the safe thing is to let the
-		 * caller observe the install via close-on-exit and we
-		 * return -EFAULT. The session keeps running until they
-		 * close the fd. */
+		/* Userspace pointer turned bad between copy_from_user
+		 * and now. Roll back the install: we still own the
+		 * primary kref via the file. close_fd() drops the
+		 * file ref synchronously which triggers
+		 * sstp_session_release(); no leak. */
+		close_fd(session_fd);
 		return -EFAULT;
 	}
 

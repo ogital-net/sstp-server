@@ -11,12 +11,12 @@
 // Consumers land in M4 (RADIUS bridge) and M5 (kernel PPP plumbing).
 #![allow(dead_code, unused_imports)]
 
+pub mod auth;
+pub mod driver;
 pub mod frame;
 pub mod fsm;
-pub mod lcp;
-pub mod auth;
 pub mod ipcp;
-pub mod driver;
+pub mod lcp;
 
 pub use driver::{AssignedAddrs, AuthVerdict, Ppp, PppEvent, PppStep, TimerOwner};
 

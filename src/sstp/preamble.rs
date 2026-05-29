@@ -354,10 +354,7 @@ mod tests {
             "Thu, 09 Nov 2006 00:51:09 GMT"
         );
         // 1970-01-01 epoch.
-        assert_eq!(
-            format_imf_fixdate(0),
-            "Thu, 01 Jan 1970 00:00:00 GMT"
-        );
+        assert_eq!(format_imf_fixdate(0), "Thu, 01 Jan 1970 00:00:00 GMT");
     }
 
     #[tokio::test]

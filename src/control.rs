@@ -99,28 +99,30 @@ pub fn bind(
         }
     }
 
-    let listener = std::os::unix::net::UnixListener::bind(path).map_err(|source| {
-        BindError::Bind {
+    let listener =
+        std::os::unix::net::UnixListener::bind(path).map_err(|source| BindError::Bind {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
-    listener.set_nonblocking(true).map_err(|source| BindError::Bind {
-        path: path.to_path_buf(),
-        source,
-    })?;
+        })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| BindError::Bind {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let perms = std::fs::Permissions::from_mode(SOCKET_MODE);
     std::fs::set_permissions(path, perms).map_err(|source| BindError::Permissions {
         path: path.to_path_buf(),
         source,
     })?;
     if let Some((uid, gid)) = owner {
-        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(
-            |source| BindError::Permissions {
-                path: path.to_path_buf(),
-                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, source),
-            },
-        )?;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|source| {
+                BindError::Permissions {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(std::io::ErrorKind::InvalidInput, source),
+                }
+            })?;
         // SAFETY: `chown` takes a NUL-terminated path and uid/gid
         // values; we own `c_path` for the duration of the call.
         let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
@@ -364,7 +366,9 @@ mod tests {
     fn disable_session_unknown_id_errors() {
         let (state, _rx) = test_state();
         assert!(dispatch("disable session 999999", &state).starts_with("Error: no such session"));
-        assert!(dispatch("disable session notanid", &state).starts_with("Error: invalid session id"));
+        assert!(
+            dispatch("disable session notanid", &state).starts_with("Error: invalid session id")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -407,7 +411,9 @@ mod tests {
         let sock_clone = sock.clone();
         let task = tokio::spawn(async move {
             let listener = bind(&sock_clone, None).unwrap();
-            serve(sock_clone, listener, state, shutdown_rx).await.unwrap();
+            serve(sock_clone, listener, state, shutdown_rx)
+                .await
+                .unwrap();
         });
         // Wait for bind.
         for _ in 0..50 {

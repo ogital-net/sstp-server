@@ -150,11 +150,7 @@ impl AuthBridge {
     }
 }
 
-async fn run_pap(
-    client: Arc<RadiusClient>,
-    servers: Arc<[(SocketAddr, Arc<[u8]>)]>,
-    job: PapJob,
-) {
+async fn run_pap(client: Arc<RadiusClient>, servers: Arc<[(SocketAddr, Arc<[u8]>)]>, job: PapJob) {
     let peer_ip = job.peer.ip().to_string();
     let ctx = AccessRequestCtx {
         username: &job.username,
@@ -210,9 +206,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use tokio::net::UdpSocket;
 
-    async fn one_shot_responder<F>(
-        mut respond: F,
-    ) -> (SocketAddr, tokio::task::JoinHandle<()>)
+    async fn one_shot_responder<F>(mut respond: F) -> (SocketAddr, tokio::task::JoinHandle<()>)
     where
         F: FnMut(u8, [u8; 16]) -> PacketBuffer + Send + 'static,
     {
@@ -265,7 +259,10 @@ mod tests {
                 assert_eq!(addrs.ip, [10, 9, 8, 7]);
             }
             AuthVerdict::Reject { message } => {
-                panic!("expected Accept, got Reject({:?})", String::from_utf8_lossy(&message))
+                panic!(
+                    "expected Accept, got Reject({:?})",
+                    String::from_utf8_lossy(&message)
+                )
             }
         }
     }
@@ -276,7 +273,9 @@ mod tests {
         let secret_for_server = secret.clone();
         let (server_addr, _h) = one_shot_responder(move |id, ra| {
             let mut reply = Reply::new(Code::ACCESS_REJECT, id);
-            reply.add(rfc::attrs::REPLY_MESSAGE, "bad password").unwrap();
+            reply
+                .add(rfc::attrs::REPLY_MESSAGE, "bad password")
+                .unwrap();
             reply.seal_for(&ra, &secret_for_server)
         })
         .await;

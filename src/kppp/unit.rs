@@ -20,9 +20,7 @@ use std::ffi::CStr;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 
-use super::ioctl::{
-    PPPIOCNEWUNIT, PPPIOCSFLAGS, PPPIOCSMRU, ioctl_set_int, ioctl_xchg_int,
-};
+use super::ioctl::{PPPIOCNEWUNIT, PPPIOCSFLAGS, PPPIOCSMRU, ioctl_set_int, ioctl_xchg_int};
 
 const DEV_PPP: &CStr = c"/dev/ppp";
 
@@ -112,11 +110,9 @@ impl Unit {
 
     /// `PPPIOCSFLAGS` — set `SC_*` flags.
     pub fn set_flags(&self, flags: i32) -> Result<(), UnitError> {
-        ioctl_set_int(self.fd.as_fd(), PPPIOCSFLAGS, flags).map_err(|source| {
-            UnitError::Configure {
-                what: "PPPIOCSFLAGS",
-                source,
-            }
+        ioctl_set_int(self.fd.as_fd(), PPPIOCSFLAGS, flags).map_err(|source| UnitError::Configure {
+            what: "PPPIOCSFLAGS",
+            source,
         })
     }
 

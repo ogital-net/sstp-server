@@ -38,20 +38,15 @@ static void sstp_deliver_ppp(struct sstp_session *s,
 			     const u8 *payload, u32 payload_len)
 {
 	struct sk_buff *skb;
-	unsigned long flags;
 
 	skb = dev_alloc_skb(payload_len);
 	if (!skb) {
-		spin_lock_irqsave(&s->stats_lock, flags);
-		s->stats.sstp_malformed++;
-		spin_unlock_irqrestore(&s->stats_lock, flags);
+		atomic64_inc(&s->stats_sstp_malformed);
 		return;
 	}
 	skb_put_data(skb, payload, payload_len);
 
-	spin_lock_irqsave(&s->stats_lock, flags);
-	s->stats.ppp_frames_rx++;
-	spin_unlock_irqrestore(&s->stats_lock, flags);
+	atomic64_inc(&s->stats_ppp_frames_rx);
 
 	ppp_input(&s->chan, skb);
 }
@@ -68,7 +63,6 @@ static void sstp_deliver_ppp(struct sstp_session *s,
 static u32 sstp_demux_parse(struct sstp_session *s)
 {
 	u32 off = 0;
-	unsigned long flags;
 
 	while (s->rx_len - off >= SSTP_HEADER_LEN) {
 		const u8 *p = s->rx_buf + off;
@@ -81,9 +75,7 @@ static u32 sstp_demux_parse(struct sstp_session *s)
 			pr_warn_ratelimited(SSTP_MOD_NAME
 				": bad framing v=0x%02x len=%u; aborting\n",
 				ver, length);
-			spin_lock_irqsave(&s->stats_lock, flags);
-			s->stats.sstp_malformed++;
-			spin_unlock_irqrestore(&s->stats_lock, flags);
+			atomic64_inc(&s->stats_sstp_malformed);
 			sstp_session_emit(s, SSTP_EVT_PROTOCOL_ERROR, ver);
 			WRITE_ONCE(s->closing, true);
 			return off;
@@ -91,9 +83,7 @@ static u32 sstp_demux_parse(struct sstp_session *s)
 		if (length > s->rx_len - off)
 			break; /* need more bytes */
 
-		spin_lock_irqsave(&s->stats_lock, flags);
-		s->stats.sstp_frames_rx++;
-		spin_unlock_irqrestore(&s->stats_lock, flags);
+		atomic64_inc(&s->stats_sstp_frames_rx);
 
 		if (c == 0) {
 			sstp_deliver_ppp(s, p + SSTP_HEADER_LEN,
@@ -126,9 +116,7 @@ static u32 sstp_demux_parse(struct sstp_session *s)
 			if (!enqueued) {
 				if (skb)
 					kfree_skb(skb);
-				spin_lock_irqsave(&s->stats_lock, flags);
-				s->stats.sstp_malformed++;
-				spin_unlock_irqrestore(&s->stats_lock, flags);
+				atomic64_inc(&s->stats_sstp_malformed);
 				pr_warn_ratelimited(SSTP_MOD_NAME
 					": control queue overflow; "
 					"dropped frame (len=%u)\n", length);
@@ -203,9 +191,7 @@ static int sstp_demux_recv_once(struct sstp_session *s)
 
 	if (ret > 0) {
 		s->rx_len += ret;
-		spin_lock(&s->stats_lock);
-		s->stats.tls_records_rx++;
-		spin_unlock(&s->stats_lock);
+		atomic64_inc(&s->stats_tls_records_rx);
 	}
 	return ret;
 }

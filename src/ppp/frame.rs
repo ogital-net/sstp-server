@@ -246,7 +246,10 @@ mod tests {
 
     #[test]
     fn rejects_empty() {
-        assert!(matches!(decode_frame(&[]), Err(FrameError::Truncated { .. })));
+        assert!(matches!(
+            decode_frame(&[]),
+            Err(FrameError::Truncated { .. })
+        ));
     }
 
     #[test]

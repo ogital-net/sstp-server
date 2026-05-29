@@ -30,7 +30,7 @@ use crate::cli::DataPathMode;
 use super::SessionIpConfig;
 use super::datapath::{DataPath, DataPathError};
 use super::netlink::{NetlinkError, RtNetlink};
-use super::sstp_kmod::{EventRaw, KmodError, SSTP_F_PFC};
+use super::sstp_kmod::{EventRaw, KmodError};
 use super::tun::{TunError, TunSession};
 use super::unit::{Unit, UnitError};
 
@@ -177,12 +177,7 @@ impl KpppSession {
         };
         nl.bring_up(ifindex, &cfg)?;
 
-        // The kmod attach derives no value from PPP option flags
-        // beyond what's already baked into the unit fd; we pass
-        // `SSTP_F_PFC` as the only currently-meaningful hint. ACFC
-        // is implied by uncompressed Address/Control bytes on the
-        // wire, and IPV6CP isn't a v0.1 feature.
-        let path = DataPath::open(mode, tcp_fd, &unit, SSTP_F_PFC, DEFAULT_MTU)?;
+        let path = DataPath::open(mode, tcp_fd, &unit, DEFAULT_MTU)?;
 
         let async_fd = match &path {
             DataPath::Kernel(_) => None,

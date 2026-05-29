@@ -163,7 +163,9 @@ mod tests {
         let auth = [0xAA; 16];
         let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 7);
         apply_pap(&mut buf, &ctx(), &auth, secret, b"hunter2").unwrap();
-        let sealed = buf.seal_as_random_authenticator_request(&auth, secret).unwrap();
+        let sealed = buf
+            .seal_as_random_authenticator_request(&auth, secret)
+            .unwrap();
         let bytes = sealed.as_bytes();
         assert_eq!(bytes[0], 1, "code = Access-Request");
         assert_eq!(bytes[1], 7, "id matches");

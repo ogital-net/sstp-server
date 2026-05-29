@@ -21,8 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use radius_tokio::{
-    Code, CodecError, PacketBuffer,
-    authenticator,
+    Code, CodecError, PacketBuffer, authenticator,
     dict::rfc::{
         self,
         values::{AcctAuthentic, AcctStatusType, AcctTerminateCause},
@@ -183,10 +182,7 @@ impl AcctClient {
         Self::bind_with(local_addr, AcctRetry::default()).await
     }
 
-    pub async fn bind_with(
-        local_addr: SocketAddr,
-        retry: AcctRetry,
-    ) -> std::io::Result<Self> {
+    pub async fn bind_with(local_addr: SocketAddr, retry: AcctRetry) -> std::io::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(local_addr).await?);
         let state: Arc<Mutex<HashMap<SocketAddr, PeerState>>> = Arc::default();
         let reader = tokio::spawn(reader_loop(Arc::clone(&socket), Arc::clone(&state)));
@@ -215,14 +211,18 @@ impl AcctClient {
         let (identifier, reply_rx) = {
             let mut all = self.state.lock().await;
             let slot = all.entry(peer).or_default();
-            let id = slot.allocate().ok_or(AcctError::IdentifierExhausted(peer))?;
+            let id = slot
+                .allocate()
+                .ok_or(AcctError::IdentifierExhausted(peer))?;
             let (tx, rx) = oneshot::channel();
             slot.inflight.insert(id, tx);
             (id, rx)
         };
 
         let result = self
-            .send_inner(peer, secret, identifier, ctx, session, event, counters, reply_rx)
+            .send_inner(
+                peer, secret, identifier, ctx, session, event, counters, reply_rx,
+            )
             .await;
 
         // Reclaim slot regardless of outcome.
@@ -273,10 +273,7 @@ impl Drop for AcctClient {
     }
 }
 
-async fn reader_loop(
-    socket: Arc<UdpSocket>,
-    state: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
-) {
+async fn reader_loop(socket: Arc<UdpSocket>, state: Arc<Mutex<HashMap<SocketAddr, PeerState>>>) {
     let mut buf = [0u8; 4096];
     loop {
         match socket.recv_from(&mut buf).await {
@@ -348,11 +345,7 @@ fn request_authenticator_from(bytes: &[u8]) -> [u8; 16] {
     out
 }
 
-fn verify(
-    reply: &[u8],
-    secret: &[u8],
-    request_authenticator: &[u8; 16],
-) -> Result<(), AcctError> {
+fn verify(reply: &[u8], secret: &[u8], request_authenticator: &[u8; 16]) -> Result<(), AcctError> {
     if reply.len() < 20 {
         return Err(AcctError::AuthenticatorMismatch);
     }
@@ -388,8 +381,15 @@ mod tests {
     #[test]
     fn start_packet_shape() {
         let secret = b"sssh";
-        let bytes = build(7, secret, &ctx(), &session(), AcctEvent::Start, &AcctCounters::default())
-            .expect("build");
+        let bytes = build(
+            7,
+            secret,
+            &ctx(),
+            &session(),
+            AcctEvent::Start,
+            &AcctCounters::default(),
+        )
+        .expect("build");
         assert_eq!(bytes[0], 4, "Accounting-Request");
         assert_eq!(bytes[1], 7);
 

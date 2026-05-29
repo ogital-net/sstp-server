@@ -275,18 +275,16 @@ fn run(config: &Config) -> ExitCode {
     };
     let control_shutdown_rx = shutdown_tx.subscribe();
     auth_runtime.block_on(async move {
-        tokio::spawn(watch_sighup_reload_tls(
-            reload_tls,
-            reload_cert,
-            reload_key,
-        ));
+        tokio::spawn(watch_sighup_reload_tls(reload_tls, reload_cert, reload_key));
 
         // Hand the pre-bound control socket to a runtime task. Failures
         // here can only come from `from_std`, which only fails if the
         // OS refuses to register the fd — extremely unusual.
         if let Some((path, listener)) = control_bound {
             tokio::spawn(async move {
-                if let Err(e) = control::serve(path, listener, control_state, control_shutdown_rx).await {
+                if let Err(e) =
+                    control::serve(path, listener, control_state, control_shutdown_rx).await
+                {
                     warn!(error = %e, "control socket failed");
                 }
             });
@@ -329,7 +327,9 @@ fn run(config: &Config) -> ExitCode {
 
 /// Resolve `--user` / `--group` into a [`privdrop::Identity`]. Returns
 /// `Ok(None)` when no `--user` was supplied (privdrop is opt-in).
-fn resolve_drop_identity(config: &Config) -> Result<Option<privdrop::Identity>, privdrop::DropError> {
+fn resolve_drop_identity(
+    config: &Config,
+) -> Result<Option<privdrop::Identity>, privdrop::DropError> {
     let Some(user) = config.drop_user.as_deref() else {
         return Ok(None);
     };
@@ -372,7 +372,9 @@ fn resolve_data_path_mode(requested: cli::DataPathMode) -> cli::DataPathMode {
             DataPathMode::Kernel
         }
         (DataPathMode::Auto, Ok(())) => {
-            info!("data-path: auto (sstp kmod available; sessions use /dev/ppp by default and attempt kernel attach only when negotiated TLS is kTLS-compatible)");
+            info!(
+                "data-path: auto (sstp kmod available; sessions use /dev/ppp by default and attempt kernel attach only when negotiated TLS is kTLS-compatible)"
+            );
             DataPathMode::Auto
         }
         (DataPathMode::Auto, Err(KmodError::NotAvailable)) => {
@@ -414,7 +416,18 @@ fn io_worker_main(
             }
         };
         info!(worker = id, listen = %listen, "listener ready");
-        accept_loop(id, listener, &mut shutdown, registry, shutdown_tx, tls_ctx, auth_bridge, local_ip, data_path).await;
+        accept_loop(
+            id,
+            listener,
+            &mut shutdown,
+            registry,
+            shutdown_tx,
+            tls_ctx,
+            auth_bridge,
+            local_ip,
+            data_path,
+        )
+        .await;
     });
 }
 

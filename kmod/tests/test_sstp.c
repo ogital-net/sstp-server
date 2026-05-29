@@ -279,27 +279,14 @@ static void test_negative_open(int devfd)
 	a.abi_major = 99;
 	a.abi_minor = 0;
 	a.tcp_fd = 0;
-	a.ppp_unit = 0;
 	int rc = ioctl(devfd, SSTP_IOC_ATTACH, &a);
 	CHECK(rc == -1 && errno == EINVAL, "bad ABI major rejected with EINVAL");
-
-	/* Reserved field nonzero. */
-	memset(&a, 0, sizeof(a));
-	a.abi_major = SSTP_ABI_VERSION_MAJOR;
-	a.abi_minor = SSTP_ABI_VERSION_MINOR;
-	a.tcp_fd = 0;
-	a.ppp_unit = 0;
-	a.reserved[2] = 0xdeadbeef;
-	rc = ioctl(devfd, SSTP_IOC_ATTACH, &a);
-	CHECK(rc == -1 && errno == EINVAL,
-	      "reserved-nonzero rejected with EINVAL");
 
 	/* Negative tcp_fd. */
 	memset(&a, 0, sizeof(a));
 	a.abi_major = SSTP_ABI_VERSION_MAJOR;
 	a.abi_minor = SSTP_ABI_VERSION_MINOR;
 	a.tcp_fd = -1;
-	a.ppp_unit = 0;
 	rc = ioctl(devfd, SSTP_IOC_ATTACH, &a);
 	CHECK(rc == -1 && errno == EINVAL, "negative tcp_fd rejected with EINVAL");
 
@@ -308,7 +295,6 @@ static void test_negative_open(int devfd)
 	a.abi_major = SSTP_ABI_VERSION_MAJOR;
 	a.abi_minor = SSTP_ABI_VERSION_MINOR;
 	a.tcp_fd = devfd;
-	a.ppp_unit = 0;
 	rc = ioctl(devfd, SSTP_IOC_ATTACH, &a);
 	CHECK(rc == -1 && errno == ENOTSOCK,
 	      "non-socket fd rejected with ENOTSOCK");
@@ -319,7 +305,6 @@ static void test_negative_open(int devfd)
 	a.abi_major = SSTP_ABI_VERSION_MAJOR;
 	a.abi_minor = SSTP_ABI_VERSION_MINOR;
 	a.tcp_fd = s;
-	a.ppp_unit = 0;
 	rc = ioctl(devfd, SSTP_IOC_ATTACH, &a);
 	CHECK(rc == -1 && errno == EOPNOTSUPP,
 	      "TCP without kTLS rejected with EOPNOTSUPP");
@@ -366,8 +351,6 @@ static void test_happy_path(int devfd)
 		.abi_major = SSTP_ABI_VERSION_MAJOR,
 		.abi_minor = SSTP_ABI_VERSION_MINOR,
 		.tcp_fd = srv_fd,
-		.ppp_unit = 0,
-		.flags = 0,
 		.mtu = 1500,
 	};
 	int rc = ioctl(devfd, SSTP_IOC_ATTACH, &a);
@@ -475,9 +458,8 @@ static void test_happy_path(int devfd)
 	CHECK(ev.type == SSTP_EVT_PROTOCOL_ERROR,
 	      "event type = SSTP_EVT_PROTOCOL_ERROR (got %u)", ev.type);
 
-	/* DETACH. */
-	struct sstp_detach d = { 0 };
-	rc = ioctl(sess_fd, SSTP_IOC_DETACH, &d);
+	/* DETACH (no payload — _IO ioctl). */
+	rc = ioctl(sess_fd, SSTP_IOC_DETACH, 0);
 	CHECK(rc == 0, "SSTP_IOC_DETACH returned 0");
 
 	/* After DETACH, poll should report HUP. */

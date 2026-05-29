@@ -16,6 +16,7 @@ use aws_lc_sys as aws;
 pub const MD5_OUTPUT_LEN: usize = fast_md5::DIGEST_LENGTH;
 pub const SHA1_OUTPUT_LEN: usize = aws::SHA_DIGEST_LENGTH as usize;
 pub const SHA256_OUTPUT_LEN: usize = aws::SHA256_DIGEST_LENGTH as usize;
+pub const SHA384_OUTPUT_LEN: usize = aws::SHA384_DIGEST_LENGTH as usize;
 
 // ---------------------------------------------------------------------------
 // MD5 — fast-md5 backend
@@ -156,7 +157,10 @@ mod tests {
     fn md5_abc() {
         assert_eq!(
             Md5::digest(b"abc"),
-            [0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72],
+            [
+                0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1,
+                0x7f, 0x72
+            ],
         );
     }
 

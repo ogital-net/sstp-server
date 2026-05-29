@@ -81,6 +81,12 @@ pub(crate) const fn ioc_readwrite<T>(typ: u8, nr: u8) -> libc::c_ulong {
     iowr::<T>(typ, nr)
 }
 
+/// Crate-internal alias of `_IO(type, nr)` (no payload).
+#[inline]
+pub(crate) const fn ioc_none(typ: u8, nr: u8) -> libc::c_ulong {
+    io(typ, nr)
+}
+
 // ---------------------------------------------------------------------------
 // PPP ioctls — `<linux/ppp-ioctl.h>` type byte is `'t'` (0x74).
 // ---------------------------------------------------------------------------
@@ -138,13 +144,21 @@ pub struct NpIoctl {
 
 /// Issue `ioctl(fd, request, &val)` where the request expects a pointer
 /// to a single `c_int` written by userspace (an `_IOW(..., int)`).
-pub fn ioctl_set_int(fd: BorrowedFd<'_>, request: libc::c_ulong, val: libc::c_int) -> io::Result<()> {
+pub fn ioctl_set_int(
+    fd: BorrowedFd<'_>,
+    request: libc::c_ulong,
+    val: libc::c_int,
+) -> io::Result<()> {
     // SAFETY: `fd` is a valid open file descriptor for the duration of
     // this call (`BorrowedFd` invariant). `request` was constructed with
     // `_IOW(..., int)`, so the kernel will read exactly `sizeof(int)`
     // bytes from `&val`. `val` lives on the stack and is initialized.
     let rc = unsafe { libc::ioctl(fd.as_raw_fd(), request, &val) };
-    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Issue `ioctl(fd, request, &mut buf)` where the request reads a `c_int`
@@ -155,7 +169,11 @@ pub fn ioctl_get_int(fd: BorrowedFd<'_>, request: libc::c_ulong) -> io::Result<l
     // constructed with `_IOR(..., int)`, so the kernel writes exactly
     // `sizeof(int)` bytes into `out`, which is properly aligned.
     let rc = unsafe { libc::ioctl(fd.as_raw_fd(), request, &mut out) };
-    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(out) }
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(out)
+    }
 }
 
 /// Issue `ioctl(fd, request, &mut val)` for `_IOWR(..., int)` — value is
@@ -169,7 +187,11 @@ pub fn ioctl_xchg_int(
     // SAFETY: `fd` is valid. `request` is `_IOWR(..., int)`, so the
     // kernel both reads and writes `sizeof(int)` bytes at `&mut io_val`.
     let rc = unsafe { libc::ioctl(fd.as_raw_fd(), request, &mut io_val) };
-    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(io_val) }
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(io_val)
+    }
 }
 
 #[cfg(test)]

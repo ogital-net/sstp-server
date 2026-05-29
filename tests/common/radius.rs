@@ -177,11 +177,7 @@ impl DummyRadius {
         Self::start_on_with_secret(port, credential, DEFAULT_SECRET.to_vec()).await
     }
 
-    pub async fn start_on_with_secret(
-        port: u16,
-        credential: Credential,
-        secret: Vec<u8>,
-    ) -> Self {
+    pub async fn start_on_with_secret(port: u16, credential: Credential, secret: Vec<u8>) -> Self {
         let bind = SocketAddr::from(([127, 0, 0, 1], port));
         let client = Arc::new(Client::new(secret.as_slice()));
         let store = StaticClients::builder()

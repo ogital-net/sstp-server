@@ -63,24 +63,21 @@ impl DataPath {
     /// path is requested) and `unit` (a `/dev/ppp` unit fd) to the
     /// chosen data path.
     ///
-    /// `flags` and `mtu` are forwarded to the kmod attach for the
-    /// kernel path; the userspace path ignores `flags` (kTLS is
-    /// optional under userspace forwarding, since TLS decryption can
-    /// still happen in `aws-lc-sys`) and uses `mtu` only as a hint.
+    /// `mtu` is forwarded to the kmod attach for the kernel path;
+    /// the userspace path uses `mtu` only as a hint.
     pub fn open(
         mode: DataPathMode,
         tcp_fd: BorrowedFd<'_>,
         unit: &Unit,
-        flags: u32,
         mtu: u32,
     ) -> Result<Self, DataPathError> {
         match mode {
-            DataPathMode::Kernel => match try_kernel(tcp_fd, unit, flags, mtu) {
+            DataPathMode::Kernel => match try_kernel(tcp_fd, unit, mtu) {
                 Ok(s) => Ok(Self::Kernel(s)),
                 Err(e) => Err(DataPathError::KernelRequired(e)),
             },
             DataPathMode::Userspace => Userspace::new(unit).map(Self::Userspace),
-            DataPathMode::Auto => match try_kernel(tcp_fd, unit, flags, mtu) {
+            DataPathMode::Auto => match try_kernel(tcp_fd, unit, mtu) {
                 Ok(s) => {
                     info!(
                         unit = unit.index(),
@@ -115,17 +112,12 @@ impl DataPath {
     }
 }
 
-fn try_kernel(
-    tcp_fd: BorrowedFd<'_>,
-    unit: &Unit,
-    flags: u32,
-    mtu: u32,
-) -> Result<KmodSession, KmodError> {
+fn try_kernel(tcp_fd: BorrowedFd<'_>, unit: &Unit, mtu: u32) -> Result<KmodSession, KmodError> {
     sstp_kmod::probe()?;
     // PPP unit numbers are small non-negative; cast is lossless.
     #[allow(clippy::cast_possible_wrap)]
     let ppp_unit = unit.index() as i32;
-    KmodSession::attach(tcp_fd, ppp_unit, flags, mtu)
+    KmodSession::attach(tcp_fd, ppp_unit, mtu)
 }
 
 /// Userspace fallback: bytes copy through this process.

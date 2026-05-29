@@ -365,15 +365,15 @@ impl TlsStream {
     /// over record framing for both directions, so any cleartext
     /// already buffered in `libssl` would be missed by the kernel).
     ///
-    /// v0.1 supports TLS 1.3 with `TLS_AES_128_GCM_SHA256` only.
-    /// Other ciphers / TLS 1.2 return `TlsError::Init(...)`; the
-    /// caller should fall back to the userspace data path.
+    /// v0.1 supports AES-128-GCM with either TLS 1.3
+    /// (`TLS_AES_128_GCM_SHA256`) or TLS 1.2
+    /// (`ECDHE-{RSA,ECDSA}-AES128-GCM-SHA256` /
+    /// `AES128-GCM-SHA256`). Other ciphers return
+    /// `TlsError::Init(...)`; the caller should fall back to the
+    /// userspace data path.
     pub fn install_ktls(&self) -> Result<(), TlsError> {
         use super::ktls;
 
-        // Cipher gate. Mirrors `ktls_eligibility` but is stricter —
-        // we only have the key-derivation code for AES-128-GCM
-        // TLS 1.3 today.
         // SAFETY: ssl is valid for the life of this TlsStream.
         let cipher = unsafe { aws::SSL_get_current_cipher(self.ssl.as_ptr()) };
         if cipher.is_null() {
@@ -395,96 +395,367 @@ impl TlsStream {
             }
         };
 
-        if version_name != "TLSv1.3" || cipher_name != "TLS_AES_128_GCM_SHA256" {
-            return Err(TlsError::Init(format!(
-                "kTLS only supports TLSv1.3 / TLS_AES_128_GCM_SHA256 in v0.1 (got {version_name} / {cipher_name})"
-            )));
-        }
-
-        // Pull the TLS 1.3 traffic secrets. For SHA-256 suites the
-        // secret length is 32. Buffer is sized to the SHA-384 max
-        // (48) defensively, but for SHA-256 we get 32 back.
-        let mut write_secret = [0u8; 48];
-        let mut write_len: usize = write_secret.len();
-        // SAFETY: ssl valid; secret + out_len point at owned storage
-        // of sufficient size.
-        let rc = unsafe {
-            aws::SSL_get_write_traffic_secret(
-                self.ssl.as_ptr(),
-                write_secret.as_mut_ptr(),
-                &raw mut write_len,
-            )
+        let (tx, rx) = match (version_name.as_str(), cipher_name.as_str()) {
+            ("TLSv1.3", "TLS_AES_128_GCM_SHA256") => self.derive_tls13_aes128_gcm()?,
+            (
+                "TLSv1.2",
+                "ECDHE-RSA-AES128-GCM-SHA256"
+                | "ECDHE-ECDSA-AES128-GCM-SHA256"
+                | "AES128-GCM-SHA256",
+            ) => self.derive_tls12_aes128_gcm()?,
+            ("TLSv1.3", "TLS_AES_256_GCM_SHA384") => {
+                let (tx, rx) = self.derive_tls13_aes256_gcm()?;
+                return ktls::install_aes_gcm_256(self.tcp_fd(), tx, rx)
+                    .map_err(|e| TlsError::Init(format!("kTLS setsockopt: {e}")));
+            }
+            (
+                "TLSv1.2",
+                "ECDHE-RSA-AES256-GCM-SHA384"
+                | "ECDHE-ECDSA-AES256-GCM-SHA384"
+                | "AES256-GCM-SHA384",
+            ) => {
+                let (tx, rx) = self.derive_tls12_aes256_gcm()?;
+                return ktls::install_aes_gcm_256(self.tcp_fd(), tx, rx)
+                    .map_err(|e| TlsError::Init(format!("kTLS setsockopt: {e}")));
+            }
+            _ => {
+                return Err(TlsError::Init(format!(
+                    "kTLS unsupported in v0.1: {version_name} / {cipher_name}"
+                )));
+            }
         };
-        if rc != 1 || write_len != 32 {
-            return Err(TlsError::Init(format!(
-                "SSL_get_write_traffic_secret: rc={rc} len={write_len}"
-            )));
-        }
-        let mut read_secret = [0u8; 48];
-        let mut read_len: usize = read_secret.len();
-        // SAFETY: as above.
-        let rc = unsafe {
-            aws::SSL_get_read_traffic_secret(
-                self.ssl.as_ptr(),
-                read_secret.as_mut_ptr(),
-                &raw mut read_len,
-            )
-        };
-        if rc != 1 || read_len != 32 {
-            return Err(TlsError::Init(format!(
-                "SSL_get_read_traffic_secret: rc={rc} len={read_len}"
-            )));
-        }
 
-        // Derive {key, iv} for each direction via HKDF-Expand-Label
-        // (RFC 8446 §7.3). For AES-128-GCM: key 16, iv 12.
-        let write_key = ktls::hkdf_expand_label_sha256(&write_secret[..32], "key", 16);
-        let write_iv = ktls::hkdf_expand_label_sha256(&write_secret[..32], "iv", 12);
-        let read_key = ktls::hkdf_expand_label_sha256(&read_secret[..32], "key", 16);
-        let read_iv = ktls::hkdf_expand_label_sha256(&read_secret[..32], "iv", 12);
+        ktls::install_aes_gcm_128(self.tcp_fd(), tx, rx)
+            .map_err(|e| TlsError::Init(format!("kTLS setsockopt: {e}")))?;
+        Ok(())
+    }
+
+    /// Derive TX/RX `tls12_crypto_info_aes_gcm_128` for a TLS 1.3
+    /// `TLS_AES_128_GCM_SHA256` session.
+    ///
+    /// TLS 1.3 (RFC 8446 §7.3) gives us per-direction traffic
+    /// secrets; we expand them via HKDF-Expand-Label into the
+    /// 16-byte key and 12-byte static IV the AEAD needs. The
+    /// kernel layout splits that IV into `salt[4] || iv[8]` and
+    /// XORs the record sequence number into the low 8 bytes
+    /// per §5.3.
+    fn derive_tls13_aes128_gcm(
+        &self,
+    ) -> Result<
+        (
+            super::ktls::TlsCryptoInfoAesGcm128,
+            super::ktls::TlsCryptoInfoAesGcm128,
+        ),
+        TlsError,
+    > {
+        use super::ktls;
+
+        let write_secret = self.tls13_traffic_secret(Direction::Write, 32)?;
+        let read_secret = self.tls13_traffic_secret(Direction::Read, 32)?;
+
+        let write_key = ktls::hkdf_expand_label_sha256(&write_secret, "key", 16);
+        let write_iv = ktls::hkdf_expand_label_sha256(&write_secret, "iv", 12);
+        let read_key = ktls::hkdf_expand_label_sha256(&read_secret, "key", 16);
+        let read_iv = ktls::hkdf_expand_label_sha256(&read_secret, "iv", 12);
 
         // SAFETY: ssl is valid; these accessors are pure reads of
         // the per-direction record counter and return a u64.
         let write_seq = unsafe { aws::SSL_get_write_sequence(self.ssl.as_ptr()) };
         let read_seq = unsafe { aws::SSL_get_read_sequence(self.ssl.as_ptr()) };
 
-        // TLS 1.3 nonce layout in `tls12_crypto_info_aes_gcm_128`:
-        // the kernel concatenates salt[4] || iv[8] to form the
-        // 12-byte static IV, then XORs the record sequence number
-        // into the last 8 bytes per RFC 8446 §5.3. So salt =
-        // static_iv[0..4], iv = static_iv[4..12].
-        let mut tx = ktls::TlsCryptoInfoAesGcm128 {
-            info: ktls::TlsCryptoInfo {
-                version: ktls::TLS_1_3_VERSION,
-                cipher_type: ktls::TLS_CIPHER_AES_GCM_128,
-            },
-            iv: [0; 8],
-            key: [0; 16],
-            salt: [0; 4],
-            rec_seq: write_seq.to_be_bytes(),
-        };
-        tx.salt.copy_from_slice(&write_iv[..4]);
-        tx.iv.copy_from_slice(&write_iv[4..12]);
-        tx.key.copy_from_slice(&write_key);
-
-        let mut rx = ktls::TlsCryptoInfoAesGcm128 {
-            info: ktls::TlsCryptoInfo {
-                version: ktls::TLS_1_3_VERSION,
-                cipher_type: ktls::TLS_CIPHER_AES_GCM_128,
-            },
-            iv: [0; 8],
-            key: [0; 16],
-            salt: [0; 4],
-            rec_seq: read_seq.to_be_bytes(),
-        };
-        rx.salt.copy_from_slice(&read_iv[..4]);
-        rx.iv.copy_from_slice(&read_iv[4..12]);
-        rx.key.copy_from_slice(&read_key);
-
-        ktls::install_aes_gcm_128(self.tcp_fd(), tx, rx)
-            .map_err(|e| TlsError::Init(format!("kTLS setsockopt: {e}")))?;
-        Ok(())
+        Ok((
+            build_aes_gcm_128(
+                ktls::TLS_1_3_VERSION,
+                &write_key,
+                &write_iv[..4],
+                &write_iv[4..12],
+                write_seq,
+            ),
+            build_aes_gcm_128(
+                ktls::TLS_1_3_VERSION,
+                &read_key,
+                &read_iv[..4],
+                &read_iv[4..12],
+                read_seq,
+            ),
+        ))
     }
+
+    /// Derive TX/RX `tls12_crypto_info_aes_gcm_128` for a TLS 1.2
+    /// AES-128-GCM session.
+    ///
+    /// TLS 1.2 (RFC 5246 §6.3, RFC 5288 §3) builds the key
+    /// material from a single PRF block:
+    ///
+    /// ```text
+    /// key_block = PRF(master_secret, "key expansion",
+    ///                 server_random || client_random,
+    ///                 key_block_len)
+    /// ```
+    ///
+    /// For an AEAD cipher with no MAC key, the block is laid out
+    /// as `client_write_key | server_write_key | client_write_IV
+    /// | server_write_IV` where `*_IV` is the 4-byte implicit
+    /// nonce (salt). Server-side, we send with `server_*` and
+    /// receive with `client_*`.
+    ///
+    /// The 8-byte explicit nonce / `iv` field of the kTLS UAPI is
+    /// seeded with the current record sequence number — the
+    /// kernel uses it as the next record's `nonce_explicit` and
+    /// then increments per RFC 5288 §3.
+    fn derive_tls12_aes128_gcm(
+        &self,
+    ) -> Result<
+        (
+            super::ktls::TlsCryptoInfoAesGcm128,
+            super::ktls::TlsCryptoInfoAesGcm128,
+        ),
+        TlsError,
+    > {
+        use super::ktls;
+
+        // 2 * (key 16 + salt 4) = 40.
+        const KEY_BLOCK_LEN: usize = 40;
+        let mut block = [0u8; KEY_BLOCK_LEN];
+        // SAFETY: ssl is valid; `block` is a writable buffer of
+        // exactly `KEY_BLOCK_LEN` bytes; `SSL_generate_key_block`
+        // writes `out_len` bytes to it on success.
+        let rc = unsafe {
+            aws::SSL_generate_key_block(self.ssl.as_ptr(), block.as_mut_ptr(), block.len())
+        };
+        if rc != 1 {
+            return Err(TlsError::Init(format!(
+                "SSL_generate_key_block: rc={rc}, {}",
+                last_error()
+            )));
+        }
+
+        let (client_key, rest) = block.split_at(16);
+        let (server_key, rest) = rest.split_at(16);
+        let (client_salt, server_salt) = rest.split_at(4);
+
+        // SAFETY: ssl is valid; these accessors are pure reads
+        // returning u64.
+        let write_seq = unsafe { aws::SSL_get_write_sequence(self.ssl.as_ptr()) };
+        let read_seq = unsafe { aws::SSL_get_read_sequence(self.ssl.as_ptr()) };
+
+        Ok((
+            build_aes_gcm_128(
+                ktls::TLS_1_2_VERSION,
+                server_key,
+                server_salt,
+                &write_seq.to_be_bytes(),
+                write_seq,
+            ),
+            build_aes_gcm_128(
+                ktls::TLS_1_2_VERSION,
+                client_key,
+                client_salt,
+                &read_seq.to_be_bytes(),
+                read_seq,
+            ),
+        ))
+    }
+
+    /// TLS 1.3 `TLS_AES_256_GCM_SHA384` sibling of
+    /// [`derive_tls13_aes128_gcm`]. Traffic secrets are 48 bytes
+    /// (SHA-384 output); the AEAD key is 32 bytes and the static
+    /// IV is 12 bytes (split into `salt[4] || iv[8]` per the
+    /// kernel UAPI).
+    fn derive_tls13_aes256_gcm(
+        &self,
+    ) -> Result<
+        (
+            super::ktls::TlsCryptoInfoAesGcm256,
+            super::ktls::TlsCryptoInfoAesGcm256,
+        ),
+        TlsError,
+    > {
+        use super::ktls;
+
+        let write_secret = self.tls13_traffic_secret(Direction::Write, 48)?;
+        let read_secret = self.tls13_traffic_secret(Direction::Read, 48)?;
+
+        let write_key = ktls::hkdf_expand_label_sha384(&write_secret, "key", 32);
+        let write_iv = ktls::hkdf_expand_label_sha384(&write_secret, "iv", 12);
+        let read_key = ktls::hkdf_expand_label_sha384(&read_secret, "key", 32);
+        let read_iv = ktls::hkdf_expand_label_sha384(&read_secret, "iv", 12);
+
+        // SAFETY: ssl is valid; these accessors are pure reads of
+        // the per-direction record counter and return a u64.
+        let write_seq = unsafe { aws::SSL_get_write_sequence(self.ssl.as_ptr()) };
+        let read_seq = unsafe { aws::SSL_get_read_sequence(self.ssl.as_ptr()) };
+
+        Ok((
+            build_aes_gcm_256(
+                ktls::TLS_1_3_VERSION,
+                &write_key,
+                &write_iv[..4],
+                &write_iv[4..12],
+                write_seq,
+            ),
+            build_aes_gcm_256(
+                ktls::TLS_1_3_VERSION,
+                &read_key,
+                &read_iv[..4],
+                &read_iv[4..12],
+                read_seq,
+            ),
+        ))
+    }
+
+    /// TLS 1.2 AES-256-GCM sibling of
+    /// [`derive_tls12_aes128_gcm`]. The key block is laid out
+    /// `client_write_key(32) | server_write_key(32) |
+    /// client_write_IV(4) | server_write_IV(4)` = 72 bytes.
+    fn derive_tls12_aes256_gcm(
+        &self,
+    ) -> Result<
+        (
+            super::ktls::TlsCryptoInfoAesGcm256,
+            super::ktls::TlsCryptoInfoAesGcm256,
+        ),
+        TlsError,
+    > {
+        use super::ktls;
+
+        // 2 * (key 32 + salt 4) = 72.
+        const KEY_BLOCK_LEN: usize = 72;
+        let mut block = [0u8; KEY_BLOCK_LEN];
+        // SAFETY: ssl is valid; `block` is a writable buffer of
+        // exactly `KEY_BLOCK_LEN` bytes; `SSL_generate_key_block`
+        // writes `out_len` bytes to it on success.
+        let rc = unsafe {
+            aws::SSL_generate_key_block(self.ssl.as_ptr(), block.as_mut_ptr(), block.len())
+        };
+        if rc != 1 {
+            return Err(TlsError::Init(format!(
+                "SSL_generate_key_block: rc={rc}, {}",
+                last_error()
+            )));
+        }
+
+        let (client_key, rest) = block.split_at(32);
+        let (server_key, rest) = rest.split_at(32);
+        let (client_salt, server_salt) = rest.split_at(4);
+
+        // SAFETY: ssl is valid; these accessors are pure reads
+        // returning u64.
+        let write_seq = unsafe { aws::SSL_get_write_sequence(self.ssl.as_ptr()) };
+        let read_seq = unsafe { aws::SSL_get_read_sequence(self.ssl.as_ptr()) };
+
+        Ok((
+            build_aes_gcm_256(
+                ktls::TLS_1_2_VERSION,
+                server_key,
+                server_salt,
+                &write_seq.to_be_bytes(),
+                write_seq,
+            ),
+            build_aes_gcm_256(
+                ktls::TLS_1_2_VERSION,
+                client_key,
+                client_salt,
+                &read_seq.to_be_bytes(),
+                read_seq,
+            ),
+        ))
+    }
+
+    /// Pull a TLS 1.3 traffic secret of the given length (in
+    /// bytes) from libssl. Errors out on length mismatch — the
+    /// caller pins the size against the negotiated hash.
+    fn tls13_traffic_secret(
+        &self,
+        dir: Direction,
+        expected_len: usize,
+    ) -> Result<Vec<u8>, TlsError> {
+        let mut buf = vec![0u8; 48]; // SHA-384 max
+        let mut got = buf.len();
+        // SAFETY: ssl is valid; buf + got point at owned storage
+        // of sufficient size.
+        let rc = unsafe {
+            match dir {
+                Direction::Write => aws::SSL_get_write_traffic_secret(
+                    self.ssl.as_ptr(),
+                    buf.as_mut_ptr(),
+                    &raw mut got,
+                ),
+                Direction::Read => aws::SSL_get_read_traffic_secret(
+                    self.ssl.as_ptr(),
+                    buf.as_mut_ptr(),
+                    &raw mut got,
+                ),
+            }
+        };
+        if rc != 1 || got != expected_len {
+            return Err(TlsError::Init(format!(
+                "SSL_get_{dir:?}_traffic_secret: rc={rc} len={got} want={expected_len}"
+            )));
+        }
+        buf.truncate(got);
+        Ok(buf)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    Write,
+    Read,
+}
+
+/// Assemble a `tls12_crypto_info_aes_gcm_128` from the pieces. The
+/// `iv` field is the 8-byte initial explicit nonce; `salt` is the
+/// 4-byte implicit nonce (TLS 1.2) / high half of the static IV
+/// (TLS 1.3). `rec_seq` seeds the kernel's record counter.
+fn build_aes_gcm_128(
+    version: u16,
+    key: &[u8],
+    salt: &[u8],
+    iv: &[u8],
+    rec_seq: u64,
+) -> crate::crypto::ktls::TlsCryptoInfoAesGcm128 {
+    use crate::crypto::ktls;
+    let mut out = ktls::TlsCryptoInfoAesGcm128 {
+        info: ktls::TlsCryptoInfo {
+            version,
+            cipher_type: ktls::TLS_CIPHER_AES_GCM_128,
+        },
+        iv: [0; 8],
+        key: [0; 16],
+        salt: [0; 4],
+        rec_seq: rec_seq.to_be_bytes(),
+    };
+    out.key.copy_from_slice(key);
+    out.salt.copy_from_slice(salt);
+    out.iv.copy_from_slice(iv);
+    out
+}
+
+/// AES-256-GCM sibling of [`build_aes_gcm_128`]. Same `iv` / `salt`
+/// / `rec_seq` semantics; only the key width changes.
+fn build_aes_gcm_256(
+    version: u16,
+    key: &[u8],
+    salt: &[u8],
+    iv: &[u8],
+    rec_seq: u64,
+) -> crate::crypto::ktls::TlsCryptoInfoAesGcm256 {
+    use crate::crypto::ktls;
+    let mut out = ktls::TlsCryptoInfoAesGcm256 {
+        info: ktls::TlsCryptoInfo {
+            version,
+            cipher_type: ktls::TLS_CIPHER_AES_GCM_256,
+        },
+        iv: [0; 8],
+        key: [0; 32],
+        salt: [0; 4],
+        rec_seq: rec_seq.to_be_bytes(),
+    };
+    out.key.copy_from_slice(key);
+    out.salt.copy_from_slice(salt);
+    out.iv.copy_from_slice(iv);
+    out
 }
 
 async fn handshake(s: &mut TlsStream) -> Result<(), TlsError> {

@@ -444,7 +444,10 @@ fn parse_ack(op: &'static str, buf: &[u8]) -> Result<(), NetlinkError> {
             // Payload starts with `int error`. Zero = success ACK,
             // negative-errno = failure.
             if buf.len() < NLMSG_HDRLEN + 4 {
-                return Err(NetlinkError::Unexpected { op, got: NLMSG_ERROR });
+                return Err(NetlinkError::Unexpected {
+                    op,
+                    got: NLMSG_ERROR,
+                });
             }
             let err_bytes: [u8; 4] = buf[NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
                 .try_into()

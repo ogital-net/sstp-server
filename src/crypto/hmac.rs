@@ -1,4 +1,4 @@
-//! HMAC-SHA1 and HMAC-SHA256 using stack-allocated `HMAC_CTX`.
+//! HMAC-SHA1, HMAC-SHA256 and HMAC-SHA384 using stack-allocated `HMAC_CTX`.
 //!
 //! `HMAC_CTX_init` / `HMAC_CTX_cleanup` are used for the incremental API so
 //! the context lives on the stack without a heap round-trip.  The one-shot
@@ -8,7 +8,7 @@ use std::mem::MaybeUninit;
 
 use aws_lc_sys as aws;
 
-use super::hash::{SHA1_OUTPUT_LEN, SHA256_OUTPUT_LEN};
+use super::hash::{SHA1_OUTPUT_LEN, SHA256_OUTPUT_LEN, SHA384_OUTPUT_LEN};
 
 macro_rules! impl_hmac {
     (
@@ -100,6 +100,7 @@ macro_rules! impl_hmac {
 
 impl_hmac!(HmacSha1, aws::EVP_sha1, SHA1_OUTPUT_LEN);
 impl_hmac!(HmacSha256, aws::EVP_sha256, SHA256_OUTPUT_LEN);
+impl_hmac!(HmacSha384, aws::EVP_sha384, SHA384_OUTPUT_LEN);
 
 /// IKEv2-style PRF+ ([RFC 4306] §2.13) using HMAC-SHA1, used by SSTP
 /// Crypto Binding CMK derivation ([MS-SSTP] §3.2.5.2.2). The

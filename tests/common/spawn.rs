@@ -89,7 +89,10 @@ impl ServerBuilder {
         cmd.args(&self.extra_args);
 
         // Secrets travel via env, never argv.
-        cmd.env("SSTP_RADIUS_SECRET", String::from_utf8_lossy(&self.radius_secret).into_owned());
+        cmd.env(
+            "SSTP_RADIUS_SECRET",
+            String::from_utf8_lossy(&self.radius_secret).into_owned(),
+        );
         // Force text logs so the line-oriented reader thread works
         // regardless of whether the test runner is a TTY.
         cmd.env("RUST_LOG", "sstp_server=debug,info");
@@ -194,11 +197,7 @@ impl ServerHandle {
     /// match itself as the last element) or `None` on timeout. Use
     /// this when the test needs to inspect ordering between several
     /// log events: `wait_for_log` discards non-matching lines.
-    pub fn collect_logs_until(
-        &self,
-        needle: &str,
-        timeout: Duration,
-    ) -> Option<Vec<String>> {
+    pub fn collect_logs_until(&self, needle: &str, timeout: Duration) -> Option<Vec<String>> {
         let deadline = Instant::now() + timeout;
         let mut seen = Vec::new();
         loop {

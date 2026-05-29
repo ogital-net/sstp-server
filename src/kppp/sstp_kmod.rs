@@ -21,7 +21,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use super::ioctl::{
-    PPPIOCATTCHAN, PPPIOCCONNECT, ioc_read, ioc_readwrite, ioc_write, ioctl_set_int,
+    PPPIOCATTCHAN, PPPIOCCONNECT, ioc_none, ioc_read, ioc_readwrite, ioctl_set_int,
 };
 
 const DEV_SSTP: &CStr = c"/dev/sstp";
@@ -37,19 +37,12 @@ const DEV_SSTP: &CStr = c"/dev/sstp";
 /// `SSTP_ABI_VERSION_MAJOR` — kernel rejects mismatched majors.
 pub const SSTP_ABI_VERSION_MAJOR: u16 = 0;
 /// `SSTP_ABI_VERSION_MINOR`.
-pub const SSTP_ABI_VERSION_MINOR: u16 = 1;
-
-/// PFC negotiated.
-pub const SSTP_F_PFC: u32 = 1 << 0;
-/// ACFC negotiated.
-pub const SSTP_F_ACFC: u32 = 1 << 1;
-/// `IPv6CP` negotiated.
-pub const SSTP_F_IPV6: u32 = 1 << 2;
+pub const SSTP_ABI_VERSION_MINOR: u16 = 2;
 
 const SSTP_IOC_MAGIC: u8 = b'S';
 
 const SSTP_IOC_ATTACH: libc::c_ulong = ioc_readwrite::<SstpAttachRaw>(SSTP_IOC_MAGIC, 0x80);
-const SSTP_IOC_DETACH: libc::c_ulong = ioc_write::<SstpDetachRaw>(SSTP_IOC_MAGIC, 0x81);
+const SSTP_IOC_DETACH: libc::c_ulong = ioc_none(SSTP_IOC_MAGIC, 0x81);
 const SSTP_IOC_GETSTATS: libc::c_ulong = ioc_read::<SstpStats>(SSTP_IOC_MAGIC, 0x82);
 const SSTP_IOC_GET_CHAN_INDEX: libc::c_ulong = ioc_read::<libc::c_int>(SSTP_IOC_MAGIC, 0x83);
 const SSTP_IOC_RECV_CONTROL: libc::c_ulong =
@@ -57,9 +50,10 @@ const SSTP_IOC_RECV_CONTROL: libc::c_ulong =
 
 /// Maximum SSTP control-packet payload userspace may need to drain.
 /// Matches `SSTP_CONTROL_MAX` in `kernel-abi/sstp.h`. The kernel
-/// rejects `recv_control` calls whose `buf_len` is below the queued
-/// payload's length with `EMSGSIZE` (and requeues the frame), so the
-/// caller's buffer must be sized at least this large.
+/// drops queued frames whose payload exceeds the caller's `buf_len`
+/// with `EMSGSIZE` (no requeue — head-side requeue would break
+/// ordering), so the caller's buffer must be sized at least this
+/// large.
 pub const SSTP_CONTROL_MAX: usize = 4096;
 
 /// Wire-compatible mirror of `struct sstp_attach`.
@@ -69,20 +63,10 @@ struct SstpAttachRaw {
     abi_major: u16,
     abi_minor: u16,
     tcp_fd: i32,
-    ppp_unit: i32,
-    flags: u32,
     mtu: u32,
     session_fd: i32,
-    reserved: [u32; 4],
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct SstpDetachRaw {
-    reserved: [u32; 4],
-}
-
-/// Wire-compatible mirror of `struct sstp_recv_control`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct SstpRecvControlRaw {
@@ -103,7 +87,7 @@ pub struct SstpStats {
     pub sstp_malformed: u64,
     pub ppp_frames_rx: u64,
     pub ppp_frames_tx: u64,
-    pub reserved: [u64; 8],
+    pub evt_dropped: u64,
 }
 
 /// Event types posted to the session fd. See `kernel-abi/sstp.h`
@@ -221,13 +205,10 @@ impl KmodSession {
     /// data path. `tcp_fd` MUST be a stream socket with kTLS RX+TX
     /// crypto already installed; otherwise the kernel returns
     /// `-EOPNOTSUPP`. `ppp_unit` is the PPP unit number (returned by
-    /// `PPPIOCGUNIT` on the userspace unit fd).
-    pub fn attach(
-        tcp_fd: BorrowedFd<'_>,
-        ppp_unit: i32,
-        flags: u32,
-        mtu: u32,
-    ) -> Result<Self, KmodError> {
+    /// `PPPIOCGUNIT` on the userspace unit fd) — it is not part of
+    /// the kmod ABI; it is used here to bind the registered SSTP
+    /// channel to the unit via the standard `ppp_generic` ioctls.
+    pub fn attach(tcp_fd: BorrowedFd<'_>, ppp_unit: i32, mtu: u32) -> Result<Self, KmodError> {
         let dev = open_dev_sstp().map_err(|e| match e.raw_os_error() {
             Some(libc::ENOENT) => KmodError::NotAvailable,
             _ => KmodError::OpenDenied(e),
@@ -237,17 +218,14 @@ impl KmodSession {
             abi_major: SSTP_ABI_VERSION_MAJOR,
             abi_minor: SSTP_ABI_VERSION_MINOR,
             tcp_fd: tcp_fd.as_raw_fd(),
-            ppp_unit,
-            flags,
             mtu,
             session_fd: -1,
-            reserved: [0; 4],
         };
 
         // SAFETY: `dev` is a freshly-opened `/dev/sstp` fd. `req`
         // matches the kernel's `struct sstp_attach` byte-for-byte
         // (verified by mirroring `kernel-abi/sstp.h`). `SSTP_IOC_ATTACH`
-        // is `_IOWR(...)` of `sizeof(SstpAttachRaw)` (40 bytes), so the
+        // is `_IOWR(...)` of `sizeof(SstpAttachRaw)` (16 bytes), so the
         // kernel both reads and writes that many bytes through our
         // pointer. `req` is properly aligned and fully initialized.
         let rc = unsafe { libc::ioctl(dev.as_raw_fd(), SSTP_IOC_ATTACH, &raw mut req) };
@@ -322,15 +300,10 @@ impl KmodSession {
         let mut out = SstpStats::default();
         // SAFETY: `self.session_fd` is a valid open fd for the
         // duration of this call. `SSTP_IOC_GETSTATS` is `_IOR(...)`
-        // of `sizeof(SstpStats)` (128 bytes), so the kernel writes
+        // of `sizeof(SstpStats)` (72 bytes), so the kernel writes
         // exactly that many bytes through our pointer.
-        let rc = unsafe {
-            libc::ioctl(
-                self.session_fd.as_raw_fd(),
-                SSTP_IOC_GETSTATS,
-                &raw mut out,
-            )
-        };
+        let rc =
+            unsafe { libc::ioctl(self.session_fd.as_raw_fd(), SSTP_IOC_GETSTATS, &raw mut out) };
         if rc < 0 {
             return Err(KmodError::Ioctl {
                 what: "SSTP_IOC_GETSTATS",
@@ -345,12 +318,10 @@ impl KmodSession {
     /// of references happens when the fd is closed (i.e. when `self`
     /// is dropped).
     pub fn detach(&self) -> Result<(), KmodError> {
-        let arg = SstpDetachRaw::default();
         // SAFETY: `self.session_fd` is valid. `SSTP_IOC_DETACH` is
-        // `_IOW(...)` of `sizeof(SstpDetachRaw)` (16 bytes), so the
-        // kernel reads exactly that many bytes from our pointer. The
-        // struct is fully initialized to zero.
-        let rc = unsafe { libc::ioctl(self.session_fd.as_raw_fd(), SSTP_IOC_DETACH, &raw const arg) };
+        // `_IO(...)` (no payload); the third argument is ignored by
+        // the kernel.
+        let rc = unsafe { libc::ioctl(self.session_fd.as_raw_fd(), SSTP_IOC_DETACH, 0) };
         if rc < 0 {
             return Err(KmodError::Ioctl {
                 what: "SSTP_IOC_DETACH",
@@ -390,10 +361,7 @@ impl KmodSession {
         if rc as usize != buf.len() {
             return Err(KmodError::Ioctl {
                 what: "read(session_fd)",
-                source: io::Error::other(format!(
-                    "short event read: {rc} of {}",
-                    buf.len()
-                )),
+                source: io::Error::other(format!("short event read: {rc} of {}", buf.len())),
             });
         }
         // SAFETY: `EventRaw` is `#[repr(C)]` with three plain integer
@@ -453,8 +421,13 @@ fn chan_index_for(session_fd: BorrowedFd<'_>) -> Result<i32, KmodError> {
     // SAFETY: `session_fd` is valid. `SSTP_IOC_GET_CHAN_INDEX` is
     // `_IOR(..., int)`, so the kernel writes exactly `sizeof(int)`
     // bytes through our pointer.
-    let rc =
-        unsafe { libc::ioctl(session_fd.as_raw_fd(), SSTP_IOC_GET_CHAN_INDEX, &raw mut out) };
+    let rc = unsafe {
+        libc::ioctl(
+            session_fd.as_raw_fd(),
+            SSTP_IOC_GET_CHAN_INDEX,
+            &raw mut out,
+        )
+    };
     if rc < 0 {
         return Err(KmodError::Ioctl {
             what: "SSTP_IOC_GET_CHAN_INDEX",
@@ -483,12 +456,7 @@ fn open_dev_sstp() -> io::Result<OwnedFd> {
 fn bind_channel_to_unit(chan_index: i32, ppp_unit: i32) -> Result<OwnedFd, KmodError> {
     // SAFETY: static NUL-terminated `CStr`; `open(2)` returns a fresh
     // fd or -1.
-    let raw = unsafe {
-        libc::open(
-            c"/dev/ppp".as_ptr(),
-            libc::O_RDWR | libc::O_CLOEXEC,
-        )
-    };
+    let raw = unsafe { libc::open(c"/dev/ppp".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if raw < 0 {
         return Err(KmodError::ChannelBind {
             what: "open(/dev/ppp)",
@@ -545,7 +513,7 @@ mod tests {
             let _ = listener.accept();
         });
         let sock = std::net::TcpStream::connect(addr).expect("connect");
-        let err = KmodSession::attach(sock.as_fd(), 0, 0, 1500).unwrap_err();
+        let err = KmodSession::attach(sock.as_fd(), 0, 1500).unwrap_err();
         match err {
             KmodError::Attach(e) => {
                 assert_eq!(
@@ -574,12 +542,12 @@ mod tests {
     /// step with `kernel-abi/sstp.h`.
     #[test]
     fn sstp_ioctl_numbers_match_kernel() {
-        // _IOWR('S', 0x80, struct sstp_attach) — 40 bytes
-        assert_eq!(SSTP_IOC_ATTACH, 0xc028_5380);
-        // _IOW('S', 0x81, struct sstp_detach) — 16 bytes
-        assert_eq!(SSTP_IOC_DETACH, 0x4010_5381);
-        // _IOR('S', 0x82, struct sstp_stats) — 128 bytes
-        assert_eq!(SSTP_IOC_GETSTATS, 0x8080_5382);
+        // _IOWR('S', 0x80, struct sstp_attach) — 16 bytes
+        assert_eq!(SSTP_IOC_ATTACH, 0xc010_5380);
+        // _IO('S', 0x81) — no payload
+        assert_eq!(SSTP_IOC_DETACH, 0x0000_5381);
+        // _IOR('S', 0x82, struct sstp_stats) — 72 bytes (9 × u64)
+        assert_eq!(SSTP_IOC_GETSTATS, 0x8048_5382);
         // _IOR('S', 0x83, __s32) — 4 bytes
         assert_eq!(SSTP_IOC_GET_CHAN_INDEX, 0x8004_5383);
         // _IOWR('S', 0x84, struct sstp_recv_control) — 16 bytes

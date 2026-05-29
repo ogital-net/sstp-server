@@ -98,17 +98,41 @@ pub static LOG_LINES_DROPPED: Counter = Counter::new();
 pub fn render_stats() -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(512);
-    let _ = writeln!(out, "sstp_connections_accepted: {}", CONNECTIONS_ACCEPTED.get());
+    let _ = writeln!(
+        out,
+        "sstp_connections_accepted: {}",
+        CONNECTIONS_ACCEPTED.get()
+    );
     let _ = writeln!(out, "sstp_connections_active: {}", CONNECTIONS_ACTIVE.get());
     let _ = writeln!(out, "sstp_handshake_failures: {}", HANDSHAKE_FAILURES.get());
     let _ = writeln!(out, "sstp_auth_accept: {}", AUTH_ACCEPT.get());
     let _ = writeln!(out, "sstp_auth_reject: {}", AUTH_REJECT.get());
-    let _ = writeln!(out, "sstp_session_teardown_clean: {}", SESSION_TEARDOWN_CLEAN.get());
-    let _ = writeln!(out, "sstp_session_teardown_admin: {}", SESSION_TEARDOWN_ADMIN.get());
-    let _ = writeln!(out, "sstp_session_teardown_coa: {}", SESSION_TEARDOWN_COA.get());
-    let _ = writeln!(out, "sstp_session_teardown_shutdown: {}", SESSION_TEARDOWN_SHUTDOWN.get());
+    let _ = writeln!(
+        out,
+        "sstp_session_teardown_clean: {}",
+        SESSION_TEARDOWN_CLEAN.get()
+    );
+    let _ = writeln!(
+        out,
+        "sstp_session_teardown_admin: {}",
+        SESSION_TEARDOWN_ADMIN.get()
+    );
+    let _ = writeln!(
+        out,
+        "sstp_session_teardown_coa: {}",
+        SESSION_TEARDOWN_COA.get()
+    );
+    let _ = writeln!(
+        out,
+        "sstp_session_teardown_shutdown: {}",
+        SESSION_TEARDOWN_SHUTDOWN.get()
+    );
     let _ = writeln!(out, "sstp_session_panics: {}", SESSION_PANICS.get());
-    let _ = writeln!(out, "sstp_crypto_binding_failures: {}", CRYPTO_BINDING_FAILURES.get());
+    let _ = writeln!(
+        out,
+        "sstp_crypto_binding_failures: {}",
+        CRYPTO_BINDING_FAILURES.get()
+    );
     let _ = writeln!(out, "sstp_log_lines_dropped: {}", LOG_LINES_DROPPED.get());
     out
 }

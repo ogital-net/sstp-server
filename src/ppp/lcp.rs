@@ -394,10 +394,7 @@ mod tests {
             0x03, 0x05, 0xc2, 0x23, 0x81, // Auth = CHAP/MS-CHAPv2
         ];
         let pkt = decode_lcp_packet(&buf).unwrap();
-        let opt = ConfigOptionIter::new(pkt.data)
-            .next()
-            .unwrap()
-            .unwrap();
+        let opt = ConfigOptionIter::new(pkt.data).next().unwrap().unwrap();
         let (proto, tail) = opt.as_auth_protocol().unwrap();
         assert_eq!(proto, 0xC223);
         assert_eq!(tail, &[0x81]);

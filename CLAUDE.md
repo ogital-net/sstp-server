@@ -127,15 +127,18 @@ independent paths, listed in order of strategic priority:
      few hundred lines of FFI plus careful state-machine work and
      is the single largest remaining piece.
    - **Finish the kmod data path.** Per [`kmod/README.md`](kmod/README.md)
-     the lifecycle, channel ops, and RX/TX skeleton compile and
-     load (`/dev/sstp` mode 0600 appears on `insmod sstp.ko`).
-     What's still stubbed: `sk_write_space` → `ppp_output_wakeup`
-     so a full socket buffer pauses ppp_generic instead of
-     dropping the frame (`kmod/sstp_chan.c`), control-packet
-     (`C=1`) forwarding back to userspace so SSTP hello timers
-     stay in process (`kmod/sstp_demux.c`), and TLS 1.3 key-update
-     detection raising `SSTP_EVT_TLS_REKEY_NEEDED` on the session
-     fd.
+     the v0.2 RC kmod ships the full per-frame data path:
+     `sk_write_space` → `ppp_output_wakeup` for TX backpressure
+     ([`kmod/sstp_chan.c`](kmod/sstp_chan.c)), control-packet
+     (`C=1`) demux + queue + `SSTP_EVT_CONTROL_PACKET` event +
+     `SSTP_IOC_RECV_CONTROL` ioctl ([`kmod/sstp_demux.c`](kmod/sstp_demux.c),
+     [`kmod/sstp_event.c`](kmod/sstp_event.c)), and TLS 1.3
+     `KeyUpdate` / `NewSessionTicket` detection via
+     `TLS_GET_RECORD_TYPE` cmsg surfacing
+     `SSTP_EVT_TLS_REKEY_NEEDED`. ABI frozen at minor 2; see
+     [kernel-abi/sstp.h](kernel-abi/sstp.h) for the wire layout
+     and [`kmod/tests/test_sstp.c`](kmod/tests/test_sstp.c) for
+     the lifecycle harness.
    - **Wire `DataPath::open` to actually request the kernel
      path.** Today [`src/session.rs`](src/session.rs) falls back
      in `Auto` mode whenever `ktls_eligibility().compatible` is
@@ -190,9 +193,13 @@ independent paths, listed in order of strategic priority:
      0 → 84 (the assertion is now hard, not informational).
    - Cons unchanged from the original plan: per-packet
      userspace round-trip caps throughput at ~1–2 Gbps per
-     session, and we lose `ppp_generic`'s NP-mode filtering /
-     VJ negotiation (the kmod path will retain these). The
-     RX direction (server → client) requires routing rules on
+     session. The kmod path runs frames through
+     `ppp_input()` so it keeps `ppp_generic`'s NP-mode
+     filtering and the rest of the unit-side machinery; the
+     TUN backend hands raw IP straight to the kernel netdev
+     and bypasses `ppp_generic` entirely (no NP filtering, no
+     unit-side `ip -s link show pppN` accounting). The RX
+     direction (server → client) requires routing rules on
      the host to send return traffic via `tun0` — out of scope
      for the data-path code itself.
 

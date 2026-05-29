@@ -18,21 +18,19 @@
 use std::time::{Duration, Instant};
 
 use super::auth::pap;
-use super::fsm::{
-    DEFAULT_RESTART, Event as FsmEvent, Fsm, Notify as FsmNotify, RestartTimer,
-    Send as FsmSend, State as FsmState, StepOut as FsmStep,
-};
 use super::frame::{
-    ADDRESS_ALL_STATIONS, CONTROL_UI, FrameError, PppFrame, ProtocolId, decode_frame,
-    encode_frame,
+    ADDRESS_ALL_STATIONS, CONTROL_UI, FrameError, PppFrame, ProtocolId, decode_frame, encode_frame,
+};
+use super::fsm::{
+    DEFAULT_RESTART, Event as FsmEvent, Fsm, Notify as FsmNotify, RestartTimer, Send as FsmSend,
+    State as FsmState, StepOut as FsmStep,
 };
 use super::ipcp::{
     IPV4_OPTION_TOTAL_LEN, IpcpCode, IpcpOptionId, read_ipv4_value, write_ipv4_option,
 };
 use super::lcp::{
-    self, ConfigOption, ConfigOptionIter, LCP_HEADER_LEN, LCP_OPT_HEADER_LEN, LcpCode,
-    LcpOptionId, LcpPacket, auth_protocol_pap, decode_lcp_packet, write_lcp_header,
-    write_option,
+    self, ConfigOption, ConfigOptionIter, LCP_HEADER_LEN, LCP_OPT_HEADER_LEN, LcpCode, LcpOptionId,
+    LcpPacket, auth_protocol_pap, decode_lcp_packet, write_lcp_header, write_option,
 };
 
 /// Which sub-protocol's restart timer the [`PppStep`] is asking to
@@ -82,10 +80,7 @@ pub enum PppEvent {
     /// Peer sent PAP `Authenticate-Request`; the session task must
     /// run RADIUS (M6e) and feed the verdict back via
     /// [`Ppp::on_auth_result`].
-    NeedPapAuth {
-        peer_id: Vec<u8>,
-        password: Vec<u8>,
-    },
+    NeedPapAuth { peer_id: Vec<u8>, password: Vec<u8> },
     /// IPCP converged: the kernel-PPP layer (M6g) can now bring the
     /// `pppN` interface up with the assigned addresses.
     NetworkUp(AssignedAddrs),
@@ -772,7 +767,10 @@ fn encode_pap_frame(packet: &[u8]) -> Vec<u8> {
 /// Identifier + Length + body) for the given protocol id.
 fn encode_protocol_packet(protocol: u16, code: u8, identifier: u8, body: &[u8]) -> Vec<u8> {
     let total = LCP_HEADER_LEN + body.len();
-    debug_assert!(u16::try_from(total).is_ok(), "PPP protocol packet too large");
+    debug_assert!(
+        u16::try_from(total).is_ok(),
+        "PPP protocol packet too large"
+    );
     let mut header = [0u8; LCP_HEADER_LEN];
     #[allow(clippy::cast_possible_truncation)]
     write_lcp_header(&mut header, code, identifier, total as u16);
@@ -880,9 +878,13 @@ mod tests {
         let mut ppp = Ppp::new();
         let _ = ppp.open();
         // Client sends an Ack to our CR (using id=1, the bumped id).
-        let ack = encode_lcp_frame(LcpCode::ConfigureAck, 1, &[
-            0x03, 0x04, 0xc0, 0x23, // Auth-Protocol = PAP
-        ]);
+        let ack = encode_lcp_frame(
+            LcpCode::ConfigureAck,
+            1,
+            &[
+                0x03, 0x04, 0xc0, 0x23, // Auth-Protocol = PAP
+            ],
+        );
         let _step = ppp.on_frame(&ack);
         assert!(matches!(ppp.phase, Phase::Establish));
         // Client sends its own CR — empty (accept defaults).
@@ -898,9 +900,7 @@ mod tests {
     fn drive_to_auth_pending(ppp: &mut Ppp) {
         let _ = ppp.open();
         // Ack our CR.
-        let ack = encode_lcp_frame(LcpCode::ConfigureAck, 1, &[
-            0x03, 0x04, 0xc0, 0x23,
-        ]);
+        let ack = encode_lcp_frame(LcpCode::ConfigureAck, 1, &[0x03, 0x04, 0xc0, 0x23]);
         let _ = ppp.on_frame(&ack);
         // Peer CR (empty) — we Ack it, LCP Opened.
         let cr = lcp_cr(5, &[]);

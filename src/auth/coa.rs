@@ -191,7 +191,13 @@ impl CoaListener {
         trace!(?peer, code = ?header.code, ?identity, "coa: dispatching");
 
         let outcome = self.handler.handle(header.code, peer, identity);
-        let reply = build_reply(header.code, header.identifier, outcome, &header.authenticator, secret);
+        let reply = build_reply(
+            header.code,
+            header.identifier,
+            outcome,
+            &header.authenticator,
+            secret,
+        );
         self.socket.send_to(reply.as_bytes(), peer).await.ok();
         Ok(())
     }
@@ -221,12 +227,10 @@ fn decode_identity(attrs: &[u8]) -> Identity {
                 out.username = std::str::from_utf8(raw.value()).ok().map(str::to_owned);
             }
             t if t == rfc::attrs::ACCT_SESSION_ID.code => {
-                out.acct_session_id =
-                    std::str::from_utf8(raw.value()).ok().map(str::to_owned);
+                out.acct_session_id = std::str::from_utf8(raw.value()).ok().map(str::to_owned);
             }
             t if t == rfc::attrs::CALLING_STATION_ID.code => {
-                out.calling_station_id =
-                    std::str::from_utf8(raw.value()).ok().map(str::to_owned);
+                out.calling_station_id = std::str::from_utf8(raw.value()).ok().map(str::to_owned);
             }
             t if t == rfc::attrs::FRAMED_IP_ADDRESS.code => {
                 if let Ok(arr) = <[u8; 4]>::try_from(raw.value()) {
@@ -439,11 +443,9 @@ mod tests {
     async fn bad_secret_drops_silently() {
         let mut peers = PeerSecrets::new();
         peers.insert("127.0.0.1".parse().unwrap(), secret());
-        let listener = CoaListener::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            peers,
-            |_, _, _| panic!("handler must not run on bad-auth packet"),
-        )
+        let listener = CoaListener::bind("127.0.0.1:0".parse().unwrap(), peers, |_, _, _| {
+            panic!("handler must not run on bad-auth packet")
+        })
         .await
         .unwrap();
         let listener_addr = listener.local_addr().unwrap();

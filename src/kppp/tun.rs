@@ -148,8 +148,8 @@ impl TunSession {
     /// strip the PPP protocol header, and write the IP body to the
     /// tun fd. Caller must have filtered for IP protocols.
     pub async fn write_frame(&self, ppp_frame: &[u8]) -> io::Result<usize> {
-        let parsed = decode_frame(ppp_frame)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let parsed =
+            decode_frame(ppp_frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         if !matches!(
             ProtocolId::from_u16(parsed.protocol),
             Some(ProtocolId::Ip | ProtocolId::Ipv6)

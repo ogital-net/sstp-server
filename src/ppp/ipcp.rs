@@ -200,10 +200,8 @@ mod tests {
         //   Primary-DNS(129) len=6 0.0.0.0
         //   Secondary-DNS(131) len=6 0.0.0.0
         let buf = [
-            0x01, 0x01, 0x00, 0x16,
-            0x03, 0x06, 0x00, 0x00, 0x00, 0x00,
-            0x81, 0x06, 0x00, 0x00, 0x00, 0x00,
-            0x83, 0x06, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x01, 0x00, 0x16, 0x03, 0x06, 0x00, 0x00, 0x00, 0x00, 0x81, 0x06, 0x00, 0x00,
+            0x00, 0x00, 0x83, 0x06, 0x00, 0x00, 0x00, 0x00,
         ];
         let packet = decode_lcp_packet(&buf).unwrap();
         assert_eq!(packet.code, IpcpCode::ConfigureRequest.as_u8());
@@ -213,7 +211,10 @@ mod tests {
         let opts: Vec<_> = (&mut iter).collect::<Result<_, _>>().unwrap();
         assert_eq!(opts.len(), 3);
 
-        let typed: Vec<_> = opts.iter().map(|o| IpcpOptionId::from_u8(o.option_type)).collect();
+        let typed: Vec<_> = opts
+            .iter()
+            .map(|o| IpcpOptionId::from_u8(o.option_type))
+            .collect();
         assert_eq!(
             typed,
             vec![

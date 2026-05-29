@@ -491,15 +491,22 @@ mod tests {
 
     #[test]
     fn missing_cert() {
-        let err = run(&["sstp-server", "-k", "/k", "-r", "1.2.3.4:1812", "-i", "10.0.0.1"])
-            .unwrap_err();
+        let err = run(&[
+            "sstp-server",
+            "-k",
+            "/k",
+            "-r",
+            "1.2.3.4:1812",
+            "-i",
+            "10.0.0.1",
+        ])
+        .unwrap_err();
         assert!(matches!(err, ParseError::MissingRequired { flag: "cert" }));
     }
 
     #[test]
     fn missing_radius() {
-        let err =
-            run(&["sstp-server", "-c", "/c", "-k", "/k", "-i", "10.0.0.1"]).unwrap_err();
+        let err = run(&["sstp-server", "-c", "/c", "-k", "/k", "-i", "10.0.0.1"]).unwrap_err();
         assert!(matches!(
             err,
             ParseError::MissingRequired { flag: "radius" }
@@ -508,16 +515,7 @@ mod tests {
 
     #[test]
     fn missing_local_ip() {
-        let err = run(&[
-            "sstp-server",
-            "-c",
-            "/c",
-            "-k",
-            "/k",
-            "-r",
-            "1.2.3.4:1812",
-        ])
-        .unwrap_err();
+        let err = run(&["sstp-server", "-c", "/c", "-k", "/k", "-r", "1.2.3.4:1812"]).unwrap_err();
         assert!(matches!(
             err,
             ParseError::MissingRequired { flag: "local-ip" }

@@ -1,16 +1,15 @@
-# sstp.ko — Linux kernel module (v0.1 DRAFT)
+# sstp.ko — Linux kernel module (v0.2 RC)
 
 In-kernel SSTP channel driver. Pairs with the userspace
 `sstp-server` daemon: once userspace finishes the TLS handshake,
 SSTP negotiation, PPP LCP/auth/IPCP, and installs kTLS RX+TX
-crypto on the TCP socket, it hands the socket and a PPP unit
-number to this module via `ioctl(SSTP_IOC_ATTACH)`. The module
-then registers a `ppp_channel` and (eventually) runs the
-steady-state SSTP demux entirely in kernel context.
+crypto on the TCP socket, it hands the socket to this module via
+`ioctl(SSTP_IOC_ATTACH)`. The module registers a `ppp_channel`
+and runs the steady-state SSTP demux entirely in kernel context.
 
-**v0.1 status.** The module compiles cleanly and exercises the
-full attach/detach lifecycle plus the per-frame paths in both
-directions:
+**v0.2 status.** ABI frozen for the v0.x series. The module
+implements the full attach/detach lifecycle plus the per-frame
+paths in both directions:
 
 - **RX**: `sk_data_ready` hook → workqueue → `kernel_recvmsg` →
   [MS-SSTP] §2.2.3 reassembly (max 4095 B frames straddling TLS
@@ -19,20 +18,27 @@ directions:
   and tears the session down.
 - **TX**: `ppp_channel_ops.start_xmit` prepends the 4-byte SSTP
   data-packet header and `kernel_sendmsg`s on the kTLS socket;
-  short writes / hard errors abort the session.
-- **Userspace binding**: `SSTP_IOC_GET_CHAN_INDEX` returns the
-  registered channel id so userspace can `PPPIOCATTCHAN` +
-  `PPPIOCCONNECT` against its own `/dev/ppp` handle.
+  short writes / hard errors abort the session, and a full
+  socket buffer parks the channel until `sk_write_space` triggers
+  `ppp_output_wakeup()`.
+- **Control plane**: `C=1` SSTP frames are demuxed off the data
+  path, queued, and surfaced to userspace via
+  `SSTP_EVT_CONTROL_PACKET` + `SSTP_IOC_RECV_CONTROL`. TLS 1.3
+  `KeyUpdate` / `NewSessionTicket` records raise
+  `SSTP_EVT_TLS_REKEY_NEEDED`.
+- **Userspace binding**: the kmod registers the channel only.
+  Userspace fetches the channel index via
+  `SSTP_IOC_GET_CHAN_INDEX` and binds it to its already-created
+  PPP unit using the standard `ppp_generic` ABI
+  (`PPPIOCATTCHAN` + `PPPIOCCONNECT` on a fresh `/dev/ppp` fd).
+  `ppp_connect_channel()` is unexported in mainline
+  `ppp_generic`, so doing the bind from userspace is the
+  pragmatic choice.
 
-Still TODO before v0.1 ships:
-
-- Userspace `kppp` integration: wrap `SSTP_IOC_ATTACH` +
-  `SSTP_IOC_GET_CHAN_INDEX` + `PPPIOCATTCHAN` + `PPPIOCCONNECT` so
-  a session can flip from userspace to kernel data path once IPCP
-  converges, and drive `SSTP_EVT_CONTROL_PACKET` /
-  `SSTP_EVT_TLS_REKEY_NEEDED` from the session task.
-- kTLS install in `crate::crypto::tls` so the kernel path is
-  actually reachable end-to-end.
+Verified end-to-end on Linux 6.8 by
+[`tests/e2e.rs`](../tests/e2e.rs) `sstpc_pap_login`: PAP login
+over TLS 1.3 + AES-GCM, ICMP echo across the tunnel, server-side
+`pppN` `rx_bytes` grows by the expected payload count.
 
 ## Files
 
@@ -88,8 +94,8 @@ A self-contained userspace lifecycle test lives under
 [kmod/tests/](tests/). It exercises:
 
 - `/dev/sstp` open + ioctl dispatch.
-- Negative `SSTP_IOC_ATTACH` paths (bad ABI major, reserved-nonzero,
-  negative fd, non-socket fd, plain TCP without kTLS → `-EOPNOTSUPP`).
+- Negative `SSTP_IOC_ATTACH` paths (bad ABI major, negative fd,
+  non-socket fd, plain TCP without kTLS → `-EOPNOTSUPP`).
 - The happy path: loopback TCP with OpenSSL TLS 1.2 + AES-GCM and
   `SSL_OP_ENABLE_KTLS` so the kernel sees a kTLS-equipped socket;
   `ATTACH` succeeds, `GETSTATS` returns zeros, `poll()` is quiet,
@@ -105,28 +111,9 @@ make run        # builds kmod (if needed), loads it, runs test_sstp,
 Requires `libssl-dev` (OpenSSL 3.x) and passwordless `sudo` (for
 `insmod` / `rmmod` / running as `CAP_NET_ADMIN`).
 
-## Next steps
+## Roadmap
 
-In rough order:
-
-1. **Userspace integration**: the Rust `kppp` module needs an
-   `attach()` helper that wraps `SSTP_IOC_ATTACH` +
-   `SSTP_IOC_GET_CHAN_INDEX` + `PPPIOCATTCHAN` + `PPPIOCCONNECT`
-   so a session can flip from userspace to kernel data path once
-   IPCP converges. The session task also needs to poll the
-   session_fd for `SSTP_EVT_CONTROL_PACKET` (drain via
-   `SSTP_IOC_RECV_CONTROL`, feed to the SSTP state machine) and
-   for `SSTP_EVT_TLS_REKEY_NEEDED` (reinstall kTLS crypto via
-   `setsockopt(SOL_TLS, ...)` and re-attach).
-2. **kTLS install**: extract negotiated TLS 1.2 / 1.3 traffic
-   keys from aws-lc-sys and wire `TCP_ULP="tls"` +
-   `TLS_TX`/`TLS_RX` `crypto_info_*` on the socket before attach.
-   This is the single biggest piece; without it the kernel-mode
-   `SSTP_IOC_ATTACH` returns `-EOPNOTSUPP` and TUN fallback fires.
-3. **CI**: a kernel-mode smoke test in `tests/e2e.rs` once the
-   above lands.
-
-Completed in v0.1.x:
+Landed in v0.1.x → v0.2:
 
 - TX backpressure via `sk_write_space` + `ppp_output_wakeup`
   ([`sstp_demux.c`](sstp_demux.c), [`sstp_chan.c`](sstp_chan.c)).
@@ -136,3 +123,20 @@ Completed in v0.1.x:
 - TLS 1.3 KeyUpdate / NewSessionTicket detection via
   `TLS_GET_RECORD_TYPE` cmsg on `kernel_recvmsg`, surfacing
   `SSTP_EVT_TLS_REKEY_NEEDED` ([`sstp_demux.c`](sstp_demux.c)).
+- Userspace `kppp` integration: `SSTP_IOC_ATTACH` +
+  channel↔unit bind via `PPPIOCATTCHAN`/`PPPIOCCONNECT` on a
+  separate `/dev/ppp` fd held for the session lifetime.
+- kTLS install in `crate::crypto::tls` so attach succeeds against
+  TLS 1.2 / 1.3 with AES-GCM or ChaCha20-Poly1305.
+- ABI freeze for v0.x at minor 2: `struct sstp_attach` shrunk
+  to 16 bytes (no `ppp_unit` / `flags` / `reserved`);
+  `struct sstp_detach` removed (`SSTP_IOC_DETACH` is now `_IO`);
+  stats counters migrated to `atomic64_t` and gained
+  `evt_dropped`.
+
+Follow-on work (v0.3+):
+
+- Lockdep / KASAN soak tests under stress.
+- Performance numbers vs. `accel-ppp`.
+- Upstream allocation of the ioctl type byte
+  (`SSTP_IOC_MAGIC = 'S'` is provisional).

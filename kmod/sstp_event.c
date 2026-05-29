@@ -22,8 +22,8 @@
 
 /*
  * Enqueue a new event for userspace. Per-type coalescing: if the
- * ring is full we increment `evt_dropped` and overwrite the most
- * recent slot with the same type. Events are advisory; we never
+ * ring is full we increment `stats_evt_dropped` and overwrite the
+ * most recent slot with the same type. Events are advisory; we never
  * block the data path on a slow reader.
  */
 void sstp_session_emit(struct sstp_session *s, u32 type, u32 arg)
@@ -44,11 +44,9 @@ void sstp_session_emit(struct sstp_session *s, u32 type, u32 arg)
 			s->events[prev].arg = arg;
 			s->events[prev].timestamp_ns =
 				ktime_get_ns();
-			s->evt_dropped++;
-		} else {
-			s->evt_dropped++;
 		}
 		spin_unlock_irqrestore(&s->evt_lock, flags);
+		atomic64_inc(&s->stats_evt_dropped);
 		return;
 	}
 
@@ -130,10 +128,8 @@ static long sstp_session_ioctl(struct file *file, unsigned int cmd,
 
 	switch (cmd) {
 	case SSTP_IOC_DETACH: {
-		struct sstp_detach d;
-
-		if (copy_from_user(&d, uarg, sizeof(d)))
-			return -EFAULT;
+		/* `_IO` ioctl — no payload. */
+		(void)uarg;
 		/* Mark closing; the rx worker observes this and exits
 		 * its loop. The actual teardown happens on release(). */
 		mutex_lock(&s->close_lock);
@@ -144,11 +140,16 @@ static long sstp_session_ioctl(struct file *file, unsigned int cmd,
 	}
 	case SSTP_IOC_GETSTATS: {
 		struct sstp_stats out;
-		unsigned long flags;
 
-		spin_lock_irqsave(&s->stats_lock, flags);
-		out = s->stats;
-		spin_unlock_irqrestore(&s->stats_lock, flags);
+		out.tls_records_rx     = atomic64_read(&s->stats_tls_records_rx);
+		out.tls_records_tx     = atomic64_read(&s->stats_tls_records_tx);
+		out.tls_decrypt_errors = atomic64_read(&s->stats_tls_decrypt_errors);
+		out.sstp_frames_rx     = atomic64_read(&s->stats_sstp_frames_rx);
+		out.sstp_frames_tx     = atomic64_read(&s->stats_sstp_frames_tx);
+		out.sstp_malformed     = atomic64_read(&s->stats_sstp_malformed);
+		out.ppp_frames_rx      = atomic64_read(&s->stats_ppp_frames_rx);
+		out.ppp_frames_tx      = atomic64_read(&s->stats_ppp_frames_tx);
+		out.evt_dropped        = atomic64_read(&s->stats_evt_dropped);
 
 		if (copy_to_user(uarg, &out, sizeof(out)))
 			return -EFAULT;
@@ -192,20 +193,16 @@ static long sstp_session_ioctl(struct file *file, unsigned int cmd,
 
 		plen = skb->len;
 		if (rc.buf_len < plen) {
-			/* Requeue at tail so userspace can retry with a
-			 * bigger buffer. Lossy fallback if the slot is
-			 * gone: drop and report EMSGSIZE. */
-			spin_lock_irqsave(&s->ctrl_q_lock, flags);
-			if (((s->ctrl_q_head + 1) % SSTP_CTRL_Q_CAP) !=
-			    s->ctrl_q_tail) {
-				s->ctrl_q[s->ctrl_q_head] = skb;
-				s->ctrl_q_head = (s->ctrl_q_head + 1) %
-						 SSTP_CTRL_Q_CAP;
-				skb = NULL;
-			}
-			spin_unlock_irqrestore(&s->ctrl_q_lock, flags);
-			if (skb)
-				kfree_skb(skb);
+			/* User passed a too-small buffer. The frame is
+			 * already off the queue and there is no safe
+			 * place to put it back without breaking ordering
+			 * (a head-side requeue would shuffle it in front
+			 * of newer frames). Drop it and bump the
+			 * malformed counter so operators notice. The
+			 * caller's contract is to size the buffer at
+			 * SSTP_CONTROL_MAX. */
+			kfree_skb(skb);
+			atomic64_inc(&s->stats_sstp_malformed);
 			return -EMSGSIZE;
 		}
 

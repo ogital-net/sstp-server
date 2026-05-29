@@ -163,9 +163,7 @@ impl EapSession {
                 // many EAP-Message attributes the server emitted.
                 let eap_request = eap::reassemble(&attributes);
                 if eap_request.is_empty() {
-                    return Err(AuthError::Malformed(
-                        "Access-Challenge without EAP-Message",
-                    ));
+                    return Err(AuthError::Malformed("Access-Challenge without EAP-Message"));
                 }
                 // Echo the new State on the next round.
                 self.state = radius_tokio::attributes::first(&attributes, rfc::attrs::STATE)
@@ -182,9 +180,9 @@ fn project_terminal(outcome: AccessOutcome, secret: &[u8]) -> AuthResult {
             authenticator,
             attributes,
         } => super::reply::decode_accept(&attributes, secret, &authenticator),
-        AccessOutcome::Reject { attributes, .. } => {
-            Err(AuthError::Rejected(super::reply::reject_reason(&attributes)))
-        }
+        AccessOutcome::Reject { attributes, .. } => Err(AuthError::Rejected(
+            super::reply::reject_reason(&attributes),
+        )),
         AccessOutcome::Challenge { .. } => Err(AuthError::UnexpectedChallenge),
     }
 }
@@ -263,7 +261,9 @@ mod tests {
         let secret_for_server = secret.clone();
         let (server_addr, _h) = one_shot_responder(secret.clone(), move |id, ra| {
             let mut reply = Reply::new(Code::ACCESS_REJECT, id);
-            reply.add(rfc::attrs::REPLY_MESSAGE, "bad password").unwrap();
+            reply
+                .add(rfc::attrs::REPLY_MESSAGE, "bad password")
+                .unwrap();
             reply.seal_for(&ra, &secret_for_server)
         })
         .await;

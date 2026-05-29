@@ -133,6 +133,9 @@ mod tests {
         let sealed = reply.seal_for(&auth, secret);
         let attrs = &sealed.as_bytes()[20..];
         let err = decode_accept(attrs, secret, &auth).unwrap_err();
-        assert!(matches!(err, AuthError::MissingAttribute("Framed-IP-Address")));
+        assert!(matches!(
+            err,
+            AuthError::MissingAttribute("Framed-IP-Address")
+        ));
     }
 }

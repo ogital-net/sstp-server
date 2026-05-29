@@ -257,13 +257,7 @@ pub fn drop_to(id: Identity, keep: &[u32]) -> Result<(), DropError> {
     // SAFETY: capset takes a header pointer and a data pointer
     // (two-element array for version 3). Header version matches the
     // data array length.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_capset,
-            &raw const hdr,
-            data.as_ptr(),
-        )
-    };
+    let rc = unsafe { libc::syscall(libc::SYS_capset, &raw const hdr, data.as_ptr()) };
     if rc != 0 {
         return Err(DropError::syscall("capset"));
     }

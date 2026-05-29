@@ -18,8 +18,8 @@ pub mod accounting;
 pub mod bridge;
 pub mod client;
 pub mod coa;
-pub mod request;
 pub mod reply;
+pub mod request;
 
 use std::net::{Ipv4Addr, SocketAddr};
 

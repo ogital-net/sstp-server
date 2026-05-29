@@ -35,7 +35,7 @@ use std::time::Duration;
 use common::cert::gen_self_signed;
 use common::radius::{Credential, DummyRadius, PapOutcome};
 use common::spawn::ServerBuilder;
-use common::{free_tcp_port, free_udp_port, loopback, TempDir};
+use common::{TempDir, free_tcp_port, free_udp_port, loopback};
 
 const TEST_USER: &str = "alice";
 const TEST_PASS: &[u8] = b"correct horse battery";
@@ -68,7 +68,9 @@ fn sstpc_skip_reason() -> Option<String> {
     // SAFETY: getuid() has no preconditions and is signal-safe.
     let uid = unsafe { libc::getuid() };
     if uid != 0 {
-        return Some(format!("not running as root (uid={uid}); pppd needs CAP_NET_ADMIN"));
+        return Some(format!(
+            "not running as root (uid={uid}); pppd needs CAP_NET_ADMIN"
+        ));
     }
     None
 }
@@ -85,7 +87,11 @@ fn which(prog: &str) -> Option<std::path::PathBuf> {
         fallbacks.push(std::path::PathBuf::from(home).join(".local/bin"));
     }
     if let Some(user) = std::env::var_os("SUDO_USER") {
-        fallbacks.push(std::path::PathBuf::from("/home").join(user).join(".local/bin"));
+        fallbacks.push(
+            std::path::PathBuf::from("/home")
+                .join(user)
+                .join(".local/bin"),
+        );
     }
     for d in [
         "/home/vscode/.local/bin",
@@ -283,10 +289,8 @@ async fn sstpc_pap_login() {
     // window — pppd is slow to start under load. Use
     // `collect_logs_until` (not `wait_for_log`) so we also retain
     // the kmod-fallback line that arrives moments before attach.
-    let pre_attach_logs = server.collect_logs_until(
-        "kernel PPP unit attached",
-        Duration::from_secs(15),
-    );
+    let pre_attach_logs =
+        server.collect_logs_until("kernel PPP unit attached", Duration::from_secs(15));
 
     let attach_line = match pre_attach_logs.as_ref().and_then(|v| v.last()).cloned() {
         Some(line) => line,
@@ -339,16 +343,18 @@ async fn sstpc_pap_login() {
     // assertion above: closing TLS tears `pppN` down.
     let traffic_result = exercise_client_to_server_traffic(&ip_bin, &ifname);
 
-    // Capture probe-path log evidence (if /dev/sstp is present we
-    // expect the kmod attach to be attempted before fallback).
+    // Capture probe-path log evidence. With /dev/sstp loaded and a
+    // kTLS-compatible cipher, Auto escalates to Kernel and we
+    // expect the kTLS install + kmod attach to succeed. Without
+    // the kmod loaded (or with a kTLS-incompatible cipher), Auto
+    // resolves to Tun.
     let kmod_present = std::path::Path::new("/dev/sstp").exists();
-    let kmod_attach_attempted = if kmod_present {
-        pre_attach_logs
-            .iter()
-            .any(|l| l.contains("falling back to TUN"))
-    } else {
-        false
-    };
+    let kmod_attach_succeeded = pre_attach_logs
+        .iter()
+        .any(|l| l.contains("kTLS installed on TCP socket"));
+    let tun_fallback_taken = pre_attach_logs
+        .iter()
+        .any(|l| l.contains("falling back to TUN"));
 
     // Now safe to reap sstpc.
     let _ = child.kill();
@@ -387,45 +393,66 @@ async fn sstpc_pap_login() {
         "expected `{needle}` on {ifname}, got:\n{addr_str}"
     );
 
-    // Probe path: when /dev/sstp is loaded the server must at least
-    // attempt the kernel attach. v0.1 always falls back (no kTLS on
-    // the socket), so we only assert the *attempt + fallback* log.
+    // Probe path: when /dev/sstp is loaded and the negotiated TLS
+    // session is kTLS-compatible (the default with our self-signed
+    // RSA cert: TLS 1.3 AES-GCM), Auto escalates to Kernel mode.
+    // Assert the kTLS install ran and we did *not* take the TUN
+    // fallback. The `ifname` should be `pppN`, not `tunN`.
     if kmod_present {
         assert!(
-            kmod_attach_attempted,
-            "/dev/sstp exists but the server never logged a kmod attach attempt + fallback;\
-             \nis DataPath::open being called?"
+            kmod_attach_succeeded,
+            "/dev/sstp exists but kTLS install was never attempted;\n\
+             pre-attach logs:\n{}",
+            pre_attach_logs.join("\n")
+        );
+        assert!(
+            !tun_fallback_taken,
+            "kmod attach should have succeeded with kTLS, but the server fell back to TUN;\n\
+             pre-attach logs:\n{}",
+            pre_attach_logs.join("\n")
+        );
+        assert!(
+            ifname.starts_with("ppp"),
+            "expected kernel PPP unit (pppN), got `{ifname}`"
         );
     }
 
     // Traffic observation: push an ICMP echo from the client and
-    // measure the server-side interface counters. When the TUN
-    // fallback is active (the default `--data-path auto` path on
-    // any host without the sstp kmod + kTLS) the data path is
-    // real: each request should bump `server rx_bytes` by at least
-    // the ICMP payload size. When the PPP-userspace path is in
-    // use (only via explicit `--data-path userspace`) traffic does
-    // not cross the tunnel — see CLAUDE.md §Data plane.
+    // measure the server-side interface counters. Both kernel-mode
+    // (sstp kmod + kTLS, ifname=pppN) and TUN-mode (ifname=tunN)
+    // are real data paths and should bump `server rx_bytes`. The
+    // PPP-userspace path (only reachable via explicit
+    // `--data-path userspace`) is a no-op on mainline kernels and
+    // is intentionally not exercised here.
+    let kernel_path_active = ifname.starts_with("ppp") && kmod_attach_succeeded;
     let tun_path_active = ifname.starts_with("tun");
     match traffic_result {
         Ok(TrafficObservation {
-            server_rx_before, server_rx_after,
-            server_tx_before, server_tx_after,
+            server_rx_before,
+            server_rx_after,
+            server_tx_before,
+            server_tx_after,
             client_ifname,
         }) => {
+            let path_label = if kernel_path_active {
+                "kernel (sstp kmod + kTLS)"
+            } else if tun_path_active {
+                "TUN"
+            } else {
+                "PPP-userspace (informational)"
+            };
             eprintln!(
-                "traffic observation ({}):\n  \
+                "traffic observation ({path_label}):\n  \
                  client `{client_ifname}` -> server `{ifname}`:\n  \
                  server rx_bytes: {server_rx_before} -> {server_rx_after} (+{})\n  \
                  server tx_bytes: {server_tx_before} -> {server_tx_after} (+{})",
-                if tun_path_active { "TUN" } else { "PPP-userspace (informational)" },
                 server_rx_after.saturating_sub(server_rx_before),
                 server_tx_after.saturating_sub(server_tx_before),
             );
-            if tun_path_active {
+            if kernel_path_active || tun_path_active {
                 assert!(
                     server_rx_after > server_rx_before,
-                    "TUN data path active but server rx_bytes did not grow \
+                    "{path_label} data path active but server rx_bytes did not grow \
                      ({server_rx_before} -> {server_rx_after}); data path \
                      regression"
                 );
@@ -512,10 +539,13 @@ fn exercise_client_to_server_traffic(
         .ok_or_else(|| format!("could not read local addr of `{server_ifname}`"))?;
     let ping_out = Command::new("ping")
         .args([
-            "-c", "1",
-            "-W", "1",
+            "-c",
+            "1",
+            "-W",
+            "1",
             "-n",
-            "-I", &client_ifname,
+            "-I",
+            &client_ifname,
             &server_endpoint.to_string(),
         ])
         .stdin(Stdio::null())
@@ -609,11 +639,7 @@ fn read_tx_bytes(ip_bin: &std::path::Path, ifname: &str) -> Option<u64> {
     read_link_counter(ip_bin, ifname, "TX:")
 }
 
-fn read_link_counter(
-    ip_bin: &std::path::Path,
-    ifname: &str,
-    section: &str,
-) -> Option<u64> {
+fn read_link_counter(ip_bin: &std::path::Path, ifname: &str, section: &str) -> Option<u64> {
     let out = Command::new(ip_bin)
         .args(["-s", "link", "show", "dev", ifname])
         .output()

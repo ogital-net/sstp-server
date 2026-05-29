@@ -61,15 +61,23 @@ struct sstp_session {
 	struct ppp_channel    chan;
 	bool                  chan_registered;
 
-	/* Flags from struct sstp_attach.flags. */
-	u32                   flags;
 	u32                   mtu;
 
-	/* Counters returned by SSTP_IOC_GETSTATS. Updated from the
-	 * data path (rx workqueue + start_xmit) with `chan_lock`
-	 * held for tx-side counters and atomically on the rx side. */
-	struct sstp_stats     stats;
-	spinlock_t            stats_lock;
+	/* Counters surfaced by SSTP_IOC_GETSTATS. Bumped lock-free
+	 * from the rx worker, start_xmit, the event emitter, and
+	 * (for `evt_dropped`) the event-emit fast path. The ioctl
+	 * snapshots them under no lock — torn reads of a single
+	 * counter pair are harmless because every counter is
+	 * monotonically increasing, and the snapshot is advisory. */
+	atomic64_t            stats_tls_records_rx;
+	atomic64_t            stats_tls_records_tx;
+	atomic64_t            stats_tls_decrypt_errors;
+	atomic64_t            stats_sstp_frames_rx;
+	atomic64_t            stats_sstp_frames_tx;
+	atomic64_t            stats_sstp_malformed;
+	atomic64_t            stats_ppp_frames_rx;
+	atomic64_t            stats_ppp_frames_tx;
+	atomic64_t            stats_evt_dropped;
 
 	/* Event ring drained via read(session_fd). Bounded by
 	 * SSTP_EVENT_QUEUE_CAP — entry SSTP_EVENT_QUEUE_CAP+1 wins
@@ -77,7 +85,6 @@ struct sstp_session {
 	struct sstp_event     events[SSTP_EVENT_QUEUE_CAP];
 	u32                   evt_head;      /* next slot to write */
 	u32                   evt_tail;      /* next slot to read */
-	u32                   evt_dropped;   /* coalesced events */
 	wait_queue_head_t     evt_wait;
 	spinlock_t            evt_lock;
 

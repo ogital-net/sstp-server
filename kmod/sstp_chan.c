@@ -23,7 +23,6 @@ static int sstp_chan_start_xmit(struct ppp_channel *chan,
 				struct sk_buff *skb)
 {
 	struct sstp_session *s = chan->private;
-	unsigned long flags;
 	u8 hdr[SSTP_HEADER_LEN];
 	struct kvec iov[2];
 	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
@@ -37,9 +36,7 @@ static int sstp_chan_start_xmit(struct ppp_channel *chan,
 	if (total > SSTP_MAX_PACKET_LEN) {
 		/* Larger than what the 12-bit Length field can carry.
 		 * ppp_generic enforces MRU but defence in depth. */
-		spin_lock_irqsave(&s->stats_lock, flags);
-		s->stats.sstp_malformed++;
-		spin_unlock_irqrestore(&s->stats_lock, flags);
+		atomic64_inc(&s->stats_sstp_malformed);
 		kfree_skb(skb);
 		return 1;
 	}
@@ -58,11 +55,9 @@ static int sstp_chan_start_xmit(struct ppp_channel *chan,
 	ret = kernel_sendmsg(s->tcp_sock, &msg, iov, 2, total);
 
 	if (ret == (int)total) {
-		spin_lock_irqsave(&s->stats_lock, flags);
-		s->stats.ppp_frames_tx++;
-		s->stats.sstp_frames_tx++;
-		s->stats.tls_records_tx++;
-		spin_unlock_irqrestore(&s->stats_lock, flags);
+		atomic64_inc(&s->stats_ppp_frames_tx);
+		atomic64_inc(&s->stats_sstp_frames_tx);
+		atomic64_inc(&s->stats_tls_records_tx);
 		kfree_skb(skb);
 		return 1;
 	}

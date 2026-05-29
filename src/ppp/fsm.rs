@@ -620,7 +620,11 @@ impl Fsm {
 
             // --- RXJ- (catastrophic Code-Reject) ----------------------
             (S::Closed | S::Stopped, E::RcvCodeRejCatastrophic) => StepOut {
-                new_state: if from == S::Closed { S::Closed } else { S::Stopped },
+                new_state: if from == S::Closed {
+                    S::Closed
+                } else {
+                    S::Stopped
+                },
                 notify: Notify {
                     finished: true,
                     ..Notify::default()
@@ -677,10 +681,7 @@ impl Fsm {
         // Decrement the restart counter every time we transmit a
         // Configure-Request or Terminate-Request (RFC 1661 §4.2 "scr"
         // and "str" both consume one count).
-        if matches!(
-            out.send,
-            Some(Send::ConfigureRequest | Send::TerminateReq)
-        ) {
+        if matches!(out.send, Some(Send::ConfigureRequest | Send::TerminateReq)) {
             self.restart_counter = self.restart_counter.saturating_sub(1);
         }
         if matches!(
