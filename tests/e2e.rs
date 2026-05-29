@@ -74,18 +74,29 @@ fn sstpc_skip_reason() -> Option<String> {
 }
 
 fn which(prog: &str) -> Option<std::path::PathBuf> {
-    // Fallback to well-known install locations. The VS Code test
-    // runner inherits a stripped PATH that often omits
-    // `~/.local/bin` and `/opt/*/sbin`, so the shell-level `which`
-    // succeeds while the in-test probe used to skip. Check the
-    // dev-container's canonical sstpc paths directly.
-    const FALLBACKS: &[&str] = &[
+    // Fallback to well-known install locations. Under `sudo` PATH is
+    // sanitised (secure_path), so the shell-level `which` succeeds
+    // while a bare `Command::new("sstpc")` fails with ENOENT. Resolve
+    // up front and let callers pass the absolute path to `Command`.
+    let mut fallbacks: Vec<std::path::PathBuf> = Vec::new();
+    // `sudo -E` preserves HOME; without -E it's root's. Try both the
+    // invoking user's home (via SUDO_USER) and $HOME.
+    if let Some(home) = std::env::var_os("HOME") {
+        fallbacks.push(std::path::PathBuf::from(home).join(".local/bin"));
+    }
+    if let Some(user) = std::env::var_os("SUDO_USER") {
+        fallbacks.push(std::path::PathBuf::from("/home").join(user).join(".local/bin"));
+    }
+    for d in [
         "/home/vscode/.local/bin",
         "/opt/sstp-client/sbin",
+        "/opt/sstp-client/bin",
         "/usr/local/sbin",
         "/usr/sbin",
         "/sbin",
-    ];
+    ] {
+        fallbacks.push(std::path::PathBuf::from(d));
+    }
     // PATH first, so an explicit override wins.
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -95,8 +106,8 @@ fn which(prog: &str) -> Option<std::path::PathBuf> {
             }
         }
     }
-    for dir in FALLBACKS {
-        let cand = std::path::Path::new(dir).join(prog);
+    for dir in fallbacks {
+        let cand = dir.join(prog);
         if cand.is_file() {
             return Some(cand);
         }
@@ -221,28 +232,43 @@ async fn sstpc_pap_login() {
         .spawn(SERVER_READY);
 
     // sstpc usage:
-    //   sstpc [opts] <hostname> [pppd opts]
-    // `noauth` disables peer-auth requirements; `user`/`password`
-    // give pppd the PAP credentials it offers when the server
-    // proposes Auth-Protocol=PAP.
+    //   sstpc <sstp-options> <hostname> [[--] <pppd-options>]
+    // The sstpc binary takes `--user` / `--password` for the SSTP
+    // auth pass-through; pppd then negotiates PAP using credentials
+    // supplied via its own `user`/`password` directives. We pass
+    // both. `--priv-dir` overrides the compiled-in default
+    // (`$PREFIX/var/run/sstpc`) which the dev-container's install
+    // never created; point it at our scratch dir.
     let host = format!("127.0.0.1:{sstp_port}");
+    let sstpc_bin = which("sstpc").expect("sstpc resolved by skip probe");
+    let priv_dir = tmp.path().join("sstpc-priv");
+    std::fs::create_dir_all(&priv_dir).expect("mkdir sstpc priv-dir");
+    let priv_dir_str = priv_dir.to_string_lossy().into_owned();
+    let pass_str = String::from_utf8_lossy(TEST_PASS).into_owned();
     let sstpc = tokio::task::spawn_blocking(move || {
-        Command::new("sstpc")
+        Command::new(&sstpc_bin)
             .args([
                 "--cert-warn",
                 "--save-server-route",
                 "--log-stderr",
                 "--log-level",
                 "4",
+                "--priv-dir",
+                &priv_dir_str,
+                "--user",
+                TEST_USER,
+                "--password",
+                &pass_str,
                 &host,
+                "--",
                 "noauth",
                 "noipdefault",
                 "nodefaultroute",
                 "user",
                 TEST_USER,
                 "password",
+                &pass_str,
             ])
-            .arg(String::from_utf8_lossy(TEST_PASS).into_owned())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -254,32 +280,79 @@ async fn sstpc_pap_login() {
     // The decisive event is M6g's "kernel PPP unit attached" log
     // line, emitted once IPCP converges and the netlink bring-up
     // succeeds. Give the full PAP + IPCP round-trip a generous
-    // window — pppd is slow to start under load.
-    let attach_line = server.wait_for_log("kernel PPP unit attached", Duration::from_secs(15));
+    // window — pppd is slow to start under load. Use
+    // `collect_logs_until` (not `wait_for_log`) so we also retain
+    // the kmod-fallback line that arrives moments before attach.
+    let pre_attach_logs = server.collect_logs_until(
+        "kernel PPP unit attached",
+        Duration::from_secs(15),
+    );
 
-    // Reap sstpc unconditionally so we don't leak the child if an
-    // assertion below fires.
-    let _ = child.kill();
-    let out = child.wait_with_output().expect("reap sstpc");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-
-    let attach_line = attach_line.unwrap_or_else(|| {
-        panic!(
-            "did not see 'kernel PPP unit attached' within 15s.\n\
-             sstpc stdout:\n{stdout}\nsstpc stderr:\n{stderr}\n\
-             server logs:\n{}",
-            server.drain_logs().join("\n")
-        )
-    });
+    let attach_line = match pre_attach_logs.as_ref().and_then(|v| v.last()).cloned() {
+        Some(line) => line,
+        None => {
+            // Reap before panicking so we don't leak the child.
+            let _ = child.kill();
+            let out = child.wait_with_output().expect("reap sstpc");
+            panic!(
+                "did not see 'kernel PPP unit attached' within 15s.\n\
+                 sstpc stdout:\n{}\nsstpc stderr:\n{}\n\
+                 server logs:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+                server.drain_logs().join("\n")
+            );
+        }
+    };
+    let pre_attach_logs = pre_attach_logs.expect("checked above");
 
     // Pull the netdev name out of the structured log so the
     // post-condition check targets the exact interface this test
     // brought up (avoids racing against parallel test runs that
     // might also be creating `pppN` units).
     let ifname = extract_kv(&attach_line, "ifname").unwrap_or_else(|| {
+        let _ = child.kill();
         panic!("no 'ifname=' field in attach log line: {attach_line}")
     });
+
+    // Kernel-side post-condition: the netdev the server logged
+    // exists and carries the Framed-IP-Address as its P2P peer.
+    // **Do this before reaping sstpc** — closing the TLS socket
+    // tears the session down, which removes `pppN` instantly.
+    let ip_bin = which("ip").unwrap_or_else(|| std::path::PathBuf::from("/usr/sbin/ip"));
+    let ip_out = Command::new(&ip_bin)
+        .args(["-o", "addr", "show", "dev", &ifname])
+        .output()
+        .expect("invoke `ip addr show`");
+
+    // Half-duplex traffic check: push a single ICMP echo from the
+    // sstpc-side `pppN` toward the server's tunnel endpoint, then
+    // assert the server's `pppN` RX counter grew. This proves the
+    // client→server data direction actually carries IP frames
+    // end-to-end (sstpc → TLS → SSTP demux → KpppSession::write_frame
+    // → kernel pppN). Server→client direction is *not* tested here
+    // because, without the sstp kmod + kTLS, the kernel never hands
+    // TX frames back to the unit-fd reader (mainline ppp_generic
+    // dispatches them through channels) — see session.rs.
+    //
+    // Done *before* reaping sstpc for the same reason as the addr
+    // assertion above: closing TLS tears `pppN` down.
+    let traffic_result = exercise_client_to_server_traffic(&ip_bin, &ifname);
+
+    // Capture probe-path log evidence (if /dev/sstp is present we
+    // expect the kmod attach to be attempted before fallback).
+    let kmod_present = std::path::Path::new("/dev/sstp").exists();
+    let kmod_attach_attempted = if kmod_present {
+        pre_attach_logs
+            .iter()
+            .any(|l| l.contains("falling back to TUN"))
+    } else {
+        false
+    };
+
+    // Now safe to reap sstpc.
+    let _ = child.kill();
+    let _ = child.wait_with_output().expect("reap sstpc");
 
     // RADIUS-side post-conditions: exactly one Access-Request, for
     // our user, with a matching PAP password.
@@ -301,12 +374,7 @@ async fn sstpc_pap_login() {
         "RADIUS PAP outcome != Match: {req:#?}"
     );
 
-    // Kernel-side post-condition: the netdev the server logged
-    // exists and carries the Framed-IP-Address as its P2P peer.
-    let ip_out = Command::new("ip")
-        .args(["-o", "addr", "show", "dev", &ifname])
-        .output()
-        .expect("invoke `ip addr show`");
+    // Validate the netdev assertions captured earlier.
     assert!(
         ip_out.status.success(),
         "`ip addr show {ifname}` failed: {:?}",
@@ -318,13 +386,265 @@ async fn sstpc_pap_login() {
         addr_str.contains(&needle),
         "expected `{needle}` on {ifname}, got:\n{addr_str}"
     );
+
+    // Probe path: when /dev/sstp is loaded the server must at least
+    // attempt the kernel attach. v0.1 always falls back (no kTLS on
+    // the socket), so we only assert the *attempt + fallback* log.
+    if kmod_present {
+        assert!(
+            kmod_attach_attempted,
+            "/dev/sstp exists but the server never logged a kmod attach attempt + fallback;\
+             \nis DataPath::open being called?"
+        );
+    }
+
+    // Traffic observation: push an ICMP echo from the client and
+    // measure the server-side interface counters. When the TUN
+    // fallback is active (the default `--data-path auto` path on
+    // any host without the sstp kmod + kTLS) the data path is
+    // real: each request should bump `server rx_bytes` by at least
+    // the ICMP payload size. When the PPP-userspace path is in
+    // use (only via explicit `--data-path userspace`) traffic does
+    // not cross the tunnel — see CLAUDE.md §Data plane.
+    let tun_path_active = ifname.starts_with("tun");
+    match traffic_result {
+        Ok(TrafficObservation {
+            server_rx_before, server_rx_after,
+            server_tx_before, server_tx_after,
+            client_ifname,
+        }) => {
+            eprintln!(
+                "traffic observation ({}):\n  \
+                 client `{client_ifname}` -> server `{ifname}`:\n  \
+                 server rx_bytes: {server_rx_before} -> {server_rx_after} (+{})\n  \
+                 server tx_bytes: {server_tx_before} -> {server_tx_after} (+{})",
+                if tun_path_active { "TUN" } else { "PPP-userspace (informational)" },
+                server_rx_after.saturating_sub(server_rx_before),
+                server_tx_after.saturating_sub(server_tx_before),
+            );
+            if tun_path_active {
+                assert!(
+                    server_rx_after > server_rx_before,
+                    "TUN data path active but server rx_bytes did not grow \
+                     ({server_rx_before} -> {server_rx_after}); data path \
+                     regression"
+                );
+            }
+        }
+        Err(reason) => {
+            // Same skip policy as before: missing client pppN is
+            // outside our control (pppd IPCP), genuine errors panic.
+            assert!(
+                reason.contains("client-side"),
+                "traffic check failed: {reason}\nserver logs:\n{}",
+                server.drain_logs().join("\n")
+            );
+            eprintln!("SKIP traffic observation: {reason}");
+        }
+    }
 }
 
-/// Extract `key=value` from a tracing-formatted log line. Returns the
-/// trimmed value (terminated by whitespace) or `None` if the key is
-/// absent. Used by the e2e test to pluck `ifname=ppp0` out of the
-/// "kernel PPP unit attached" line.
+/// Outcome of the half-duplex traffic exercise. See
+/// [`exercise_client_to_server_traffic`]. v0.1 records both
+/// directions because neither one moves data through the tunnel
+/// without the sstp kmod + kTLS (see CLAUDE.md "Data plane").
+struct TrafficObservation {
+    server_rx_before: u64,
+    server_rx_after: u64,
+    server_tx_before: u64,
+    server_tx_after: u64,
+    client_ifname: String,
+}
+
+/// Find the sstpc-side `pppN` (the one whose local address is
+/// `TEST_FRAMED_IP`), snapshot the *server*-side `pppN` rx_bytes
+/// counter, fire a single `ping` from the client interface to the
+/// server endpoint, then re-read the counter. Returns the before/
+/// after pair on success, or a descriptive error string explaining
+/// why the exercise could not be performed (caller decides whether
+/// to skip or fail).
+fn exercise_client_to_server_traffic(
+    ip_bin: &std::path::Path,
+    server_ifname: &str,
+) -> Result<TrafficObservation, String> {
+    // Wait up to ~5s for pppd (on the sstpc side) to bring up its
+    // own pppN with the negotiated Framed-IP-Address. IPCP completes
+    // on the server side before pppd finishes its own kernel-side
+    // bring-up, so the client interface usually appears a few
+    // hundred milliseconds after our "kernel PPP unit attached" log.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let client_ifname = loop {
+        if let Some(name) = find_ifname_with_local_addr(ip_bin, TEST_FRAMED_IP) {
+            // Don't return our *own* server-side interface even in
+            // the (impossible-by-construction) case the local addr
+            // matched there.
+            if name != server_ifname {
+                break name;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "client-side pppN with local addr {TEST_FRAMED_IP} did not \
+                 appear within 5s (pppd may have failed IPCP)"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let rx_before = read_rx_bytes(ip_bin, server_ifname)
+        .ok_or_else(|| format!("could not read rx_bytes on server-side `{server_ifname}`"))?;
+    let tx_before = read_tx_bytes(ip_bin, server_ifname)
+        .ok_or_else(|| format!("could not read tx_bytes on server-side `{server_ifname}`"))?;
+
+    // -I binds source IP / outgoing interface so the packet is
+    // forced out the client pppN regardless of routing-table
+    // preference (the server's tunnel endpoint is *also* local on
+    // this single-host setup; without -I the kernel would short-
+    // circuit via `lo`). -c 1 sends one echo, -W 1 waits up to a
+    // second for the reply, -n suppresses reverse DNS.
+    //
+    // The reply may or may not come back — depending on how the
+    // host's routing table resolves the return path it might loop
+    // through `lo`. We don't care: the assertion is about the
+    // request reaching the *server* pppN, which is what M6g's
+    // userspace forwarder must deliver.
+    let server_endpoint = local_addr_of(ip_bin, server_ifname)
+        .ok_or_else(|| format!("could not read local addr of `{server_ifname}`"))?;
+    let ping_out = Command::new("ping")
+        .args([
+            "-c", "1",
+            "-W", "1",
+            "-n",
+            "-I", &client_ifname,
+            &server_endpoint.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn ping: {e}"))?;
+    // Ignore ping exit status — see comment above.
+    let _ = ping_out;
+
+    // Give the kernel a moment to update interface stats after the
+    // packet is delivered (the counter update happens in the
+    // softirq path; nominally instantaneous, but a small grace
+    // makes the test less flaky on a loaded box).
+    std::thread::sleep(Duration::from_millis(200));
+
+    let rx_after = read_rx_bytes(ip_bin, server_ifname)
+        .ok_or_else(|| format!("could not re-read rx_bytes on `{server_ifname}`"))?;
+    let tx_after = read_tx_bytes(ip_bin, server_ifname)
+        .ok_or_else(|| format!("could not re-read tx_bytes on `{server_ifname}`"))?;
+
+    Ok(TrafficObservation {
+        server_rx_before: rx_before,
+        server_rx_after: rx_after,
+        server_tx_before: tx_before,
+        server_tx_after: tx_after,
+        client_ifname,
+    })
+}
+
+/// Walk `ip -j addr show` and return the name of any interface
+/// carrying `target` as one of its local IPv4 addresses. Returns the
+/// first match (most setups only ever have one).
+fn find_ifname_with_local_addr(ip_bin: &std::path::Path, target: Ipv4Addr) -> Option<String> {
+    let out = Command::new(ip_bin)
+        .args(["-o", "-4", "addr", "show"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let txt = String::from_utf8_lossy(&out.stdout);
+    let needle = format!(" inet {target}");
+    for line in txt.lines() {
+        if line.contains(&needle) {
+            // `ip -o addr show` lines look like:
+            //   "21: ppp2    inet 10.99.0.42 peer 10.255.255.1/32 ..."
+            // Grab field 1 (after the leading "N: ").
+            let after_idx = line.find(": ").map(|i| i + 2)?;
+            let rest = &line[after_idx..];
+            let name = rest.split_ascii_whitespace().next()?.to_string();
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Return the local IPv4 address of `ifname` as reported by
+/// `ip -o -4 addr show dev <ifname>`. Returns `None` on parse
+/// failure or no address.
+fn local_addr_of(ip_bin: &std::path::Path, ifname: &str) -> Option<Ipv4Addr> {
+    let out = Command::new(ip_bin)
+        .args(["-o", "-4", "addr", "show", "dev", ifname])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let txt = String::from_utf8_lossy(&out.stdout);
+    let mut tokens = txt.split_ascii_whitespace();
+    while let Some(t) = tokens.next() {
+        if t == "inet" {
+            let addr_with_mask = tokens.next()?;
+            let addr = addr_with_mask.split('/').next()?;
+            return addr.parse().ok();
+        }
+    }
+    None
+}
+
+/// Read `rx_bytes` from `ip -s link show dev <ifname>`. The `-s`
+/// output is space-separated and the rx-byte counter is the first
+/// integer on the line immediately following "RX: bytes packets ...".
+fn read_rx_bytes(ip_bin: &std::path::Path, ifname: &str) -> Option<u64> {
+    read_link_counter(ip_bin, ifname, "RX:")
+}
+
+/// Read `tx_bytes` from `ip -s link show dev <ifname>`. Symmetric
+/// counterpart to [`read_rx_bytes`].
+fn read_tx_bytes(ip_bin: &std::path::Path, ifname: &str) -> Option<u64> {
+    read_link_counter(ip_bin, ifname, "TX:")
+}
+
+fn read_link_counter(
+    ip_bin: &std::path::Path,
+    ifname: &str,
+    section: &str,
+) -> Option<u64> {
+    let out = Command::new(ip_bin)
+        .args(["-s", "link", "show", "dev", ifname])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let txt = String::from_utf8_lossy(&out.stdout);
+    let mut lines = txt.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_start().starts_with(section) {
+            let values = lines.next()?;
+            return values.split_ascii_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// Extract `key=value` (text format) or `"key":"value"` (JSON
+/// format) from a tracing log line. Returns the value or `None` if
+/// absent. Used by the e2e test to pluck `ifname=ppp0` (or
+/// `"ifname":"ppp0"`) out of the "kernel PPP unit attached" line.
 fn extract_kv(line: &str, key: &str) -> Option<String> {
+    // JSON-style: "key":"value"
+    let json_needle = format!("\"{key}\":\"");
+    if let Some(start) = line.find(&json_needle) {
+        let rest = &line[start + json_needle.len()..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        return Some(rest[..end].to_string());
+    }
+    // Text-style: key=value
     let needle = format!("{key}=");
     let start = line.find(&needle)? + needle.len();
     let rest = &line[start..];

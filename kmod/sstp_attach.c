@@ -36,6 +36,12 @@ static void sstp_session_release(struct kref *ref)
 
 	kfree(s->rx_buf);
 
+	/* Drop any control packets userspace never drained. */
+	while (s->ctrl_q_head != s->ctrl_q_tail) {
+		kfree_skb(s->ctrl_q[s->ctrl_q_tail]);
+		s->ctrl_q_tail = (s->ctrl_q_tail + 1) % SSTP_CTRL_Q_CAP;
+	}
+
 	if (s->tcp_file)
 		fput(s->tcp_file);
 
@@ -117,10 +123,10 @@ long sstp_do_attach(struct file *misc_file,
 	kref_init(&s->ref);
 	spin_lock_init(&s->stats_lock);
 	spin_lock_init(&s->evt_lock);
+	spin_lock_init(&s->ctrl_q_lock);
 	init_waitqueue_head(&s->evt_wait);
 	mutex_init(&s->close_lock);
 	INIT_WORK(&s->rx_work, sstp_rx_worker);
-	s->ppp_unit = a.ppp_unit;
 	s->flags = a.flags;
 	s->mtu = a.mtu ? a.mtu : 1500;
 
@@ -150,10 +156,10 @@ long sstp_do_attach(struct file *misc_file,
 	if (ret)
 		goto err_free;
 
-	/* PPP channel ops. We don't bind to a specific unit number
-	 * here — userspace will issue PPPIOCATTCHAN/PPPIOCCONNECT on
-	 * its own /dev/ppp handle using the channel number we expose
-	 * via SSTP_IOC_GETSTATS (TODO: separate ioctl). */
+	/* PPP channel ops. The kernel registers a channel only; the
+	 * unit binding is owned by userspace, which calls
+	 * `PPPIOCATTCHAN` + `PPPIOCCONNECT` on its own /dev/ppp handle
+	 * with the channel index returned by SSTP_IOC_GET_CHAN_INDEX. */
 	s->chan.private = s;
 	s->chan.ops = &sstp_chan_ops;
 	s->chan.mtu = s->mtu;
@@ -177,20 +183,21 @@ long sstp_do_attach(struct file *misc_file,
 
 	/* Anon-inode fd for the session. The caller's userspace will
 	 * poll/read/ioctl this fd; closing it triggers detach via
-	 * sstp_session_fops.release. */
+	 * sstp_session_fops.release. The file inherits the kref_init
+	 * reference; on success we hand it off and return without
+	 * an explicit put. On failure below the err_free path puts
+	 * that reference and runs the kref release callback. */
 	session_fd = get_unused_fd_flags(O_CLOEXEC);
 	if (session_fd < 0) {
 		ret = session_fd;
 		goto err_free;
 	}
 
-	sstp_session_get(s); /* file holds a reference */
 	session_file = anon_inode_getfile("[sstp-session]",
 					  &sstp_session_fops, s,
 					  O_RDWR | O_CLOEXEC);
 	if (IS_ERR(session_file)) {
 		ret = PTR_ERR(session_file);
-		sstp_session_put(s);
 		put_unused_fd(session_fd);
 		goto err_free;
 	}

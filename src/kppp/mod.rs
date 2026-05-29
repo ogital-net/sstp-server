@@ -48,6 +48,7 @@ pub mod ioctl;
 pub mod netlink;
 pub mod session;
 pub mod sstp_kmod;
+pub mod tun;
 pub mod unit;
 
 /// IPv4 configuration applied to a `pppN` interface after IPCP.

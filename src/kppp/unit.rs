@@ -81,9 +81,19 @@ impl Unit {
         format!("ppp{}", self.index)
     }
 
-    /// Borrow the unit fd. The fd is bidirectional: reads return PPP
-    /// frames the kernel wants to transmit; writes inject PPP frames
-    /// received from the peer.
+    /// Borrow the unit fd.
+    ///
+    /// **Mainline `ppp_generic` semantics (kernel ≥6.x):** the unit
+    /// fd is *not* a data path. `write()` on a unit fd is treated as
+    /// TX direction (frame heading out toward an attached channel)
+    /// and is dropped if no channel is bound; `read()` on a unit fd
+    /// returns EOF on a channel-less unit. The only way to move IP
+    /// data through `pppN` without a kernel transport driver is via
+    /// a registered `ppp_channel` (`PPPIOCATTCHAN` against a fd that
+    /// came from a driver such as the in-tree sstp kmod, pppoe,
+    /// pptp, …).
+    ///
+    /// See CLAUDE.md "Data plane" for the implications.
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }

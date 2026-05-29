@@ -355,6 +355,10 @@ fn resolve_data_path_mode(requested: cli::DataPathMode) -> cli::DataPathMode {
     use kppp::sstp_kmod::{self, KmodError};
 
     match (requested, sstp_kmod::probe()) {
+        (DataPathMode::Tun, _) => {
+            info!("data-path: tun (operator-selected; /dev/net/tun)");
+            DataPathMode::Tun
+        }
         (DataPathMode::Userspace, _) => {
             info!("data-path: userspace (operator-selected)");
             DataPathMode::Userspace
@@ -372,12 +376,12 @@ fn resolve_data_path_mode(requested: cli::DataPathMode) -> cli::DataPathMode {
             DataPathMode::Auto
         }
         (DataPathMode::Auto, Err(KmodError::NotAvailable)) => {
-            info!("data-path: userspace (sstp kmod not loaded; falling back to /dev/ppp copy)");
-            DataPathMode::Userspace
+            info!("data-path: tun (sstp kmod not loaded; falling back to /dev/net/tun)");
+            DataPathMode::Tun
         }
         (DataPathMode::Auto, Err(e)) => {
-            warn!(error = %e, "data-path: /dev/sstp present but unusable; falling back to userspace");
-            DataPathMode::Userspace
+            warn!(error = %e, "data-path: /dev/sstp present but unusable; falling back to TUN");
+            DataPathMode::Tun
         }
     }
 }

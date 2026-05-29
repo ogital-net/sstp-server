@@ -23,12 +23,15 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
+use tracing::warn;
+
 use crate::cli::DataPathMode;
 
 use super::SessionIpConfig;
 use super::datapath::{DataPath, DataPathError};
 use super::netlink::{NetlinkError, RtNetlink};
 use super::sstp_kmod::SSTP_F_PFC;
+use super::tun::{TunError, TunSession};
 use super::unit::{Unit, UnitError};
 
 /// MTU we configure on `pppN`. Standard PPP default; SSTP carries
@@ -45,22 +48,51 @@ pub enum BringUpError {
     Netlink(#[from] NetlinkError),
     #[error("data path: {0}")]
     DataPath(#[from] DataPathError),
+    #[error("tun: {0}")]
+    Tun(#[from] TunError),
     #[error("duplicating unit fd for async I/O: {0}")]
     Dup(#[source] io::Error),
     #[error("registering unit fd with tokio: {0}")]
     Register(#[source] io::Error),
+    #[error("resolving ifindex for {ifname}: {source}")]
+    ResolveIfindex {
+        ifname: String,
+        #[source]
+        source: io::Error,
+    },
 }
 
-/// Live kernel-PPP session bound to a single SSTP session.
+/// Live data-path session bound to a single SSTP session.
 ///
-/// Holds the `pppN` netdev ([`Unit`]) plus whichever data path the
-/// session ended up on. Dropping closes the unit fd (the kernel then
-/// removes the `pppN` netdev) and any kernel-side `/dev/sstp`
-/// attachment.
+/// Dispatches between two backends:
+///
+/// - **PPP** — a `/dev/ppp` unit fd plus an attached [`DataPath`]
+///   (kernel kmod or userspace copy). Used when the operator asks
+///   for `--data-path kernel` or `--data-path userspace`, and the
+///   first choice tried under `--data-path auto`.
+/// - **TUN** — a plain `/dev/net/tun` netdev. Used under
+///   `--data-path tun` and as the fallback under `--data-path auto`
+///   when the kmod attach fails. This is the path that actually
+///   moves IP traffic on mainline kernels without the sstp kmod.
 #[derive(Debug)]
 pub struct KpppSession {
+    inner: Backend,
+}
+
+#[derive(Debug)]
+enum Backend {
+    Ppp(PppBackend),
+    Tun(TunSession),
+}
+
+#[derive(Debug)]
+struct PppBackend {
     /// Lifecycle handle for `pppN`. Drop removes the netdev.
     unit: Unit,
+    /// Kernel-assigned netdev index for `pppN`. Distinct from
+    /// [`Unit::index`] (the PPP unit number) — netlink wants the
+    /// `IFLA_INDEX`, not the unit number.
+    ifindex: u32,
     /// Per-session data-path attachment. `Kernel` means the SSTP
     /// kmod owns the steady-state byte path; `Userspace` means
     /// frames flow through this process via [`Self::async_fd`].
@@ -71,21 +103,71 @@ pub struct KpppSession {
 }
 
 impl KpppSession {
-    /// Allocate `pppN`, configure MRU, push the P2P address pair,
-    /// and attach the chosen data path.
+    /// Resolve the operator-selected `mode` to a concrete backend,
+    /// bring it up, and return a live session.
     ///
-    /// `tcp_fd` is required for the kernel path (`SSTP_IOC_ATTACH`
-    /// hands the socket to the kmod) but ignored for userspace.
-    /// `mode` resolves the kernel-vs-userspace decision per the
-    /// CLI / startup probe (see [`DataPath::open`]).
+    /// `tcp_fd` is required for the kernel kmod attach but ignored
+    /// for the userspace and TUN paths. Under `DataPathMode::Auto`,
+    /// the kmod is tried first; on failure the session falls back
+    /// to TUN (the legacy PPP-userspace copier is a no-op on
+    /// mainline kernels and is reachable only via the explicit
+    /// `--data-path userspace` flag).
     pub fn bring_up(
         mode: DataPathMode,
         tcp_fd: BorrowedFd<'_>,
         local: Ipv4Addr,
         peer: Ipv4Addr,
     ) -> Result<Self, BringUpError> {
+        match mode {
+            DataPathMode::Tun => {
+                let tun = TunSession::bring_up(local, peer)?;
+                return Ok(Self {
+                    inner: Backend::Tun(tun),
+                });
+            }
+            DataPathMode::Auto => {
+                // Try the PPP+kmod path first; if it fails, fall
+                // back to TUN. The PPP-userspace path is *not*
+                // tried under Auto because it doesn't move IP
+                // traffic on mainline kernels.
+                match Self::bring_up_ppp(DataPathMode::Kernel, tcp_fd, local, peer) {
+                    Ok(s) => return Ok(s),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "kernel data path unavailable; falling back to TUN"
+                        );
+                        let tun = TunSession::bring_up(local, peer)?;
+                        return Ok(Self {
+                            inner: Backend::Tun(tun),
+                        });
+                    }
+                }
+            }
+            DataPathMode::Kernel | DataPathMode::Userspace => {}
+        }
+        Self::bring_up_ppp(mode, tcp_fd, local, peer)
+    }
+
+    fn bring_up_ppp(
+        mode: DataPathMode,
+        tcp_fd: BorrowedFd<'_>,
+        local: Ipv4Addr,
+        peer: Ipv4Addr,
+    ) -> Result<Self, BringUpError> {
         let unit = Unit::new()?;
-        unit.set_mru(DEFAULT_MTU).map_err(BringUpError::Unit)?;
+        // Skip PPPIOCSMRU: in mainline kernels (≥6.x) the unit-fd
+        // dispatch returns ENOTTY for it (PPPIOCSMRU is a channel
+        // ioctl). The netlink `IFLA_MTU` below is what the kernel
+        // honours on the data path; LCP MRU negotiation is already
+        // settled by our in-process PPP FSM.
+        // The PPP unit number is *not* the netdev `ifindex` — resolve
+        // the kernel-assigned `IFLA_INDEX` from the netdev name so
+        // RTM_NEWADDR/RTM_NEWLINK target the right interface (without
+        // this, addresses land on whatever netdev happens to have
+        // `ifindex == unit_number`, typically `lo`).
+        let ifname = unit.ifname();
+        let ifindex = resolve_ifindex(&ifname)?;
         let mut nl = RtNetlink::open()?;
         let cfg = SessionIpConfig {
             local,
@@ -93,7 +175,7 @@ impl KpppSession {
             netmask: None,
             mtu: Some(DEFAULT_MTU),
         };
-        nl.bring_up(unit.index(), &cfg)?;
+        nl.bring_up(ifindex, &cfg)?;
 
         // The kmod attach derives no value from PPP option flags
         // beyond what's already baked into the unit fd; we pass
@@ -121,50 +203,88 @@ impl KpppSession {
         };
 
         Ok(Self {
-            unit,
-            path,
-            async_fd,
+            inner: Backend::Ppp(PppBackend {
+                unit,
+                ifindex,
+                path,
+                async_fd,
+            }),
         })
     }
 
     #[must_use]
     pub fn ifname(&self) -> String {
-        self.unit.ifname()
+        match &self.inner {
+            Backend::Ppp(p) => p.unit.ifname(),
+            Backend::Tun(t) => t.ifname().to_string(),
+        }
     }
 
     #[must_use]
     pub fn ifindex(&self) -> u32 {
-        self.unit.index()
+        match &self.inner {
+            Backend::Ppp(p) => p.ifindex,
+            Backend::Tun(t) => t.ifindex(),
+        }
     }
 
     /// `true` when the kernel SSTP module owns the steady-state byte
     /// path for this session. The session driver uses this to skip
-    /// its userspace copy loop.
+    /// its userspace copy loop. False for TUN and for the PPP
+    /// userspace fallback.
     #[must_use]
     pub fn is_kernel(&self) -> bool {
-        self.path.is_kernel()
+        matches!(&self.inner, Backend::Ppp(p) if p.path.is_kernel())
     }
 
-    /// Write one PPP frame to the kernel unit fd. Userspace mode
-    /// only; calling this in kernel mode is a programming error.
+    /// `true` when the backend is a TUN device. Lets the session
+    /// driver know an EOF from `read_frame` is a real error (TUN
+    /// reads return packets, not EOF) rather than the
+    /// channel-less-pppN no-op behaviour.
+    #[must_use]
+    pub fn is_tun(&self) -> bool {
+        matches!(&self.inner, Backend::Tun(_))
+    }
+
+    /// Write one PPP frame to the backing data path.
+    ///
+    /// - PPP backend: the bytes go straight to the unit fd.
+    /// - TUN backend: the PPP header is stripped and just the IP
+    ///   payload is written to the tun fd.
+    ///
+    /// Calling this in kernel mode is a programming error.
     pub async fn write_frame(&self, frame: &[u8]) -> io::Result<usize> {
-        let fd = self.async_fd.as_ref().ok_or_else(|| {
-            io::Error::other("write_frame called on kernel-mode KpppSession")
-        })?;
-        fd.async_io(Interest::WRITABLE, |fd| write_fd(fd.as_fd(), frame))
-            .await
+        match &self.inner {
+            Backend::Ppp(p) => {
+                let fd = p.async_fd.as_ref().ok_or_else(|| {
+                    io::Error::other("write_frame called on kernel-mode KpppSession")
+                })?;
+                fd.async_io(Interest::WRITABLE, |fd| write_fd(fd.as_fd(), frame))
+                    .await
+            }
+            Backend::Tun(t) => t.write_frame(frame).await,
+        }
     }
 
-    /// Read one PPP frame from the kernel unit fd into `buf`.
-    /// Userspace mode only; in kernel mode the future will never
-    /// resolve (the session driver instead selects on a `pending()`
-    /// branch for this slot).
+    /// Read one PPP frame from the backing data path into `buf`.
+    ///
+    /// - PPP backend: bytes read from the unit fd verbatim.
+    /// - TUN backend: an IP packet is read from the tun fd and
+    ///   PPP-encoded (uncompressed header + protocol field) into
+    ///   `buf`.
+    ///
+    /// In kernel mode the future will never resolve.
     pub async fn read_frame(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let fd = self.async_fd.as_ref().ok_or_else(|| {
-            io::Error::other("read_frame called on kernel-mode KpppSession")
-        })?;
-        fd.async_io(Interest::READABLE, |fd| read_fd(fd.as_fd(), buf))
-            .await
+        match &self.inner {
+            Backend::Ppp(p) => {
+                let fd = p.async_fd.as_ref().ok_or_else(|| {
+                    io::Error::other("read_frame called on kernel-mode KpppSession")
+                })?;
+                fd.async_io(Interest::READABLE, |fd| read_fd(fd.as_fd(), buf))
+                    .await
+            }
+            Backend::Tun(t) => t.read_frame(buf).await,
+        }
     }
 }
 
@@ -191,5 +311,22 @@ fn read_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
         Err(io::Error::last_os_error())
     } else {
         Ok(usize::try_from(rc).expect("non-negative ssize_t"))
+    }
+}
+
+/// Resolve a netdev name to its kernel `ifindex` via `if_nametoindex(3)`.
+fn resolve_ifindex(ifname: &str) -> Result<u32, BringUpError> {
+    let cstr = std::ffi::CString::new(ifname).expect("ifname has no NUL");
+    // SAFETY: `cstr` is a valid NUL-terminated C string for the
+    // duration of the call. `if_nametoindex` returns 0 on error and
+    // sets errno; any non-zero return is a valid ifindex.
+    let idx = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+    if idx == 0 {
+        Err(BringUpError::ResolveIfindex {
+            ifname: ifname.to_string(),
+            source: io::Error::last_os_error(),
+        })
+    } else {
+        Ok(idx)
     }
 }

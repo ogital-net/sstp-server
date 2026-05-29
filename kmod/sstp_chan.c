@@ -68,15 +68,12 @@ static int sstp_chan_start_xmit(struct ppp_channel *chan,
 	}
 
 	if (ret == -EAGAIN || ret == -EWOULDBLOCK) {
-		/* Socket buffer full. Tell ppp_generic to hold off; it
-		 * will retry after we call ppp_output_wakeup(). For v0.1
-		 * we drop the frame — installing the sk_write_space hook
-		 * to trigger ppp_output_wakeup() is a TODO. */
-		spin_lock_irqsave(&s->stats_lock, flags);
-		s->stats.sstp_malformed++;
-		spin_unlock_irqrestore(&s->stats_lock, flags);
-		kfree_skb(skb);
-		return 1;
+		/* Socket buffer full. Tell ppp_generic to hold off by
+		 * returning 0; the skb stays queued at the channel and
+		 * ppp_generic will re-call us once ppp_output_wakeup()
+		 * fires from the sk_write_space hook installed in
+		 * sstp_demux_install_callback(). */
+		return 0;
 	}
 
 	/* Short write or hard error: the TCP stream is now ambiguous

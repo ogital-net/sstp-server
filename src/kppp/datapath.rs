@@ -98,6 +98,13 @@ impl DataPath {
                     Userspace::new(unit).map(Self::Userspace)
                 }
             },
+            // TUN does not go through `DataPath::open` — it's a
+            // different backend entirely, selected at the
+            // [`KpppSession`] level before any `/dev/ppp` unit is
+            // ever opened. Reaching here is a programming error.
+            DataPathMode::Tun => unreachable!(
+                "DataPathMode::Tun must be handled by KpppSession::bring_up, not DataPath::open"
+            ),
         }
     }
 

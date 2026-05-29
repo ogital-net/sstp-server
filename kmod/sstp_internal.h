@@ -55,10 +55,10 @@ struct sstp_session {
 	struct file          *tcp_file;
 	struct socket        *tcp_sock;
 
-	/* PPP plumbing. The channel is registered against the unit
-	 * number supplied at attach time. */
+	/* PPP plumbing. The kernel registers a channel only; the unit
+	 * binding is owned by userspace via PPPIOCATTCHAN/PPPIOCCONNECT
+	 * against the index returned by SSTP_IOC_GET_CHAN_INDEX. */
 	struct ppp_channel    chan;
-	int                   ppp_unit;      /* requested by userspace */
 	bool                  chan_registered;
 
 	/* Flags from struct sstp_attach.flags. */
@@ -95,10 +95,22 @@ struct sstp_session {
 	u32                   rx_len;        /* bytes valid at head */
 #define SSTP_RX_BUF_CAP       8192       /* > 2 * max SSTP frame */
 
+	/* SSTP control-packet queue. Demuxed C=1 frames are stashed
+	 * here (payload only, header stripped) and userspace pulls
+	 * them with SSTP_IOC_RECV_CONTROL after seeing the matching
+	 * SSTP_EVT_CONTROL_PACKET event. Bounded; overflow drops
+	 * the *new* frame and bumps stats.sstp_malformed. */
+#define SSTP_CTRL_Q_CAP       8
+	struct sk_buff       *ctrl_q[SSTP_CTRL_Q_CAP];
+	u32                   ctrl_q_head;
+	u32                   ctrl_q_tail;
+	spinlock_t            ctrl_q_lock;
+
 	/* Original socket callbacks, saved at attach so we can
 	 * restore them at detach without leaking our wakeup hook
 	 * into a socket the caller may keep open. */
 	void                (*saved_data_ready)(struct sock *sk);
+	void                (*saved_write_space)(struct sock *sk);
 	void                 *saved_user_data;
 	bool                  cb_installed;
 

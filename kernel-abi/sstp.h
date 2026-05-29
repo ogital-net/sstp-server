@@ -146,10 +146,13 @@ struct sstp_attach {
 	__s32   tcp_fd;
 
 	/* Input: PPP unit number returned by PPPIOCGUNIT on the
-	 * userspace unit fd. The kernel attaches the SSTP channel
-	 * to this unit via `ppp_register_channel` + the equivalent
-	 * of PPPIOCCONNECT. The unit itself stays owned by
-	 * userspace; the kernel only takes a reference. */
+	 * userspace unit fd. Currently advisory — the kernel registers
+	 * an SSTP channel and exposes its index via
+	 * SSTP_IOC_GET_CHAN_INDEX; userspace is responsible for binding
+	 * that channel to this unit via PPPIOCATTCHAN / PPPIOCCONNECT
+	 * on its own /dev/ppp handle. The field is retained so a
+	 * future revision can move the bind into the kernel without an
+	 * ABI break; today it is only sanity-checked (>= 0). */
 	__s32   ppp_unit;
 
 	/* Input: SSTP_F_* flags (see above). */
@@ -230,6 +233,22 @@ struct sstp_stats {
  * the session_fd. */
 #define SSTP_IOC_GET_CHAN_INDEX _IOR (SSTP_IOC_MAGIC, 0x83, __s32)
 
+/* Pull one queued SSTP control packet (C=1, header stripped) into
+ * the user-supplied buffer. Returns the payload length on success,
+ * 0 if the queue is empty, or -errno. The caller's buffer must be
+ * at least SSTP_CONTROL_MAX bytes to avoid -EMSGSIZE on large
+ * frames. Issued on the session_fd; pair with a poll() on the
+ * event fd for SSTP_EVT_CONTROL_PACKET. */
+#define SSTP_CONTROL_MAX        4096
+
+struct sstp_recv_control {
+	__u32   buf_len;            /* in: size of `buf` */
+	__u32   payload_len;        /* out: bytes written to `buf` */
+	__u64   buf;                /* in: __u64-cast user pointer */
+};
+
+#define SSTP_IOC_RECV_CONTROL   _IOWR(SSTP_IOC_MAGIC, 0x84, struct sstp_recv_control)
+
 /* ----------------------------------------------------------------
  * Event stream (read from session_fd)
  *
@@ -245,6 +264,12 @@ struct sstp_stats {
 #define SSTP_EVT_PROTOCOL_ERROR     4   /* malformed SSTP that aborts
                                          * the session per [MS-SSTP]
                                          * §3.2.5.2.5 */
+#define SSTP_EVT_CONTROL_PACKET     5   /* an SSTP control packet (C=1)
+                                         * was demuxed and queued for
+                                         * userspace; pull it with
+                                         * SSTP_IOC_RECV_CONTROL. `arg`
+                                         * is the payload length (header
+                                         * stripped). */
 
 struct sstp_event {
 	__u32   type;     /* SSTP_EVT_* */

@@ -188,6 +188,36 @@ impl ServerHandle {
             }
         }
     }
+
+    /// Block (up to `timeout`) for a log line matching `needle`,
+    /// returning **all lines consumed** along the way (including the
+    /// match itself as the last element) or `None` on timeout. Use
+    /// this when the test needs to inspect ordering between several
+    /// log events: `wait_for_log` discards non-matching lines.
+    pub fn collect_logs_until(
+        &self,
+        needle: &str,
+        timeout: Duration,
+    ) -> Option<Vec<String>> {
+        let deadline = Instant::now() + timeout;
+        let mut seen = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match self.log_rx.recv_timeout(remaining) {
+                Ok(line) => {
+                    let matched = line.contains(needle);
+                    seen.push(line);
+                    if matched {
+                        return Some(seen);
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
 }
 
 impl Drop for ServerHandle {

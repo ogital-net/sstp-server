@@ -164,6 +164,63 @@ static long sstp_session_ioctl(struct file *file, unsigned int cmd,
 			return -EFAULT;
 		return 0;
 	}
+	case SSTP_IOC_RECV_CONTROL: {
+		struct sstp_recv_control rc;
+		struct sk_buff *skb = NULL;
+		unsigned long flags;
+		void __user *ubuf;
+		u32 plen;
+
+		if (copy_from_user(&rc, uarg, sizeof(rc)))
+			return -EFAULT;
+
+		spin_lock_irqsave(&s->ctrl_q_lock, flags);
+		if (s->ctrl_q_head != s->ctrl_q_tail) {
+			skb = s->ctrl_q[s->ctrl_q_tail];
+			s->ctrl_q[s->ctrl_q_tail] = NULL;
+			s->ctrl_q_tail = (s->ctrl_q_tail + 1) %
+					 SSTP_CTRL_Q_CAP;
+		}
+		spin_unlock_irqrestore(&s->ctrl_q_lock, flags);
+
+		if (!skb) {
+			rc.payload_len = 0;
+			if (copy_to_user(uarg, &rc, sizeof(rc)))
+				return -EFAULT;
+			return 0;
+		}
+
+		plen = skb->len;
+		if (rc.buf_len < plen) {
+			/* Requeue at tail so userspace can retry with a
+			 * bigger buffer. Lossy fallback if the slot is
+			 * gone: drop and report EMSGSIZE. */
+			spin_lock_irqsave(&s->ctrl_q_lock, flags);
+			if (((s->ctrl_q_head + 1) % SSTP_CTRL_Q_CAP) !=
+			    s->ctrl_q_tail) {
+				s->ctrl_q[s->ctrl_q_head] = skb;
+				s->ctrl_q_head = (s->ctrl_q_head + 1) %
+						 SSTP_CTRL_Q_CAP;
+				skb = NULL;
+			}
+			spin_unlock_irqrestore(&s->ctrl_q_lock, flags);
+			if (skb)
+				kfree_skb(skb);
+			return -EMSGSIZE;
+		}
+
+		ubuf = (void __user *)(uintptr_t)rc.buf;
+		if (copy_to_user(ubuf, skb->data, plen)) {
+			kfree_skb(skb);
+			return -EFAULT;
+		}
+		kfree_skb(skb);
+
+		rc.payload_len = plen;
+		if (copy_to_user(uarg, &rc, sizeof(rc)))
+			return -EFAULT;
+		return plen;
+	}
 	default:
 		return -ENOTTY;
 	}

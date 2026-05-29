@@ -330,6 +330,13 @@ async fn drive_sstp(
     let mut ppp_timer: Option<(TimerOwner, Pin<Box<Sleep>>)> = None;
     let mut kppp: Option<KpppSession> = None;
     let mut kppp_buf = [0u8; 2048];
+    // Mainline `/dev/ppp` unit fds return `Ok(0)` from `read(2)` —
+    // the unit fd does not deliver TX frames in userspace (that's a
+    // channel-fd path, which requires our SSTP kmod). Until the
+    // kmod is wired in, the userspace data path is RX-only; flip
+    // this flag after the first spurious EOF and stop polling the
+    // unit fd to keep the control plane alive.
+    let mut kppp_read_disabled = false;
     let auth = AuthCtx { peer, bridge: &auth_bridge };
 
     // Spec entry point: `New HTTPS Connection Received` (§3.3.2.1).
@@ -364,7 +371,9 @@ async fn drive_sstp(
             // is nothing for us to copy.
             let kppp_read_fut = async {
                 match kppp.as_ref() {
-                    Some(k) if !k.is_kernel() => k.read_frame(&mut kppp_buf).await,
+                    Some(k) if !k.is_kernel() && !kppp_read_disabled => {
+                        k.read_frame(&mut kppp_buf).await
+                    }
                     _ => std::future::pending::<std::io::Result<usize>>().await,
                 }
             };
@@ -469,10 +478,16 @@ async fn drive_sstp(
                 warn!(%id, error = %e, "kernel PPP unit read failed");
             }
             DriverEvent::KpppRead(Ok(0)) => {
-                // EOF on a /dev/ppp unit fd is unusual; treat as a
-                // hard error and tear the session down.
-                warn!(%id, "kernel PPP unit returned EOF");
-                return;
+                // Mainline ppp_generic returns EOF from a unit-fd
+                // read because TX frames flow through channels, not
+                // the unit. TUN by contrast returns EOF only on
+                // genuine close. Branch on backend.
+                if kppp.as_ref().is_some_and(KpppSession::is_tun) {
+                    warn!(%id, "tun fd returned EOF; tearing down session");
+                    return;
+                }
+                warn!(%id, "ppp unit fd returned EOF; userspace RX path disabled (no kernel channel; needs sstp kmod + kTLS)");
+                kppp_read_disabled = true;
             }
             DriverEvent::KpppRead(Ok(n)) => {
                 if let Err(e) = write_ppp_as_sstp_data(&mut tls, &kppp_buf[..n]).await {

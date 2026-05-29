@@ -26,12 +26,13 @@ directions:
 
 Still TODO before v0.1 ships:
 
-- `sk_write_space` hook + `ppp_output_wakeup` so a full socket
-  buffer pauses ppp_generic instead of dropping the frame.
-- Control-packet (`C=1`) forwarding to userspace so the SSTP
-  hello timer can stay in userspace (today they are counted and
-  dropped).
-- TLS 1.3 `KeyUpdate` detection → `SSTP_EVT_TLS_REKEY_NEEDED`.
+- Userspace `kppp` integration: wrap `SSTP_IOC_ATTACH` +
+  `SSTP_IOC_GET_CHAN_INDEX` + `PPPIOCATTCHAN` + `PPPIOCCONNECT` so
+  a session can flip from userspace to kernel data path once IPCP
+  converges, and drive `SSTP_EVT_CONTROL_PACKET` /
+  `SSTP_EVT_TLS_REKEY_NEEDED` from the session task.
+- kTLS install in `crate::crypto::tls` so the kernel path is
+  actually reachable end-to-end.
 
 ## Files
 
@@ -108,20 +109,30 @@ Requires `libssl-dev` (OpenSSL 3.x) and passwordless `sudo` (for
 
 In rough order:
 
-1. **TX backpressure**: install `sk_write_space` on the TCP socket
-   so `-EAGAIN` from `kernel_sendmsg` returns 0 from start_xmit
-   (telling ppp_generic to queue), then `ppp_output_wakeup` when
-   space is available.
-2. **Control-packet forwarding**: post-handoff Echo Request /
-   Response should surface to userspace via a new
-   `SSTP_EVT_CONTROL_PACKET` event with the payload available via
-   a read of the session_fd, so the hello timer stays where the
-   state machine lives.
-3. **TLS rekey handling**: detect TLS 1.3 KeyUpdate records,
-   emit `SSTP_EVT_TLS_REKEY_NEEDED`, suspend the data path until
-   userspace reinstalls crypto info via `setsockopt(SOL_TLS, ...)`.
-4. **Userspace integration**: the Rust `kppp` module needs an
+1. **Userspace integration**: the Rust `kppp` module needs an
    `attach()` helper that wraps `SSTP_IOC_ATTACH` +
    `SSTP_IOC_GET_CHAN_INDEX` + `PPPIOCATTCHAN` + `PPPIOCCONNECT`
    so a session can flip from userspace to kernel data path once
-   IPCP converges.
+   IPCP converges. The session task also needs to poll the
+   session_fd for `SSTP_EVT_CONTROL_PACKET` (drain via
+   `SSTP_IOC_RECV_CONTROL`, feed to the SSTP state machine) and
+   for `SSTP_EVT_TLS_REKEY_NEEDED` (reinstall kTLS crypto via
+   `setsockopt(SOL_TLS, ...)` and re-attach).
+2. **kTLS install**: extract negotiated TLS 1.2 / 1.3 traffic
+   keys from aws-lc-sys and wire `TCP_ULP="tls"` +
+   `TLS_TX`/`TLS_RX` `crypto_info_*` on the socket before attach.
+   This is the single biggest piece; without it the kernel-mode
+   `SSTP_IOC_ATTACH` returns `-EOPNOTSUPP` and TUN fallback fires.
+3. **CI**: a kernel-mode smoke test in `tests/e2e.rs` once the
+   above lands.
+
+Completed in v0.1.x:
+
+- TX backpressure via `sk_write_space` + `ppp_output_wakeup`
+  ([`sstp_demux.c`](sstp_demux.c), [`sstp_chan.c`](sstp_chan.c)).
+- Control-packet (`C=1`) demux + queue + `SSTP_EVT_CONTROL_PACKET`
+  event + `SSTP_IOC_RECV_CONTROL` ioctl
+  ([`sstp_demux.c`](sstp_demux.c), [`sstp_event.c`](sstp_event.c)).
+- TLS 1.3 KeyUpdate / NewSessionTicket detection via
+  `TLS_GET_RECORD_TYPE` cmsg on `kernel_recvmsg`, surfacing
+  `SSTP_EVT_TLS_REKEY_NEEDED` ([`sstp_demux.c`](sstp_demux.c)).

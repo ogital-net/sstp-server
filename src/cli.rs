@@ -52,7 +52,7 @@ OPTIONS:
     -n, --no-control-socket      Disable the control socket
     -F, --log-format <fmt>       text | json | auto (default: auto)
     -L, --log-file <path>        Log to file instead of stderr
-    -D, --data-path <mode>       auto | kernel | userspace (default: auto)
+    -D, --data-path <mode>       auto | kernel | tun | userspace (default: auto)
     -i, --local-ip <ipv4>        Server-side IPv4 for every pppN interface (required)
     -u, --user <name>            Drop privileges to this user after binding sockets (root only)
     -g, --group <name>           Group to drop to (defaults to the user's primary GID)
@@ -101,13 +101,17 @@ pub enum LogFormat {
 }
 
 /// Operator-selectable data-path mode. `Auto` tries the kernel path
-/// first and falls back to userspace copying with a warning log if the
-/// `sstp` kmod isn't present or the attach fails.
+/// first and falls back to a TUN device with a warning log if the
+/// `sstp` kmod isn't present or the attach fails. `Userspace` keeps
+/// the legacy `/dev/ppp` unit-fd copier — useful for debugging but
+/// **does not move IP traffic on mainline kernels** (the unit fd is
+/// TX-only and has no attached channel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DataPathMode {
     #[default]
     Auto,
     Kernel,
+    Tun,
     Userspace,
 }
 
@@ -285,12 +289,13 @@ where
                 data_path = match raw {
                     "auto" => DataPathMode::Auto,
                     "kernel" => DataPathMode::Kernel,
+                    "tun" => DataPathMode::Tun,
                     "userspace" => DataPathMode::Userspace,
                     other => {
                         return Err(ParseError::invalid(
                             "data-path",
                             other,
-                            BadEnumValue("expected one of: auto, kernel, userspace"),
+                            BadEnumValue("expected one of: auto, kernel, tun, userspace"),
                         ));
                     }
                 };
