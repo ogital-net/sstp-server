@@ -574,51 +574,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mnl"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "528ab362254419b09757228dc96e0d834e75392c52870d759df2274753007065"
-dependencies = [
- "libc",
- "log",
- "mnl-sys",
-]
-
-[[package]]
-name = "mnl-sys"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0f3c607af12ed53f3cade8ee7adeced5533800abc0b07f5b6bdc7081d1e0d4c"
-dependencies = [
- "libc",
- "pkg-config",
-]
-
-[[package]]
-name = "nftnl"
-version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39ca472ecf2987c3de5b728d24876eb94724269fff2c526e6beb0c80fe4bbb3b"
-dependencies = [
- "bitflags",
- "log",
- "nftnl-sys",
- "nix",
-]
-
-[[package]]
-name = "nftnl-sys"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cffa28b4c81eea6a8a4fd454634d425e1a559250a50a926de4517dd9607fe9a4"
-dependencies = [
- "cfg-if",
- "libc",
- "mnl-sys",
- "pkg-config",
-]
-
-[[package]]
 name = "nibble_vec"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -937,8 +892,6 @@ dependencies = [
  "fast-md5",
  "getopt-iter",
  "libc",
- "mnl",
- "nftnl",
  "radius-tokio",
  "rustyline",
  "socket2",

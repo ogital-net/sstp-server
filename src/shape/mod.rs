@@ -62,6 +62,7 @@ pub mod mikrotik;
 pub mod mss;
 mod netlink;
 pub mod tc;
+mod wire;
 
 use std::io;
 
@@ -300,8 +301,7 @@ fn encode_htb_root(seq: u32, ifindex: u32) -> netlink::MessageBuf {
         KIND_HTB, RTM_NEWQDISC, TC_H_ROOT, TCA_KIND, TCA_OPTIONS, TcHtbGlob, Tcmsg, handle, htb,
     };
 
-    let mut buf = MessageBuf::new();
-    buf.push_nlmsghdr(
+    let mut buf = MessageBuf::new(
         RTM_NEWQDISC,
         NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
         seq,
@@ -315,7 +315,7 @@ fn encode_htb_root(seq: u32, ifindex: u32) -> netlink::MessageBuf {
         tcm_parent: TC_H_ROOT,
         tcm_info: 0,
     });
-    buf.push_attr(TCA_KIND, KIND_HTB);
+    buf.push_attr_bytes(TCA_KIND, KIND_HTB);
     buf.nest_begin(TCA_OPTIONS);
     // TCA_HTB_INIT: tc_htb_glob. defcls=1 routes unmatched
     // traffic to handle 1:1 (our single leaf class).
@@ -326,7 +326,7 @@ fn encode_htb_root(seq: u32, ifindex: u32) -> netlink::MessageBuf {
         debug: 0,
         direct_pkts: 0,
     };
-    buf.push_attr(htb::TCA_HTB_INIT, struct_as_bytes(&glob));
+    buf.push_attr_bytes(htb::TCA_HTB_INIT, wire::bytes_of(&glob));
     buf.nest_end();
     buf.finalize();
     buf
@@ -396,8 +396,7 @@ fn encode_htb_leaf(
         hopt.ceil.rate = hopt.rate.rate;
     }
 
-    let mut buf = MessageBuf::new();
-    buf.push_nlmsghdr(
+    let mut buf = MessageBuf::new(
         RTM_NEWTCLASS,
         NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
         seq,
@@ -411,16 +410,16 @@ fn encode_htb_leaf(
         tcm_parent: handle(1, 0),
         tcm_info: 0,
     });
-    buf.push_attr(TCA_KIND, KIND_HTB);
+    buf.push_attr_bytes(TCA_KIND, KIND_HTB);
     buf.nest_begin(TCA_OPTIONS);
-    buf.push_attr(htb::TCA_HTB_PARMS, struct_as_bytes(&hopt));
+    buf.push_attr_bytes(htb::TCA_HTB_PARMS, wire::bytes_of(&hopt));
     // Always emit RATE64 / CEIL64. They cost 12 bytes apiece
     // and let the kernel handle 10GbE-class deployments where
     // bytes/s overflows u32 (≥ 4 GiB/s ≈ 32 Gbps). Kernels
     // that don't recognise the attribute silently ignore it;
     // kernels that do prefer it over the 32-bit field.
-    buf.push_attr(htb::TCA_HTB_RATE64, &rate_bps_u64.to_ne_bytes());
-    buf.push_attr(htb::TCA_HTB_CEIL64, &ceil_bps_u64.to_ne_bytes());
+    buf.push_attr_bytes(htb::TCA_HTB_RATE64, &rate_bps_u64.to_ne_bytes());
+    buf.push_attr_bytes(htb::TCA_HTB_CEIL64, &ceil_bps_u64.to_ne_bytes());
     // FUTURE (M-shape-rtab): for kernels older than 3.3, also
     // emit TCA_HTB_RTAB / TCA_HTB_CTAB (256 × u32 each).
     // Mirroring iproute2's `tc_calc_rtable` is straightforward
@@ -446,8 +445,7 @@ fn encode_ingress_qdisc(seq: u32, ifindex: u32) -> netlink::MessageBuf {
     use netlink::{MessageBuf, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST};
     use tc::{KIND_INGRESS, RTM_NEWQDISC, TC_H_INGRESS, TCA_KIND, Tcmsg, handle};
 
-    let mut buf = MessageBuf::new();
-    buf.push_nlmsghdr(
+    let mut buf = MessageBuf::new(
         RTM_NEWQDISC,
         NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
         seq,
@@ -464,7 +462,7 @@ fn encode_ingress_qdisc(seq: u32, ifindex: u32) -> netlink::MessageBuf {
         tcm_parent: TC_H_INGRESS,
         tcm_info: 0,
     });
-    buf.push_attr(TCA_KIND, KIND_INGRESS);
+    buf.push_attr_bytes(TCA_KIND, KIND_INGRESS);
     buf.finalize();
     buf
 }
@@ -551,8 +549,7 @@ fn encode_ingress_police_filter(seq: u32, ifindex: u32, spec: &RateSpec) -> netl
     let prio: u32 = 1;
     let info = (prio << 16) | u32::from(ETH_P_ALL.to_be());
 
-    let mut buf = MessageBuf::new();
-    buf.push_nlmsghdr(
+    let mut buf = MessageBuf::new(
         RTM_NEWTFILTER,
         NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
         seq,
@@ -566,31 +563,17 @@ fn encode_ingress_police_filter(seq: u32, ifindex: u32, spec: &RateSpec) -> netl
         tcm_parent: handle(0xFFFF, 0),
         tcm_info: info,
     });
-    buf.push_attr(TCA_KIND, KIND_U32);
+    buf.push_attr_bytes(TCA_KIND, KIND_U32);
     buf.nest_begin(TCA_OPTIONS);
-    buf.push_attr(u32_filter::TCA_U32_SEL, struct_as_bytes(&sel));
+    buf.push_attr_bytes(u32_filter::TCA_U32_SEL, wire::bytes_of(&sel));
     buf.nest_begin(u32_filter::TCA_U32_POLICE);
-    buf.push_attr(police::TCA_POLICE_TBF, struct_as_bytes(&parm));
+    buf.push_attr_bytes(police::TCA_POLICE_TBF, wire::bytes_of(&parm));
     // Always emit RATE64 — same posture as the HTB side.
-    buf.push_attr(police::TCA_POLICE_RATE64, &rate_bps_u64.to_ne_bytes());
+    buf.push_attr_bytes(police::TCA_POLICE_RATE64, &rate_bps_u64.to_ne_bytes());
     buf.nest_end(); // TCA_U32_POLICE
     buf.nest_end(); // TCA_OPTIONS
     buf.finalize();
     buf
-}
-
-/// View `value` as its raw byte representation. Used when pushing
-/// `#[repr(C)]` structs into a `TCA_*` attribute payload.
-fn struct_as_bytes<T: Copy>(value: &T) -> &[u8] {
-    // SAFETY: `T: Copy` plus the caller's `#[repr(C)]` annotation
-    // make every byte pattern of `T` a valid value; the slice
-    // covers exactly `size_of::<T>()` bytes of an owned reference.
-    unsafe {
-        std::slice::from_raw_parts(
-            std::ptr::from_ref(value).cast::<u8>(),
-            std::mem::size_of::<T>(),
-        )
-    }
 }
 
 /// Compute an HTB burst budget that's at least one MTU and roughly
@@ -684,7 +667,7 @@ mod tests {
         // platform-stable but the test reads better as
         // field-level assertions).
         let buf = encode_htb_root(/* seq */ 7, /* ifindex */ 42);
-        let bytes = &buf.bytes;
+        let bytes = buf.bytes();
 
         // nlmsghdr: len patched, type=RTM_NEWQDISC,
         // flags=REQUEST|ACK|CREATE|REPLACE, seq=7.
@@ -729,7 +712,7 @@ mod tests {
         // field when both are set.
         let spec = RateSpec::flat(5_000_000_000);
         let buf = encode_htb_leaf(/* seq */ 9, /* ifindex */ 1, &spec, None);
-        let bytes = &buf.bytes;
+        let bytes = buf.bytes();
 
         // Look for the 8-byte rate value in native byte order
         // anywhere after the TCA_OPTIONS nest. 5_000_000_000 / 8
@@ -759,7 +742,7 @@ mod tests {
         // tell that from a substring search, but we can confirm
         // RATE64 is the explicit zero we expect (the spec said
         // 0) and that the message still encodes successfully.
-        let bytes = &buf.bytes;
+        let bytes = buf.bytes();
         let zero_u64 = 0u64.to_ne_bytes();
         assert!(
             bytes.windows(8).any(|w| w == zero_u64),
@@ -770,7 +753,7 @@ mod tests {
     #[test]
     fn encode_ingress_qdisc_shape() {
         let buf = encode_ingress_qdisc(/* seq */ 11, /* ifindex */ 7);
-        let bytes = &buf.bytes;
+        let bytes = buf.bytes();
 
         // nlmsghdr: type / flags / seq.
         let nlmsg_len = u32::from_ne_bytes(bytes[0..4].try_into().unwrap());
@@ -802,7 +785,7 @@ mod tests {
         // 100 Mbps = 12_500_000 bytes/s.
         let spec = RateSpec::flat(100_000_000);
         let buf = encode_ingress_police_filter(/* seq */ 13, /* ifindex */ 9, &spec);
-        let bytes = &buf.bytes;
+        let bytes = buf.bytes();
 
         // Header invariants.
         let nlmsg_type = u16::from_ne_bytes(bytes[4..6].try_into().unwrap());
