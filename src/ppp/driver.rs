@@ -17,7 +17,7 @@
 
 use std::time::Duration;
 
-use super::auth::pap;
+use super::auth::{chap, pap};
 use super::frame::{ADDRESS_ALL_STATIONS, CONTROL_UI, ProtocolId, decode_frame, encode_frame};
 use super::fsm::{
     DEFAULT_RESTART, Event as FsmEvent, Fsm, RestartTimer, Send as FsmSend, StepOut as FsmStep,
@@ -27,7 +27,8 @@ use super::ipcp::{
 };
 use super::lcp::{
     ConfigOption, ConfigOptionIter, LCP_HEADER_LEN, LCP_OPT_HEADER_LEN, LcpCode, LcpOptionId,
-    LcpPacket, auth_protocol_pap, decode_lcp_packet, write_lcp_header, write_option,
+    LcpPacket, auth_protocol_chap_md5, auth_protocol_pap, decode_lcp_packet, write_lcp_header,
+    write_option,
 };
 
 /// Which sub-protocol's restart timer the [`PppStep`] is asking to
@@ -78,6 +79,16 @@ pub enum PppEvent {
     /// run RADIUS (M6e) and feed the verdict back via
     /// [`Ppp::on_auth_result`].
     NeedPapAuth { peer_id: Vec<u8>, password: Vec<u8> },
+    /// Peer sent CHAP `Response`; the session task must run RADIUS
+    /// and feed the verdict back via [`Ppp::on_auth_result`]. The
+    /// 16-byte response hash is forwarded as `CHAP-Password`; the
+    /// `challenge` we originally sent goes as `CHAP-Challenge`.
+    NeedChapAuth {
+        username: Vec<u8>,
+        chap_id: u8,
+        challenge: Vec<u8>,
+        response: [u8; 16],
+    },
     /// IPCP converged: the kernel-PPP layer (M6g) can now bring the
     /// `pppN` interface up with the assigned addresses.
     NetworkUp(AssignedAddrs),
@@ -100,6 +111,16 @@ pub struct AssignedAddrs {
 pub enum AuthVerdict {
     Accept { addrs: AssignedAddrs },
     Reject { message: Vec<u8> },
+}
+
+/// PPP authentication method advertised by the server in its LCP
+/// `Configure-Request`. v0.1 supports PAP ([RFC 1334]) and CHAP-MD5
+/// ([RFC 1994]); MS-CHAPv2 lands in a follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthMethod {
+    #[default]
+    Pap,
+    ChapMd5,
 }
 
 // =============================================================================
@@ -126,10 +147,13 @@ struct LcpServer {
     /// `True` once LCP Opened (i.e. `tlu` fired). Drives the
     /// session-level transition to the auth phase.
     opened: bool,
+    /// Authentication method the server advertises in its outbound
+    /// `Configure-Request`. PAP or CHAP-MD5 today.
+    auth_method: AuthMethod,
 }
 
 impl LcpServer {
-    fn new() -> Self {
+    fn new(auth_method: AuthMethod) -> Self {
         Self {
             fsm: Fsm::new(),
             last_cr_id: 0,
@@ -137,6 +161,7 @@ impl LcpServer {
             pending_nak: Vec::new(),
             pending_nak_is_reject: false,
             opened: false,
+            auth_method,
         }
     }
 
@@ -222,12 +247,22 @@ impl LcpServer {
     }
 
     /// Render the server's outbound LCP options for its own
-    /// Configure-Request: `Auth-Protocol = PAP` only (v0.1).
-    fn write_own_cr_options(buf: &mut Vec<u8>) {
-        let proto = auth_protocol_pap();
-        let mut tmp = [0u8; LCP_OPT_HEADER_LEN + 2];
-        let n = write_option(&mut tmp, LcpOptionId::AuthProtocol.as_u8(), &proto);
-        buf.extend_from_slice(&tmp[..n]);
+    /// Configure-Request: just the negotiated `Auth-Protocol`.
+    fn write_own_cr_options(&self, buf: &mut Vec<u8>) {
+        match self.auth_method {
+            AuthMethod::Pap => {
+                let proto = auth_protocol_pap();
+                let mut tmp = [0u8; LCP_OPT_HEADER_LEN + 2];
+                let n = write_option(&mut tmp, LcpOptionId::AuthProtocol.as_u8(), &proto);
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            AuthMethod::ChapMd5 => {
+                let proto = auth_protocol_chap_md5();
+                let mut tmp = [0u8; LCP_OPT_HEADER_LEN + 3];
+                let n = write_option(&mut tmp, LcpOptionId::AuthProtocol.as_u8(), &proto);
+                buf.extend_from_slice(&tmp[..n]);
+            }
+        }
     }
 }
 
@@ -439,15 +474,24 @@ fn push_v4_option(buf: &mut Vec<u8>, opt_type: u8, addr: [u8; 4]) {
 enum Phase {
     /// LCP negotiating; auth has not started.
     Establish,
-    /// LCP Opened, PAP `Authenticate-Request` not yet received.
+    /// LCP Opened. For PAP, waiting for the peer's
+    /// `Authenticate-Request`. For CHAP, the server's `Challenge`
+    /// has been sent and we're waiting for the peer's `Response`.
     AuthPending,
-    /// PAP credentials handed to the session task via `NeedPapAuth`;
-    /// waiting for [`Ppp::on_auth_result`].
-    AuthInFlight { pap_id: u8 },
+    /// PAP credentials handed to the session task via `NeedPapAuth`,
+    /// or CHAP response handed via `NeedChapAuth`; waiting for
+    /// [`Ppp::on_auth_result`].
+    AuthInFlight { method: InFlightMethod },
     /// Auth accepted; IPCP negotiating.
     Network,
     /// LCP terminating or terminated.
     Dead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InFlightMethod {
+    Pap { pap_id: u8 },
+    Chap { chap_id: u8 },
 }
 
 /// PPP driver orchestrator. Owns LCP + IPCP sub-drivers and the
@@ -465,19 +509,28 @@ pub struct Ppp {
     /// arbitrary peer address (MikroTik defaults to a 10.112/16
     /// pool) and on-link routing fails.
     local_ip: [u8; 4],
+    /// CHAP challenge most recently sent to the peer ([RFC 1994]
+    /// §4.1) — populated when entering `AuthPending` under CHAP
+    /// and forwarded as `CHAP-Challenge` to RADIUS once the peer's
+    /// `Response` arrives. Empty under PAP.
+    chap_challenge: Vec<u8>,
+    /// Identifier counter for outbound CHAP packets.
+    chap_id_counter: u8,
 }
 
 impl Ppp {
     /// Build the driver. The caller must invoke [`Ppp::open`] to
     /// kick off the LCP exchange.
     #[must_use]
-    pub fn new(local_ip: [u8; 4]) -> Self {
+    pub fn new(local_ip: [u8; 4], auth_method: AuthMethod) -> Self {
         Self {
             phase: Phase::Establish,
-            lcp: LcpServer::new(),
+            lcp: LcpServer::new(auth_method),
             ipcp: None,
             pending_addrs: None,
             local_ip,
+            chap_challenge: Vec::new(),
+            chap_id_counter: 0,
         }
     }
 
@@ -500,6 +553,7 @@ impl Ppp {
         match (self.phase, ProtocolId::from_u16(frame.protocol)) {
             (_, Some(ProtocolId::Lcp)) => self.handle_lcp(frame.info),
             (Phase::AuthPending, Some(ProtocolId::Pap)) => self.handle_pap(frame.info),
+            (Phase::AuthPending, Some(ProtocolId::Chap)) => self.handle_chap(frame.info),
             (Phase::Network, Some(ProtocolId::Ipcp)) => self.handle_ipcp(frame.info),
             // Anything else: silently drop for v0.1. CHAP/EAP/IP
             // traffic in the wrong phase, or before IPCP convergence,
@@ -526,33 +580,22 @@ impl Ppp {
         }
     }
 
-    /// Apply a RADIUS verdict to the in-flight PAP exchange.
+    /// Apply a RADIUS verdict to the in-flight authentication
+    /// exchange (PAP or CHAP-MD5).
     pub fn on_auth_result(&mut self, verdict: AuthVerdict) -> PppStep {
-        let Phase::AuthInFlight { pap_id } = self.phase else {
+        let Phase::AuthInFlight { method } = self.phase else {
             return PppStep::default();
         };
         let mut step = PppStep::default();
-        let mut body = [0u8; 16];
-        match verdict {
-            AuthVerdict::Accept { addrs } => {
+        match (method, verdict) {
+            (InFlightMethod::Pap { pap_id }, AuthVerdict::Accept { addrs }) => {
+                let mut body = [0u8; 16];
                 let n = pap::encode_response(&mut body, pap::Code::AuthenticateAck, pap_id, &[]);
                 step.push_frame(encode_pap_frame(&body[..n]));
-                self.pending_addrs = Some(addrs);
-                self.phase = Phase::Network;
-                // Kick off IPCP.
-                let mut ipcp = IpcpServer::new(addrs, self.local_ip);
-                let fsm_step = ipcp.open();
-                self.ipcp = Some(ipcp);
-                let ipcp_step = self.render_ipcp_step(fsm_step);
-                step.frames.extend(ipcp_step.frames);
-                step.timer_starts.extend(ipcp_step.timer_starts);
-                step.timer_stops.extend(ipcp_step.timer_stops);
-                if ipcp_step.event.is_some() {
-                    step.event = ipcp_step.event;
-                }
-                step.finished |= ipcp_step.finished;
+                self.advance_to_network(&mut step, addrs);
             }
-            AuthVerdict::Reject { message } => {
+            (InFlightMethod::Pap { pap_id }, AuthVerdict::Reject { message }) => {
+                let mut body = [0u8; 16];
                 let n = pap::encode_response(
                     &mut body,
                     pap::Code::AuthenticateNak,
@@ -560,19 +603,58 @@ impl Ppp {
                     message.get(..message.len().min(11)).unwrap_or(&[]),
                 );
                 step.push_frame(encode_pap_frame(&body[..n]));
-                // Tear down LCP — peer should follow up with a
-                // TerminateReq but if not, the negotiation timer
-                // ensures eventual cleanup.
-                let close = self.lcp.fsm.step(FsmEvent::Close);
-                let close_step = self.render_lcp_step(close);
-                step.frames.extend(close_step.frames);
-                step.timer_starts.extend(close_step.timer_starts);
-                step.timer_stops.extend(close_step.timer_stops);
-                step.finished = true;
-                self.phase = Phase::Dead;
+                self.tear_down_after_reject(&mut step);
+            }
+            (InFlightMethod::Chap { chap_id }, AuthVerdict::Accept { addrs }) => {
+                step.push_frame(encode_chap_terminal(chap::Code::Success, chap_id, b""));
+                self.advance_to_network(&mut step, addrs);
+            }
+            (InFlightMethod::Chap { chap_id }, AuthVerdict::Reject { message }) => {
+                // CHAP Failure carries an opaque message (free-form
+                // text per [RFC 1994] §4.3); cap to keep the frame
+                // small.
+                let trimmed = message.get(..message.len().min(255)).unwrap_or(&[]);
+                step.push_frame(encode_chap_terminal(
+                    chap::Code::Failure,
+                    chap_id,
+                    trimmed,
+                ));
+                self.tear_down_after_reject(&mut step);
             }
         }
         step
+    }
+
+    fn advance_to_network(&mut self, step: &mut PppStep, addrs: AssignedAddrs) {
+        self.pending_addrs = Some(addrs);
+        self.phase = Phase::Network;
+        let mut ipcp = IpcpServer::new(addrs, self.local_ip);
+        let fsm_step = ipcp.open();
+        self.ipcp = Some(ipcp);
+        let ipcp_step = self.render_ipcp_step(fsm_step);
+        step.frames.extend(ipcp_step.frames);
+        step.timer_starts.extend(ipcp_step.timer_starts);
+        step.timer_stops.extend(ipcp_step.timer_stops);
+        if ipcp_step.event.is_some() {
+            step.event = ipcp_step.event;
+        }
+        step.finished |= ipcp_step.finished;
+    }
+
+    fn tear_down_after_reject(&mut self, step: &mut PppStep) {
+        let close = self.lcp.fsm.step(FsmEvent::Close);
+        let close_step = self.render_lcp_step(close);
+        step.frames.extend(close_step.frames);
+        step.timer_starts.extend(close_step.timer_starts);
+        step.timer_stops.extend(close_step.timer_stops);
+        step.finished = true;
+        self.phase = Phase::Dead;
+    }
+
+    fn next_chap_id(&mut self) -> u8 {
+        let id = self.chap_id_counter;
+        self.chap_id_counter = self.chap_id_counter.wrapping_add(1);
+        id
     }
 
     fn handle_lcp(&mut self, info: &[u8]) -> PppStep {
@@ -589,12 +671,45 @@ impl Ppp {
             return PppStep::default();
         };
         self.phase = Phase::AuthInFlight {
-            pap_id: req.identifier,
+            method: InFlightMethod::Pap {
+                pap_id: req.identifier,
+            },
         };
         PppStep {
             event: Some(PppEvent::NeedPapAuth {
                 peer_id: req.peer_id.to_vec(),
                 password: req.password.to_vec(),
+            }),
+            ..PppStep::default()
+        }
+    }
+
+    fn handle_chap(&mut self, info: &[u8]) -> PppStep {
+        // We expect a CHAP `Response` here. Anything else (a stray
+        // Challenge from the peer, Success/Failure, malformed) is
+        // dropped.
+        let Ok(resp) = chap::decode_challenge_response(info) else {
+            return PppStep::default();
+        };
+        // CHAP-MD5 response must be exactly 16 bytes ([RFC 1994] §4.1).
+        if resp.value.len() != 16 {
+            return PppStep::default();
+        }
+        let mut response = [0u8; 16];
+        response.copy_from_slice(resp.value);
+        let username = resp.name.to_vec();
+        let challenge = self.chap_challenge.clone();
+        self.phase = Phase::AuthInFlight {
+            method: InFlightMethod::Chap {
+                chap_id: resp.identifier,
+            },
+        };
+        PppStep {
+            event: Some(PppEvent::NeedChapAuth {
+                username,
+                chap_id: resp.identifier,
+                challenge,
+                response,
             }),
             ..PppStep::default()
         }
@@ -626,6 +741,17 @@ impl Ppp {
             self.lcp.opened = true;
             // LCP Opened → enter auth phase.
             self.phase = Phase::AuthPending;
+            // Under CHAP-MD5 the server is the authenticator; emit
+            // a Challenge ([RFC 1994] §4.1) immediately so the peer
+            // can compute its response. Under PAP the peer drives
+            // the exchange and we wait for its `Authenticate-Request`.
+            if self.lcp.auth_method == AuthMethod::ChapMd5 {
+                let challenge = generate_chap_challenge();
+                let chap_id = self.next_chap_id();
+                let frame = encode_chap_challenge(chap_id, &challenge);
+                self.chap_challenge = challenge;
+                out.push_frame(frame);
+            }
         }
         if step.notify.down {
             self.lcp.opened = false;
@@ -658,7 +784,7 @@ impl Ppp {
 
 impl Default for Ppp {
     fn default() -> Self {
-        Self::new([0, 0, 0, 0])
+        Self::new([0, 0, 0, 0], AuthMethod::Pap)
     }
 }
 
@@ -687,7 +813,7 @@ fn render_send(
     let (code, identifier) = match send {
         FsmSend::ConfigureRequest => {
             let id = lcp.fsm.bump_identifier();
-            LcpServer::write_own_cr_options(&mut body);
+            lcp.write_own_cr_options(&mut body);
             (LcpCode::ConfigureRequest, id)
         }
         FsmSend::ConfigureAck => {
@@ -783,6 +909,52 @@ fn encode_pap_frame(packet: &[u8]) -> Vec<u8> {
     out
 }
 
+fn encode_chap_frame(packet: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; 4 + packet.len()];
+    let n = encode_frame(&mut out, ProtocolId::Chap.as_u16(), packet);
+    out.truncate(n);
+    out
+}
+
+/// Encode a CHAP `Challenge` PPP frame ready for SSTP wrapping.
+/// Server name in the Name field is informational ([RFC 1994]
+/// §4.1) — clients commonly ignore it.
+fn encode_chap_challenge(identifier: u8, challenge: &[u8]) -> Vec<u8> {
+    const NAME: &[u8] = b"sstp-server";
+    let total = chap::HEADER_LEN + 1 + challenge.len() + NAME.len();
+    let mut packet = vec![0u8; total];
+    let n = chap::encode_challenge_response(
+        &mut packet,
+        chap::Code::Challenge,
+        identifier,
+        challenge,
+        NAME,
+    );
+    packet.truncate(n);
+    encode_chap_frame(&packet)
+}
+
+/// Encode a CHAP `Success` or `Failure` PPP frame.
+fn encode_chap_terminal(code: chap::Code, identifier: u8, message: &[u8]) -> Vec<u8> {
+    let total = chap::HEADER_LEN + message.len();
+    let mut packet = vec![0u8; total];
+    let n = chap::encode_terminal(&mut packet, code, identifier, message);
+    packet.truncate(n);
+    encode_chap_frame(&packet)
+}
+
+/// Generate a fresh 16-byte CHAP challenge ([RFC 1994] §4.1
+/// recommends ≥8 octets; 16 matches MD5 block size and is what
+/// FreeRADIUS / strongSwan emit).
+fn generate_chap_challenge() -> Vec<u8> {
+    use std::mem::MaybeUninit;
+    let mut buf = [MaybeUninit::<u8>::uninit(); 16];
+    crate::crypto::rand::fill_bytes(&mut buf);
+    // SAFETY: fill_bytes fully initialises every element.
+    let init = unsafe { buf.map(|x| x.assume_init()) };
+    init.to_vec()
+}
+
 /// Build a PPP frame containing an LCP-format packet (Code +
 /// Identifier + Length + body) for the given protocol id.
 fn encode_protocol_packet(protocol: u16, code: u8, identifier: u8, body: &[u8]) -> Vec<u8> {
@@ -839,7 +1011,7 @@ mod tests {
 
     #[test]
     fn open_emits_lcp_configure_request_with_pap() {
-        let mut ppp = Ppp::new([0,0,0,0]);
+        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
         let step = ppp.open();
         assert_eq!(step.frames.len(), 1);
         let (proto, code, _id, opts) = peel(&step.frames[0]);
@@ -855,7 +1027,7 @@ mod tests {
 
     #[test]
     fn ack_acceptable_lcp_cr() {
-        let mut ppp = Ppp::new([0,0,0,0]);
+        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
         let _open = ppp.open();
         // Client CR: MRU=1500, Magic, PFC, ACFC.
         let opts: Vec<u8> = vec![
@@ -876,7 +1048,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_lcp_option() {
-        let mut ppp = Ppp::new([0,0,0,0]);
+        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
         let _open = ppp.open();
         // Option type 99 (unknown) plus a known MRU.
         let opts: Vec<u8> = vec![
@@ -895,7 +1067,7 @@ mod tests {
 
     #[test]
     fn lcp_opened_transitions_to_auth_pending() {
-        let mut ppp = Ppp::new([0,0,0,0]);
+        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
         let _ = ppp.open();
         // Client sends an Ack to our CR (using id=1, the bumped id).
         let ack = encode_lcp_frame(
@@ -930,7 +1102,7 @@ mod tests {
 
     #[test]
     fn pap_request_emits_need_auth_event() {
-        let mut ppp = Ppp::new([0,0,0,0]);
+        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
         drive_to_auth_pending(&mut ppp);
 
         // PAP Authenticate-Request: id=2, peer-id="alice", pw="hunter2".
@@ -959,12 +1131,17 @@ mod tests {
             }
             other => panic!("expected NeedPapAuth, got {other:?}"),
         }
-        assert!(matches!(ppp.phase, Phase::AuthInFlight { pap_id: 2 }));
+        assert!(matches!(
+            ppp.phase,
+            Phase::AuthInFlight {
+                method: InFlightMethod::Pap { pap_id: 2 }
+            }
+        ));
     }
 
     #[test]
     fn auth_accept_acks_pap_and_starts_ipcp() {
-        let mut ppp = Ppp::new([0,0,0,0]);
+        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
         drive_to_auth_pending(&mut ppp);
         // Send a PAP request to advance to AuthInFlight.
         let pap_body = vec![
@@ -1000,7 +1177,7 @@ mod tests {
 
     #[test]
     fn ipcp_naks_zero_ip_with_assigned() {
-        let mut ppp = Ppp::new([0,0,0,0]);
+        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
         drive_to_auth_pending(&mut ppp);
         let pap_body = vec![
             pap::Code::AuthenticateRequest.as_u8(),
@@ -1034,7 +1211,7 @@ mod tests {
 
     #[test]
     fn ipcp_acks_matching_ip() {
-        let mut ppp = Ppp::new([0,0,0,0]);
+        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
         drive_to_auth_pending(&mut ppp);
         let pap_body = vec![
             pap::Code::AuthenticateRequest.as_u8(),
@@ -1063,7 +1240,7 @@ mod tests {
 
     #[test]
     fn auth_reject_emits_nak_and_terminates() {
-        let mut ppp = Ppp::new([0,0,0,0]);
+        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
         drive_to_auth_pending(&mut ppp);
         let pap_body = vec![
             pap::Code::AuthenticateRequest.as_u8(),

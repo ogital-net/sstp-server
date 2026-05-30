@@ -33,7 +33,7 @@ use crate::cli::DataPathMode;
 use crate::crypto::tls::{SslContext, TlsStream};
 use crate::kppp::session::KpppSession;
 use crate::metrics;
-use crate::ppp::{AuthVerdict, Ppp, PppEvent, PppStep, TimerOwner};
+use crate::ppp::{AuthMethod, AuthVerdict, Ppp, PppEvent, PppStep, TimerOwner};
 use crate::sstp::preamble;
 
 /// Bounded depth for the per-session control channel. Control commands
@@ -208,6 +208,7 @@ pub async fn run(
     tls_ctx: SslContext,
     auth_bridge: AuthBridge,
     local_ip: Ipv4Addr,
+    auth_method: AuthMethod,
     data_path: DataPathMode,
 ) {
     info!(%id, %peer, "session accepted");
@@ -306,6 +307,7 @@ pub async fn run(
         auth_bridge,
         cert_hash,
         local_ip,
+        auth_method,
         data_path,
     )
     .await;
@@ -334,6 +336,7 @@ async fn drive_sstp(
     auth_bridge: AuthBridge,
     cert_hash: [u8; 32],
     local_ip: Ipv4Addr,
+    auth_method: AuthMethod,
     data_path: DataPathMode,
 ) {
     use std::future::poll_fn;
@@ -398,6 +401,7 @@ async fn drive_sstp(
         &mut ppp_timer,
         &auth,
         local_ip,
+        auth_method,
         &mut kppp,
         data_path,
             &mut pending_shaping,
@@ -541,6 +545,7 @@ async fn drive_sstp(
                     &mut ppp_timer,
                     &auth,
                     local_ip,
+                    auth_method,
                     &mut kppp,
                     data_path,
                                     &mut pending_shaping,
@@ -563,6 +568,7 @@ async fn drive_sstp(
                     &mut ppp_timer,
                     &auth,
                     local_ip,
+                    auth_method,
                     &mut kppp,
                     data_path,
                                     &mut pending_shaping,
@@ -592,6 +598,7 @@ async fn drive_sstp(
                     &mut ppp_timer,
                     &auth,
                     local_ip,
+                    auth_method,
                     &mut kppp,
                     data_path,
                                     &mut pending_shaping,
@@ -616,6 +623,7 @@ async fn drive_sstp(
                         &mut ppp_timer,
                         &auth,
                         local_ip,
+                        auth_method,
                         &mut kppp,
                         data_path,
                                             &mut pending_shaping,
@@ -716,6 +724,7 @@ async fn drive_sstp(
                                 &mut ppp_timer,
                                 &auth,
                                 local_ip,
+                                auth_method,
                                 &mut kppp,
                                 data_path,
                                                             &mut pending_shaping,
@@ -793,6 +802,7 @@ async fn drive_sstp(
                                 &mut ppp_timer,
                                 &auth,
                                 local_ip,
+                                auth_method,
                                 &mut kppp,
                                 data_path,
                                                             &mut pending_shaping,
@@ -822,6 +832,7 @@ async fn drive_sstp(
                                     &mut ppp_timer,
                                     &auth,
                                     local_ip,
+                                    auth_method,
                                     &mut kppp,
                                     data_path,
                                                                     &mut pending_shaping,
@@ -863,6 +874,7 @@ async fn drive_sstp(
                                         &mut ppp_timer,
                                         &auth,
                                         local_ip,
+                                        auth_method,
                                         &mut kppp,
                                         data_path,
                                                                             &mut pending_shaping,
@@ -923,6 +935,7 @@ async fn handle_sstp_step(
     ppp_timer: &mut Option<(TimerOwner, std::pin::Pin<Box<tokio::time::Sleep>>)>,
     auth: &AuthCtx<'_>,
     local_ip: Ipv4Addr,
+    auth_method: AuthMethod,
     kppp: &mut Option<KpppSession>,
     data_path: DataPathMode,
     pending_shaping: &mut Option<crate::shape::ShapingPolicy>,
@@ -937,7 +950,7 @@ async fn handle_sstp_step(
             return true;
         }
         info!(%id, "starting PPP control plane");
-        let mut new_ppp = Ppp::new(local_ip.octets());
+        let mut new_ppp = Ppp::new(local_ip.octets(), auth_method);
         let step = new_ppp.open();
         *ppp = Some(new_ppp);
         if !handle_ppp_step(
@@ -948,6 +961,7 @@ async fn handle_sstp_step(
             ppp_timer,
             auth,
             local_ip,
+            auth_method,
             kppp,
             data_path,
             pending_shaping,
@@ -976,6 +990,7 @@ async fn handle_ppp_step(
     ppp_timer: &mut Option<(TimerOwner, std::pin::Pin<Box<tokio::time::Sleep>>)>,
     auth: &AuthCtx<'_>,
     local_ip: Ipv4Addr,
+    _auth_method: AuthMethod,
     kppp: &mut Option<KpppSession>,
     data_path: DataPathMode,
     pending_shaping: &mut Option<crate::shape::ShapingPolicy>,
@@ -1034,6 +1049,32 @@ async fn handle_ppp_step(
                 }
                 step = ppp.on_auth_result(verdict);
                 // Loop to render the new step.
+                continue;
+            }
+            Some(PppEvent::NeedChapAuth {
+                username,
+                chap_id,
+                challenge,
+                response,
+            }) => {
+                let user = String::from_utf8_lossy(&username).into_owned();
+                info!(%id, user = %user, chap_id, "CHAP-MD5 response received; dispatching to RADIUS");
+                let outcome = auth
+                    .bridge
+                    .submit_chap(user.clone(), chap_id, response, challenge, auth.peer, None)
+                    .await;
+                let crate::auth::bridge::ChapOutcome { verdict, shaping } = outcome;
+                match &verdict {
+                    AuthVerdict::Accept { addrs } => {
+                        info!(%id, user = %user, ip = ?addrs.ip, shaping = ?shaping, "RADIUS Access-Accept (CHAP)");
+                        *pending_shaping = shaping;
+                    }
+                    AuthVerdict::Reject { message } => {
+                        let msg = String::from_utf8_lossy(message);
+                        info!(%id, user = %user, reason = %msg, "RADIUS Access-Reject (CHAP)");
+                    }
+                }
+                step = ppp.on_auth_result(verdict);
                 continue;
             }
             Some(PppEvent::NetworkUp(addrs)) => {

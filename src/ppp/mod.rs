@@ -17,4 +17,4 @@ pub mod fsm;
 pub mod ipcp;
 pub mod lcp;
 
-pub use driver::{AssignedAddrs, AuthVerdict, Ppp, PppEvent, PppStep, TimerOwner};
+pub use driver::{AssignedAddrs, AuthMethod, AuthVerdict, Ppp, PppEvent, PppStep, TimerOwner};

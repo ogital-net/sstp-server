@@ -22,7 +22,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
-use crate::auth::client::authenticate_pap;
+use crate::auth::client::{authenticate_chap_md5, authenticate_pap};
 use crate::auth::request::AccessRequestCtx;
 use crate::auth::{AuthAccept, AuthError};
 use crate::ppp::{AssignedAddrs, AuthVerdict};
@@ -66,8 +66,34 @@ pub struct PapOutcome {
     pub shaping: Option<ShapingPolicy>,
 }
 
+/// A CHAP-MD5 response to be verified against RADIUS.
+///
+/// The 16-byte `response` and original `challenge` are forwarded to
+/// the authenticator as `CHAP-Password` / `CHAP-Challenge`; we never
+/// hash anything in-process.
+#[derive(Debug)]
+pub struct ChapJob {
+    pub username: String,
+    pub chap_id: u8,
+    pub response: [u8; 16],
+    pub challenge: Vec<u8>,
+    pub peer: SocketAddr,
+    pub nas_identifier: Option<String>,
+    pub reply: oneshot::Sender<ChapOutcome>,
+}
+
+/// Result of a CHAP-MD5 RADIUS round-trip. Mirrors [`PapOutcome`];
+/// kept as a separate type so call sites don't have to muddle method
+/// identity at the bridge boundary.
+#[derive(Debug)]
+pub struct ChapOutcome {
+    pub verdict: AuthVerdict,
+    pub shaping: Option<ShapingPolicy>,
+}
+
 enum Job {
     Pap(PapJob),
+    Chap(ChapJob),
 }
 
 /// Cloneable handle to the auth dispatcher. Cheap to clone — wraps
@@ -128,6 +154,7 @@ impl AuthBridge {
                 tokio::spawn(async move {
                     match job {
                         Job::Pap(j) => run_pap(client, servers, j).await,
+                        Job::Chap(j) => run_chap(client, servers, j).await,
                     }
                 });
             }
@@ -165,6 +192,43 @@ impl AuthBridge {
             };
         }
         rx.await.unwrap_or_else(|_| PapOutcome {
+            verdict: AuthVerdict::Reject {
+                message: b"auth dispatcher dropped reply".to_vec(),
+            },
+            shaping: None,
+        })
+    }
+
+    /// Submit a CHAP-MD5 response. Same backpressure / drop semantics
+    /// as [`AuthBridge::submit_pap`].
+    pub async fn submit_chap(
+        &self,
+        username: String,
+        chap_id: u8,
+        response: [u8; 16],
+        challenge: Vec<u8>,
+        peer: SocketAddr,
+        nas_identifier: Option<String>,
+    ) -> ChapOutcome {
+        let (reply, rx) = oneshot::channel();
+        let job = Job::Chap(ChapJob {
+            username,
+            chap_id,
+            response,
+            challenge,
+            peer,
+            nas_identifier,
+            reply,
+        });
+        if self.tx.send(job).await.is_err() {
+            return ChapOutcome {
+                verdict: AuthVerdict::Reject {
+                    message: b"auth dispatcher unavailable".to_vec(),
+                },
+                shaping: None,
+            };
+        }
+        rx.await.unwrap_or_else(|_| ChapOutcome {
             verdict: AuthVerdict::Reject {
                 message: b"auth dispatcher dropped reply".to_vec(),
             },
@@ -215,6 +279,67 @@ async fn run_pap(client: Arc<RadiusClient>, servers: Arc<[(SocketAddr, Arc<[u8]>
         |e| format!("auth failed: {e}"),
     );
     let _ = job.reply.send(PapOutcome {
+        verdict: AuthVerdict::Reject {
+            message: msg.into_bytes(),
+        },
+        shaping: None,
+    });
+}
+
+async fn run_chap(
+    client: Arc<RadiusClient>,
+    servers: Arc<[(SocketAddr, Arc<[u8]>)]>,
+    job: ChapJob,
+) {
+    let peer_ip = job.peer.ip().to_string();
+    let ctx = AccessRequestCtx {
+        username: &job.username,
+        calling_station_id: Some(&peer_ip),
+        nas_identifier: job.nas_identifier.as_deref(),
+    };
+
+    let mut last_transport_err: Option<String> = None;
+    for (addr, secret) in servers.iter() {
+        match authenticate_chap_md5(
+            &client,
+            *addr,
+            secret,
+            &ctx,
+            job.chap_id,
+            &job.response,
+            &job.challenge,
+        )
+        .await
+        {
+            Ok(accept) => {
+                let shaping = accept.shaping;
+                let _ = job.reply.send(ChapOutcome {
+                    verdict: AuthVerdict::Accept {
+                        addrs: project_addrs(&accept),
+                    },
+                    shaping,
+                });
+                return;
+            }
+            Err(AuthError::Rejected(msg)) => {
+                let bytes = msg.unwrap_or_else(|| "access rejected".into()).into_bytes();
+                let _ = job.reply.send(ChapOutcome {
+                    verdict: AuthVerdict::Reject { message: bytes },
+                    shaping: None,
+                });
+                return;
+            }
+            Err(e) => {
+                warn!(radius = %addr, user = %job.username, error = %e, "RADIUS CHAP attempt failed; trying next server");
+                last_transport_err = Some(e.to_string());
+            }
+        }
+    }
+    let msg = last_transport_err.map_or_else(
+        || "auth failed: no RADIUS servers reachable".into(),
+        |e| format!("auth failed: {e}"),
+    );
+    let _ = job.reply.send(ChapOutcome {
         verdict: AuthVerdict::Reject {
             message: msg.into_bytes(),
         },

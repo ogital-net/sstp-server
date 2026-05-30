@@ -69,6 +69,28 @@ pub async fn authenticate_pap(
     project_terminal(outcome, secret)
 }
 
+/// CHAP-MD5 authentication round-trip ([RFC 1994] + RFC 2865 §5.40).
+///
+/// Hash validation lives entirely in the RADIUS authenticator: we
+/// forward `(chap_ident, response, challenge)` as `CHAP-Password` /
+/// `CHAP-Challenge` attributes and propagate the verdict.
+pub async fn authenticate_chap_md5(
+    client: &RadiusClient,
+    peer: SocketAddr,
+    secret: &[u8],
+    ctx: &AccessRequestCtx<'_>,
+    chap_ident: u8,
+    response: &[u8; 16],
+    challenge: &[u8],
+) -> AuthResult {
+    let outcome = client
+        .access_request(peer, secret, |buf, _ra| {
+            super::request::apply_chap_md5(buf, ctx, chap_ident, response, challenge)
+        })
+        .await?;
+    project_terminal(outcome, secret)
+}
+
 /// MS-CHAPv2 authentication round-trip.
 #[allow(clippy::too_many_arguments)]
 pub async fn authenticate_mschapv2(

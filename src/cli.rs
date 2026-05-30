@@ -54,6 +54,7 @@ OPTIONS:
     -F, --log-format <fmt>       text | json | auto (default: auto)
     -L, --log-file <path>        Log to file instead of stderr
     -D, --data-path <mode>       auto | kernel | tun (default: auto)
+    -M, --auth-method <method>   pap | chap (default: pap)
     -i, --local-ip <ipv4>        Server-side IPv4 for every pppN interface (required)
     -u, --user <name>            Drop privileges to this user after binding sockets (root only)
     -g, --group <name>           Group to drop to (defaults to the user's primary GID)
@@ -90,6 +91,7 @@ n(no-control-socket)\
 F:(log-format)\
 L:(log-file)\
 D:(data-path)\
+M:(auth-method)\
 i:(local-ip)\
 u:(user)\
 g:(group)";
@@ -129,6 +131,9 @@ pub struct Config {
     pub log_file: Option<PathBuf>,
     pub log_level: LevelFilter,
     pub data_path: DataPathMode,
+    /// PPP authentication method advertised to clients. v0.1
+    /// supports PAP and CHAP-MD5; MS-CHAPv2 / EAP land later.
+    pub auth_method: crate::ppp::AuthMethod,
     /// Server-side IPv4 address for every `pppN` interface we bring
     /// up. Required: the kernel needs a P2P address pair to set on
     /// the netdev, and the peer half comes from RADIUS
@@ -226,6 +231,7 @@ where
     let mut log_format = LogFormat::Auto;
     let mut log_file: Option<PathBuf> = None;
     let mut data_path = DataPathMode::Auto;
+    let mut auth_method = crate::ppp::AuthMethod::Pap;
     let mut local_ip: Option<String> = None;
     let mut drop_user: Option<String> = None;
     let mut drop_group: Option<String> = None;
@@ -297,6 +303,20 @@ where
                     }
                 };
             }
+            'M' => {
+                let raw = opt.arg().unwrap_or("");
+                auth_method = match raw {
+                    "pap" => crate::ppp::AuthMethod::Pap,
+                    "chap" | "chap-md5" => crate::ppp::AuthMethod::ChapMd5,
+                    other => {
+                        return Err(ParseError::invalid(
+                            "auth-method",
+                            other,
+                            BadEnumValue("expected one of: pap, chap"),
+                        ));
+                    }
+                };
+            }
             '?' => {
                 let bad = opt.erropt().unwrap_or('?');
                 return Err(ParseError::UnknownOption(bad));
@@ -358,6 +378,7 @@ where
         log_file,
         log_level,
         data_path,
+        auth_method,
         local_ip,
         drop_user,
         drop_group,

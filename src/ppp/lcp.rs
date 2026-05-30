@@ -340,6 +340,16 @@ pub fn auth_protocol_mschapv2() -> [u8; 3] {
     v
 }
 
+/// CHAP-MD5 ([RFC 1994] §3): CHAP protocol id (0xC223) + algorithm
+/// byte 0x05.
+#[must_use]
+pub fn auth_protocol_chap_md5() -> [u8; 3] {
+    let mut v = [0u8; 3];
+    v[0..2].copy_from_slice(&ProtocolId::Chap.as_u16().to_be_bytes());
+    v[2] = 0x05;
+    v
+}
+
 #[must_use]
 pub fn auth_protocol_eap() -> [u8; 2] {
     ProtocolId::Eap.as_u16().to_be_bytes()
@@ -471,6 +481,7 @@ mod tests {
     fn auth_protocol_helpers() {
         assert_eq!(auth_protocol_pap(), [0xc0, 0x23]);
         assert_eq!(auth_protocol_mschapv2(), [0xc2, 0x23, 0x81]);
+        assert_eq!(auth_protocol_chap_md5(), [0xc2, 0x23, 0x05]);
         assert_eq!(auth_protocol_eap(), [0xc2, 0x27]);
     }
 }

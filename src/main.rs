@@ -246,6 +246,7 @@ fn run(config: &Config) -> ExitCode {
         let rx = shutdown_tx.subscribe();
         let listen_addr = config.listen;
         let local_ip = config.local_ip;
+        let auth_method = config.auth_method;
         let data_path = effective_data_path;
         let worker_registry = registry.clone();
         let worker_shutdown = shutdown_tx.clone();
@@ -264,6 +265,7 @@ fn run(config: &Config) -> ExitCode {
                     worker_tls,
                     worker_auth,
                     local_ip,
+                    auth_method,
                     data_path,
                 );
             })
@@ -446,6 +448,7 @@ fn io_worker_main(
     tls_ctx: SharedTlsContext,
     auth_bridge: AuthBridge,
     local_ip: std::net::Ipv4Addr,
+    auth_method: crate::ppp::AuthMethod,
     data_path: cli::DataPathMode,
 ) {
     set_io_thread_realtime(id);
@@ -473,6 +476,7 @@ fn io_worker_main(
             tls_ctx,
             auth_bridge,
             local_ip,
+            auth_method,
             data_path,
         )
         .await;
@@ -489,6 +493,7 @@ async fn accept_loop(
     tls_ctx: SharedTlsContext,
     auth_bridge: AuthBridge,
     local_ip: std::net::Ipv4Addr,
+    auth_method: crate::ppp::AuthMethod,
     data_path: cli::DataPathMode,
 ) {
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
@@ -518,7 +523,7 @@ async fn accept_loop(
                         .clone();
                     let session_auth = auth_bridge.clone();
                     let handle = tokio::task::spawn_local(session::run(
-                        stream, peer, id, registry, control_rx, drain_rx, session_tls, session_auth, local_ip, data_path,
+                        stream, peer, id, registry, control_rx, drain_rx, session_tls, session_auth, local_ip, auth_method, data_path,
                     ));
                     tasks.push(handle);
                 }

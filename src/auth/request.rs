@@ -86,6 +86,32 @@ pub fn apply_pap(
     Ok(())
 }
 
+/// Append a CHAP-MD5 credential ([RFC 1994] + RFC 2865 §5.3 / §5.40).
+///
+/// Validation of the response hash itself is delegated to the RADIUS
+/// authenticator: we forward `CHAP-Password` (the 1-byte CHAP
+/// identifier followed by the 16-byte response hash from the peer)
+/// and `CHAP-Challenge` (the original 16-byte challenge we sent).
+///
+/// # Errors
+///
+/// Forwards [`CodecError`] on packet overflow.
+pub fn apply_chap_md5(
+    buf: &mut PacketBuffer,
+    ctx: &AccessRequestCtx<'_>,
+    chap_ident: u8,
+    response: &[u8; 16],
+    challenge: &[u8],
+) -> Result<(), CodecError> {
+    apply_common(buf, ctx)?;
+    let mut chap_password = [0u8; 17];
+    chap_password[0] = chap_ident;
+    chap_password[1..].copy_from_slice(response);
+    buf.add_attribute(rfc::attrs::CHAP_PASSWORD.code, &chap_password)?;
+    buf.add_attribute(rfc::attrs::CHAP_CHALLENGE.code, challenge)?;
+    Ok(())
+}
+
 /// Append an MS-CHAPv2 credential (RFC 2548 §2.3.2, RFC 2759).
 ///
 /// # Errors
@@ -185,6 +211,38 @@ mod tests {
         assert!(names.contains(&1), "User-Name");
         assert!(names.contains(&2), "User-Password");
         assert!(names.contains(&80), "Message-Authenticator");
+    }
+
+    #[test]
+    fn chap_md5_emits_chap_password_and_challenge() {
+        let secret = b"shh";
+        let auth = [0x77; 16];
+        let response = [0xAB; 16];
+        let challenge = [0xCD; 16];
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 4);
+        apply_chap_md5(&mut buf, &ctx(), 9, &response, &challenge).unwrap();
+        let sealed = buf
+            .seal_as_random_authenticator_request(&auth, secret)
+            .unwrap();
+        let mut saw_password = false;
+        let mut saw_challenge = false;
+        for raw in radius_tokio::attributes::iter(sealed.attributes()).filter_map(Result::ok) {
+            match raw.attribute_type() {
+                3 => {
+                    saw_password = true;
+                    let v = raw.value();
+                    assert_eq!(v.len(), 17, "CHAP-Password is id + 16 bytes");
+                    assert_eq!(v[0], 9, "chap ident byte");
+                    assert_eq!(&v[1..], &response, "response hash");
+                }
+                60 => {
+                    saw_challenge = true;
+                    assert_eq!(raw.value(), &challenge);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_password && saw_challenge);
     }
 
     #[test]
