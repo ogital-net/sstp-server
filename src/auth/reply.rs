@@ -49,6 +49,8 @@ pub fn decode_accept(
         microsoft::attrs::MS_MPPE_RECV_KEY,
     )?;
 
+    let shaping = mikrotik_rate_limit(attrs);
+
     Ok(AuthAccept {
         framed_ip,
         framed_netmask,
@@ -59,6 +61,7 @@ pub fn decode_accept(
         secondary_nbns,
         mppe_send_key,
         mppe_recv_key,
+        shaping,
     })
 }
 
@@ -66,6 +69,32 @@ pub fn decode_accept(
 #[must_use]
 pub fn reject_reason(attrs: &[u8]) -> Option<String> {
     radius_tokio::attributes::first(attrs, rfc::attrs::REPLY_MESSAGE).map(str::to_owned)
+}
+
+/// Decode a `Mikrotik-Rate-Limit` VSA (vendor 14988, attr 8) into a
+/// [`crate::shape::ShapingPolicy`], if present and parseable.
+///
+/// A malformed value is *not* fatal: we log it and return `None` so
+/// the session still comes up unshaped — bad RADIUS dictionaries are
+/// far more common than bad authenticators, and a typo in a NAS-side
+/// rate string shouldn't drop every login. An empty policy (parser
+/// succeeded but no rate fields were set) likewise collapses to
+/// `None` so callers don't have to special-case it.
+fn mikrotik_rate_limit(attrs: &[u8]) -> Option<crate::shape::ShapingPolicy> {
+    use radius_tokio::typed::{VsaAttr, WText};
+    let value = radius_tokio::attributes::first_vsa(attrs, VsaAttr::<WText>::new(14988, 8))?;
+    match crate::shape::mikrotik::parse(value) {
+        Ok(p) if !p.is_empty() => Some(p),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                value = %value,
+                "Mikrotik-Rate-Limit parse failed; ignoring shaping policy"
+            );
+            None
+        }
+    }
 }
 
 fn mppe_key(
@@ -137,5 +166,50 @@ mod tests {
             err,
             AuthError::MissingAttribute("Framed-IP-Address")
         ));
+    }
+
+    #[test]
+    fn mikrotik_rate_limit_populates_shaping() {
+        use radius_tokio::typed::{VsaAttr, WText};
+        let secret = b"shh";
+        let auth = [0x11; 16];
+        let mut reply = Reply::new(Code::ACCESS_ACCEPT, 7);
+        reply
+            .add(rfc::attrs::FRAMED_IP_ADDRESS, Ipv4Addr::new(10, 0, 0, 1))
+            .unwrap();
+        // Mikrotik names rates client-POV: tx=client→server (ingress on
+        // server's pppN), rx=server→client (egress).
+        reply
+            .add_vsa(VsaAttr::<WText>::new(14988, 8), "1M/2M")
+            .unwrap();
+        let sealed = reply.seal_for(&auth, secret);
+        let attrs = &sealed.as_bytes()[20..];
+        let acc = decode_accept(attrs, secret, &auth).unwrap();
+        let shaping = acc.shaping.expect("shaping populated");
+        assert!(!shaping.is_empty());
+        // Mikrotik format: "rx/tx" → rx is server→client (egress),
+        // tx is client→server (ingress).
+        assert_eq!(shaping.egress.unwrap().rate_bps, 1_000_000);
+        assert_eq!(shaping.ingress.unwrap().rate_bps, 2_000_000);
+    }
+
+    #[test]
+    fn mikrotik_rate_limit_garbage_yields_none() {
+        use radius_tokio::typed::{VsaAttr, WText};
+        let secret = b"shh";
+        let auth = [0x22; 16];
+        let mut reply = Reply::new(Code::ACCESS_ACCEPT, 8);
+        reply
+            .add(rfc::attrs::FRAMED_IP_ADDRESS, Ipv4Addr::new(10, 0, 0, 2))
+            .unwrap();
+        reply
+            .add_vsa(VsaAttr::<WText>::new(14988, 8), "not-a-rate")
+            .unwrap();
+        let sealed = reply.seal_for(&auth, secret);
+        let attrs = &sealed.as_bytes()[20..];
+        // Parse failure must not turn into a missing-Framed-IP /
+        // Malformed error — the session should come up unshaped.
+        let acc = decode_accept(attrs, secret, &auth).unwrap();
+        assert!(acc.shaping.is_none());
     }
 }

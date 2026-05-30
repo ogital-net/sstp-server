@@ -51,6 +51,12 @@ pub struct AuthAccept {
     pub mppe_send_key: Vec<u8>,
     /// MPPE Recv key (RFC 3079) — peer-to-server.
     pub mppe_recv_key: Vec<u8>,
+    /// Per-session traffic-shaping policy projected from RADIUS
+    /// VSAs (today: `Mikrotik-Rate-Limit`, vendor 14988, attr 8).
+    /// `None` when the Access-Accept carried no recognised shaping
+    /// attribute, or when its value parsed but described no
+    /// active rate cap.
+    pub shaping: Option<crate::shape::ShapingPolicy>,
 }
 
 /// Reason an Access-Request did not yield an Access-Accept.

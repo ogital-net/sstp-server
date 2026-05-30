@@ -286,6 +286,82 @@ pub const KIND_TBF: &[u8] = b"tbf\0";
 /// `u32` filter kind string.
 pub const KIND_U32: &[u8] = b"u32\0";
 
+// ---------------------------------------------------------------------------
+// `cls_u32` filter attributes (`<linux/pkt_cls.h>`).
+//
+// Used to attach a police action to the ingress qdisc as a
+// match-everything filter.
+// ---------------------------------------------------------------------------
+
+pub mod u32_filter {
+    pub const TCA_U32_UNSPEC: u16 = 0;
+    pub const TCA_U32_CLASSID: u16 = 1;
+    pub const TCA_U32_HASH: u16 = 2;
+    pub const TCA_U32_LINK: u16 = 3;
+    pub const TCA_U32_DIVISOR: u16 = 4;
+    pub const TCA_U32_SEL: u16 = 5;
+    pub const TCA_U32_POLICE: u16 = 6;
+    pub const TCA_U32_ACT: u16 = 7;
+    pub const TCA_U32_INDEV: u16 = 8;
+    pub const TCA_U32_PCNT: u16 = 9;
+    pub const TCA_U32_MARK: u16 = 10;
+    pub const TCA_U32_FLAGS: u16 = 11;
+
+    /// `TC_U32_TERMINAL` — flag in `tc_u32_sel.flags` marking a
+    /// match-everything terminal node (no further hash linking).
+    pub const TC_U32_TERMINAL: u8 = 1;
+}
+
+/// `struct tc_u32_sel` — the selector at the head of `TCA_U32_SEL`.
+/// Followed by `nkeys` × `tc_u32_key` (we send `nkeys = 0` for
+/// match-all).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TcU32Sel {
+    pub flags: u8,
+    pub offshift: u8,
+    pub nkeys: u8,
+    /// `__be16` in the kernel header. Layout puts this at offset
+    /// 4 due to natural alignment after `nkeys` (1 byte of pad
+    /// is added by the C compiler before this field).
+    pub _pad: u8,
+    pub offmask: u16,
+    pub off: u16,
+    pub offoff: i16,
+    pub hoff: i16,
+    pub hmask: u32,
+}
+
+const _: () = assert!(mem::size_of::<TcU32Sel>() == 16);
+
+// ---------------------------------------------------------------------------
+// Police action attribute IDs (`<linux/pkt_cls.h>` — `TCA_POLICE_*`).
+// ---------------------------------------------------------------------------
+
+pub mod police {
+    pub const TCA_POLICE_UNSPEC: u16 = 0;
+    /// Carries the `tc_police` struct itself.
+    pub const TCA_POLICE_TBF: u16 = 1;
+    pub const TCA_POLICE_RATE: u16 = 2;
+    pub const TCA_POLICE_PEAKRATE: u16 = 3;
+    pub const TCA_POLICE_AVRATE: u16 = 4;
+    pub const TCA_POLICE_RESULT: u16 = 5;
+    pub const TCA_POLICE_TM: u16 = 6;
+    pub const TCA_POLICE_PAD: u16 = 7;
+    /// 64-bit rate override; preferred on modern kernels.
+    pub const TCA_POLICE_RATE64: u16 = 8;
+    pub const TCA_POLICE_PEAKRATE64: u16 = 9;
+}
+
+// ---------------------------------------------------------------------------
+// Linux ethertype constants (`<linux/if_ether.h>`).
+// ---------------------------------------------------------------------------
+
+/// `ETH_P_ALL` — matches every packet at the filter level. Stored
+/// in `tcm_info` in **network byte order** (the kernel calls
+/// `htons(protocol)` on the way in).
+pub const ETH_P_ALL: u16 = 0x0003;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +390,6 @@ mod tests {
         assert_eq!(mem::size_of::<TcHtbOpt>(), 44);
         assert_eq!(mem::size_of::<TcTbfQopt>(), 36);
         assert_eq!(mem::size_of::<TcPolice>(), 56);
+        assert_eq!(mem::size_of::<TcU32Sel>(), 16);
     }
 }

@@ -26,6 +26,7 @@ use crate::auth::client::authenticate_pap;
 use crate::auth::request::AccessRequestCtx;
 use crate::auth::{AuthAccept, AuthError};
 use crate::ppp::{AssignedAddrs, AuthVerdict};
+use crate::shape::ShapingPolicy;
 
 /// Bounded depth of the dispatcher's inbound queue. A backlog past
 /// this signals a RADIUS outage; we'd rather drop new auth requests
@@ -46,7 +47,23 @@ pub struct PapJob {
     pub nas_identifier: Option<String>,
     /// Verdict channel. The dispatcher always sends exactly one
     /// reply on this; a dropped sender surfaces as a Reject.
-    pub reply: oneshot::Sender<AuthVerdict>,
+    pub reply: oneshot::Sender<PapOutcome>,
+}
+
+/// Result of a PAP RADIUS round-trip, returned by
+/// [`AuthBridge::submit_pap`].
+///
+/// `verdict` is what the in-process PPP driver consumes to gate the
+/// PAP-Ack/-Nak frame and the IPCP transition. `shaping` is a
+/// side-channel for the session task: present only on Accept, and
+/// only when the Access-Accept carried a recognised shaping VSA
+/// (today: `Mikrotik-Rate-Limit`). Kept separate from
+/// [`AuthVerdict`] so the PPP layer doesn't grow a dependency on
+/// [`crate::shape`].
+#[derive(Debug)]
+pub struct PapOutcome {
+    pub verdict: AuthVerdict,
+    pub shaping: Option<ShapingPolicy>,
 }
 
 enum Job {
@@ -130,7 +147,7 @@ impl AuthBridge {
         password: Vec<u8>,
         peer: SocketAddr,
         nas_identifier: Option<String>,
-    ) -> AuthVerdict {
+    ) -> PapOutcome {
         let (reply, rx) = oneshot::channel();
         let job = Job::Pap(PapJob {
             username,
@@ -140,12 +157,18 @@ impl AuthBridge {
             reply,
         });
         if self.tx.send(job).await.is_err() {
-            return AuthVerdict::Reject {
-                message: b"auth dispatcher unavailable".to_vec(),
+            return PapOutcome {
+                verdict: AuthVerdict::Reject {
+                    message: b"auth dispatcher unavailable".to_vec(),
+                },
+                shaping: None,
             };
         }
-        rx.await.unwrap_or_else(|_| AuthVerdict::Reject {
-            message: b"auth dispatcher dropped reply".to_vec(),
+        rx.await.unwrap_or_else(|_| PapOutcome {
+            verdict: AuthVerdict::Reject {
+                message: b"auth dispatcher dropped reply".to_vec(),
+            },
+            shaping: None,
         })
     }
 }
@@ -162,8 +185,12 @@ async fn run_pap(client: Arc<RadiusClient>, servers: Arc<[(SocketAddr, Arc<[u8]>
     for (addr, secret) in servers.iter() {
         match authenticate_pap(&client, *addr, secret, &ctx, &job.password).await {
             Ok(accept) => {
-                let _ = job.reply.send(AuthVerdict::Accept {
-                    addrs: project_addrs(&accept),
+                let shaping = accept.shaping;
+                let _ = job.reply.send(PapOutcome {
+                    verdict: AuthVerdict::Accept {
+                        addrs: project_addrs(&accept),
+                    },
+                    shaping,
                 });
                 return;
             }
@@ -171,7 +198,10 @@ async fn run_pap(client: Arc<RadiusClient>, servers: Arc<[(SocketAddr, Arc<[u8]>
                 // Authoritative reject — do not fail over to the
                 // next server.
                 let bytes = msg.unwrap_or_else(|| "access rejected".into()).into_bytes();
-                let _ = job.reply.send(AuthVerdict::Reject { message: bytes });
+                let _ = job.reply.send(PapOutcome {
+                    verdict: AuthVerdict::Reject { message: bytes },
+                    shaping: None,
+                });
                 return;
             }
             Err(e) => {
@@ -184,8 +214,11 @@ async fn run_pap(client: Arc<RadiusClient>, servers: Arc<[(SocketAddr, Arc<[u8]>
         || "auth failed: no RADIUS servers reachable".into(),
         |e| format!("auth failed: {e}"),
     );
-    let _ = job.reply.send(AuthVerdict::Reject {
-        message: msg.into_bytes(),
+    let _ = job.reply.send(PapOutcome {
+        verdict: AuthVerdict::Reject {
+            message: msg.into_bytes(),
+        },
+        shaping: None,
     });
 }
 
@@ -246,7 +279,7 @@ mod tests {
         .await
         .expect("spawn bridge");
 
-        let verdict = bridge
+        let outcome = bridge
             .submit_pap(
                 "alice".into(),
                 b"pw".to_vec(),
@@ -254,7 +287,8 @@ mod tests {
                 None,
             )
             .await;
-        match verdict {
+        assert!(outcome.shaping.is_none());
+        match outcome.verdict {
             AuthVerdict::Accept { addrs } => {
                 assert_eq!(addrs.ip, [10, 9, 8, 7]);
             }
@@ -288,7 +322,7 @@ mod tests {
         .await
         .expect("spawn bridge");
 
-        let verdict = bridge
+        let outcome = bridge
             .submit_pap(
                 "alice".into(),
                 b"pw".to_vec(),
@@ -296,7 +330,8 @@ mod tests {
                 None,
             )
             .await;
-        match verdict {
+        assert!(outcome.shaping.is_none());
+        match outcome.verdict {
             AuthVerdict::Reject { message } => {
                 assert_eq!(&message, b"bad password");
             }

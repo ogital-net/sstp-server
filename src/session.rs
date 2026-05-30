@@ -366,6 +366,11 @@ async fn drive_sstp(
     let mut ppp_timer: Option<(TimerOwner, Pin<Box<Sleep>>)> = None;
     let mut kppp: Option<KpppSession> = None;
     let mut kppp_buf = [0u8; 2048];
+    // Stashed at PAP Accept time (`NeedPapAuth` handler in
+    // `handle_ppp_step`), consumed at `NetworkUp` time once the
+    // kernel netdev exists. `None` after consumption or when the
+    // RADIUS reply carried no shaping VSA.
+    let mut pending_shaping: Option<crate::shape::ShapingPolicy> = None;
     // Set once a kernel-mode `KpppSession` is brought up: a
     // duplicate of the kmod's anon-inode session fd wrapped for
     // tokio readability polling. While `Some`, `tx.tls.read()` is
@@ -395,6 +400,7 @@ async fn drive_sstp(
         local_ip,
         &mut kppp,
         data_path,
+            &mut pending_shaping,
     )
     .await
     {
@@ -537,6 +543,7 @@ async fn drive_sstp(
                     local_ip,
                     &mut kppp,
                     data_path,
+                                    &mut pending_shaping,
                 )
                 .await
                 {
@@ -558,6 +565,7 @@ async fn drive_sstp(
                     local_ip,
                     &mut kppp,
                     data_path,
+                                    &mut pending_shaping,
                 )
                 .await
                 {
@@ -586,6 +594,7 @@ async fn drive_sstp(
                     local_ip,
                     &mut kppp,
                     data_path,
+                                    &mut pending_shaping,
                 )
                 .await
                 {
@@ -609,6 +618,7 @@ async fn drive_sstp(
                         local_ip,
                         &mut kppp,
                         data_path,
+                                            &mut pending_shaping,
                     )
                     .await
                     {
@@ -708,6 +718,7 @@ async fn drive_sstp(
                                 local_ip,
                                 &mut kppp,
                                 data_path,
+                                                            &mut pending_shaping,
                             )
                             .await
                             {
@@ -784,6 +795,7 @@ async fn drive_sstp(
                                 local_ip,
                                 &mut kppp,
                                 data_path,
+                                                            &mut pending_shaping,
                             )
                             .await
                             {
@@ -812,6 +824,7 @@ async fn drive_sstp(
                                     local_ip,
                                     &mut kppp,
                                     data_path,
+                                                                    &mut pending_shaping,
                                 )
                                 .await
                                 {
@@ -852,6 +865,7 @@ async fn drive_sstp(
                                         local_ip,
                                         &mut kppp,
                                         data_path,
+                                                                            &mut pending_shaping,
                                     )
                                     .await
                                     {
@@ -911,6 +925,7 @@ async fn handle_sstp_step(
     local_ip: Ipv4Addr,
     kppp: &mut Option<KpppSession>,
     data_path: DataPathMode,
+    pending_shaping: &mut Option<crate::shape::ShapingPolicy>,
 ) -> bool {
     let outcome = apply_step(id, tx, out, tx_buf, sstp_timer).await;
     if !outcome.keep_going {
@@ -935,6 +950,7 @@ async fn handle_sstp_step(
             local_ip,
             kppp,
             data_path,
+            pending_shaping,
         )
         .await
         {
@@ -962,6 +978,7 @@ async fn handle_ppp_step(
     local_ip: Ipv4Addr,
     kppp: &mut Option<KpppSession>,
     data_path: DataPathMode,
+    pending_shaping: &mut Option<crate::shape::ShapingPolicy>,
 ) -> bool {
     use tokio::time::{Instant, sleep_until};
 
@@ -997,13 +1014,18 @@ async fn handle_ppp_step(
             Some(PppEvent::NeedPapAuth { peer_id, password }) => {
                 let user = String::from_utf8_lossy(&peer_id).into_owned();
                 info!(%id, user = %user, "PAP credentials received; dispatching to RADIUS");
-                let verdict = auth
+                let outcome = auth
                     .bridge
                     .submit_pap(user.clone(), password, auth.peer, None)
                     .await;
+                let crate::auth::bridge::PapOutcome { verdict, shaping } = outcome;
                 match &verdict {
                     AuthVerdict::Accept { addrs } => {
-                        info!(%id, user = %user, ip = ?addrs.ip, "RADIUS Access-Accept");
+                        info!(%id, user = %user, ip = ?addrs.ip, shaping = ?shaping, "RADIUS Access-Accept");
+                        // Stash the shaping policy until the kernel
+                        // PPP unit is up; applied alongside
+                        // bring-up at `NetworkUp` below.
+                        *pending_shaping = shaping;
                     }
                     AuthVerdict::Reject { message } => {
                         let msg = String::from_utf8_lossy(message);
@@ -1127,6 +1149,43 @@ async fn handle_ppp_step(
                                 kernel_path = k.is_kernel(),
                                 "kernel PPP unit attached"
                             );
+                            // Apply RADIUS-driven traffic shaping
+                            // (Mikrotik-Rate-Limit VSA, today) on
+                            // the freshly-brought-up netdev. Failure
+                            // is non-fatal: the session continues
+                            // unshaped and a warning is emitted so
+                            // the operator can see why a deployment
+                            // expecting rate caps isn't getting them.
+                            if let Some(policy) = pending_shaping.take() {
+                                match crate::shape::Shaper::open() {
+                                    Ok(mut shaper) => {
+                                        if let Err(e) =
+                                            shaper.apply(k.ifindex(), &policy)
+                                        {
+                                            warn!(
+                                                %id,
+                                                ifindex = k.ifindex(),
+                                                error = %e,
+                                                "shape::apply failed; session continues unshaped"
+                                            );
+                                        } else {
+                                            info!(
+                                                %id,
+                                                ifindex = k.ifindex(),
+                                                ?policy,
+                                                "traffic shaping policy applied"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            %id,
+                                            error = %e,
+                                            "shape::open failed; session continues unshaped"
+                                        );
+                                    }
+                                }
+                            }
                             *kppp = Some(k);
                         }
                         Err(e) => {

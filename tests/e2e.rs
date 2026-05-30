@@ -7,24 +7,26 @@
 //!   3. the `sstp-server` binary itself, configured to listen on a
 //!      free TCP port and forward auth to the dummy RADIUS.
 //!
-//! The first test (`tls_handshake_smoke`) drives an in-process TLS
-//! client at the server and asserts that the TLS handshake completes
-//! and the server accepts the connection. This is the regression
-//! gate for the listener / TLS-acceptor path and runs everywhere
-//! `openssl` and a built binary are available.
+//! Coverage tiers, ordered by required privilege:
 //!
-//! The second test (`sstpc_pap_login`) spawns the upstream
-//! `sstp-client` binary against the server with PAP credentials.
-//! Because the server's session driver (M6) does not yet implement
-//! the SSTP HTTPS preamble or the PPP/RADIUS bridge, `sstpc` is
-//! expected to fail at the HTTP layer for now — the test asserts
-//! that the *connection-acceptance* path works and records the
-//! current bar so a future driver implementation graduates this to
-//! a full PAP success assertion. See `CLAUDE.md` §M6 "MVP roadmap".
+//!   * `tls_handshake_smoke` — TLS-acceptor regression gate. Drives
+//!     a real `ClientHello` at the server with `openssl s_client`
+//!     and asserts the handshake completes. **No root, no kmod, no
+//!     `sstpc`.** Runs everywhere.
+//!   * `sstp_https_preamble` — pushes a canonical
+//!     `SSTP_DUPLEX_POST` over TLS and checks the server's
+//!     `HTTP/1.1 200 OK` response (MS-SSTP §3.2.4.1 / §4.1).
+//!     **No root.** Runs everywhere `openssl` is available.
+//!   * `sstpc_pap_login` — full PAP + IPCP round-trip via the
+//!     upstream `sstp-client` binary, terminating in a real netdev
+//!     bring-up (kernel `pppN` if the sstp kmod + kTLS are in play,
+//!     `tunN` otherwise) plus a half-duplex ICMP traffic check.
+//!     **Needs root** on both ends — the server still needs
+//!     `CAP_NET_ADMIN` for TUN/netlink, and the client needs
+//!     `/dev/ppp` for `pppd`.
 //!
-//! Both tests skip cleanly when their prerequisites are missing
-//! (`sstpc` not on `PATH`, `/dev/ppp` not present, …) so `cargo
-//! test` is hermetic in any environment.
+//! Tests skip cleanly when their prerequisites are missing so
+//! `cargo test` is hermetic in any environment.
 
 mod common;
 
@@ -53,15 +55,25 @@ fn build_credential() -> Credential {
 /// Probe whether `sstpc` is runnable in this environment. Returns a
 /// human-readable reason string on skip, or `None` if everything is
 /// in place.
+///
+/// Three independent prerequisites, all on the *client* side except
+/// the last:
+///   * `sstpc` on `PATH`,
+///   * `/dev/ppp` present (the client wraps `pppd`, which needs it —
+///     the server itself uses TUN by default and does not require
+///     `/dev/ppp`),
+///   * `CAP_NET_ADMIN` (proxied via uid==0). Required on **both**
+///     ends — `pppd` for its kernel-side bring-up, the server for
+///     `/dev/net/tun` + netlink `RTM_NEWADDR`/`IFF_UP`.
 fn sstpc_skip_reason() -> Option<String> {
     if which("sstpc").is_none() {
         return Some("sstpc not on PATH".into());
     }
-    // sstpc spawns pppd, which needs /dev/ppp and CAP_NET_ADMIN. In a
-    // typical dev container neither is available; skip rather than
-    // hard-fail.
     if !std::path::Path::new("/dev/ppp").exists() {
-        return Some("/dev/ppp not present (need PPP kmod loaded)".into());
+        return Some(
+            "/dev/ppp not present (sstpc/pppd client-side requirement; server uses TUN)"
+                .into(),
+        );
     }
     // EUID 0 is the simplest portable check; CAP_NET_ADMIN is a
     // superset of "is root" for our purposes.
@@ -69,7 +81,7 @@ fn sstpc_skip_reason() -> Option<String> {
     let uid = unsafe { libc::getuid() };
     if uid != 0 {
         return Some(format!(
-            "not running as root (uid={uid}); pppd needs CAP_NET_ADMIN"
+            "not running as root (uid={uid}); both pppd (client) and TUN/netlink (server) need CAP_NET_ADMIN"
         ));
     }
     None
@@ -125,13 +137,12 @@ fn which(prog: &str) -> Option<std::path::PathBuf> {
 /// acceptor completes the handshake against an `openssl s_client`.
 /// Runs without root.
 ///
-/// Today the session task in `src/session.rs` terminates TLS but
-/// does not yet drive the SSTP HTTPS preamble or the PPP/RADIUS
-/// bridge (see `CLAUDE.md` §M6 MVP roadmap: M6b onward). So this
-/// test currently asserts what works: TLS handshake completes
-/// server-side. When the SSTP preamble is wired in (M6b), this
-/// assertion should graduate to checking that the server emits the
-/// `HTTP/1.1 200` line and transitions into SSTP framing.
+/// Deliberately scoped to the TLS layer: `s_client` finishes the
+/// handshake and disconnects without writing any application data,
+/// so the server never reaches the SSTP HTTPS preamble (covered by
+/// [`sstp_https_preamble`]) or the auth bridge (covered by
+/// [`sstpc_pap_login`]). The RADIUS-not-reached assertion below is
+/// a sanity check on that scoping, not a forward-looking guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_handshake_smoke() {
     let tmp = TempDir::new("tls");
@@ -185,15 +196,14 @@ async fn tls_handshake_smoke() {
         server.drain_logs().join("\n")
     );
 
-    // RADIUS should not have been reached yet — the session driver
-    // does not implement auth, so this is a forward-looking guard:
-    // the day the auth bridge is wired up, this assertion will fire
-    // and the test graduates to checking that we did reach RADIUS.
+    // RADIUS should not have been reached: `s_client` closes after
+    // the handshake without sending the SSTP preamble, so the
+    // session driver tears the connection down before auth.
     let seen = radius.seen();
     assert!(
         seen.is_empty(),
         "dummy RADIUS unexpectedly received {} requests; \
-         is the session driver now reaching auth? Time to upgrade this assertion.\n\
+         a TLS-only handshake should not reach auth.\n\
          seen: {seen:#?}",
         seen.len()
     );
@@ -203,18 +213,18 @@ async fn tls_handshake_smoke() {
 /// server. Skipped if prerequisites (sstpc, /dev/ppp, root) are not
 /// available — see [`sstpc_skip_reason`].
 ///
-/// **M6h graduated assertions.** When prerequisites are present this
-/// drives the full PAP path end-to-end and checks:
+/// Drives the full PAP path end-to-end and checks:
 ///   * the dummy RADIUS authenticator received exactly one
 ///     `Access-Request` with `User-Name=alice` and a PAP outcome of
 ///     `Match`;
-///   * the server logged "kernel PPP unit attached" (M6g brought up
-///     `pppN` via `/dev/ppp` + netlink);
-///   * the resulting netdev exists and carries the
-///     `Framed-IP-Address` as its P2P peer.
+///   * the server brought up a netdev (kernel `pppN` if the sstp
+///     kmod + kTLS are loaded, otherwise `tunN`) and it carries the
+///     `Framed-IP-Address` as its P2P peer;
+///   * a single ICMP echo from the client-side `pppN` reaches the
+///     server-side netdev (asserted via interface RX byte counters).
 ///
 /// We deliberately *do not* assert `sstpc`'s exit status: the harness
-/// SIGKILLs it once the kernel PPP unit appears, so its exit will be
+/// SIGKILLs it once the netdev appears, so its exit will be
 /// signal-terminated. Asserting a clean exit would require driving
 /// `sstpc`'s own teardown path, which is outside the SSTP server's
 /// responsibility.
@@ -283,10 +293,11 @@ async fn sstpc_pap_login() {
     });
     let mut child = sstpc.await.expect("sstpc spawn join");
 
-    // The decisive event is M6g's "kernel PPP unit attached" log
-    // line, emitted once IPCP converges and the netlink bring-up
-    // succeeds. Give the full PAP + IPCP round-trip a generous
-    // window — pppd is slow to start under load. Use
+    // The decisive event is the "kernel PPP unit attached" log
+    // line (emitted for both pppN and tunN paths — `kernel_path=…`
+    // disambiguates), fired once IPCP converges and the netlink
+    // bring-up succeeds. Give the full PAP + IPCP round-trip a
+    // generous window — pppd is slow to start under load. Use
     // `collect_logs_until` (not `wait_for_log`) so we also retain
     // the kmod-fallback line that arrives moments before attach.
     let pre_attach_logs =
@@ -331,16 +342,20 @@ async fn sstpc_pap_login() {
 
     // Half-duplex traffic check: push a single ICMP echo from the
     // sstpc-side `pppN` toward the server's tunnel endpoint, then
-    // assert the server's `pppN` RX counter grew. This proves the
-    // client→server data direction actually carries IP frames
-    // end-to-end (sstpc → TLS → SSTP demux → KpppSession::write_frame
-    // → kernel pppN). Server→client direction is *not* tested here
-    // because, without the sstp kmod + kTLS, the kernel never hands
-    // TX frames back to the unit-fd reader (mainline ppp_generic
-    // dispatches them through channels) — see session.rs.
+    // assert the server-side netdev's RX counter grew. This proves
+    // the client→server data direction carries IP frames end-to-end
+    // (sstpc → TLS → SSTP demux → KpppSession::write_frame → kernel
+    // pppN/tunN).
     //
-    // Done *before* reaping sstpc for the same reason as the addr
-    // assertion above: closing TLS tears `pppN` down.
+    // Server→client is not exercised: it would require host
+    // routing rules that send return traffic back through the
+    // server's tunnel endpoint, which is out of scope for the data
+    // path itself. On the kmod path the kernel additionally never
+    // hands TX frames to the unit-fd reader (ppp_generic dispatches
+    // through channels) — see CLAUDE.md "Data plane".
+    //
+    // Done *before* reaping sstpc: closing TLS tears the session
+    // down, which removes the netdev.
     let traffic_result = exercise_client_to_server_traffic(&ip_bin, &ifname);
 
     // Capture probe-path log evidence. With /dev/sstp loaded and a
