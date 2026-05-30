@@ -49,10 +49,7 @@ pub enum ParseError {
     BadPair { field: &'static str },
     /// A numeric field could not be parsed.
     #[error("Mikrotik-Rate-Limit: invalid number {value:?} in field {field}")]
-    BadNumber {
-        field: &'static str,
-        value: String,
-    },
+    BadNumber { field: &'static str, value: String },
     /// Priority was outside 1..=8.
     #[error("Mikrotik-Rate-Limit: priority {0} out of range 1..=8")]
     PriorityRange(i64),
@@ -75,7 +72,10 @@ pub fn parse(value: &str) -> Result<ShapingPolicy, ParseError> {
     let mut fields = trimmed.split_ascii_whitespace();
 
     let rate = parse_pair(fields.next().ok_or(ParseError::Empty)?, "rate")?;
-    let burst_rate = fields.next().map(|f| parse_pair(f, "burst-rate")).transpose()?;
+    let burst_rate = fields
+        .next()
+        .map(|f| parse_pair(f, "burst-rate"))
+        .transpose()?;
     let burst_threshold = fields
         .next()
         .map(|f| parse_pair(f, "burst-threshold"))
@@ -153,12 +153,10 @@ fn parse_pair_u32(field: &str, name: &'static str) -> Result<Pair<u32>, ParseErr
 }
 
 fn parse_priority(field: &str) -> Result<u8, ParseError> {
-    let n: i64 = field
-        .parse()
-        .map_err(|_| ParseError::BadNumber {
-            field: "priority",
-            value: field.to_owned(),
-        })?;
+    let n: i64 = field.parse().map_err(|_| ParseError::BadNumber {
+        field: "priority",
+        value: field.to_owned(),
+    })?;
     if !(1..=8).contains(&n) {
         return Err(ParseError::PriorityRange(n));
     }

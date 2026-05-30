@@ -208,10 +208,7 @@ fn run(config: &Config) -> ExitCode {
 
     // ---- Phase 2: drop privileges (still single-threaded) ----
     if let Some(id) = drop_identity {
-        if let Err(e) = privdrop::drop_to(
-            id,
-            &[privdrop::CAP_NET_ADMIN, privdrop::CAP_SYS_NICE],
-        ) {
+        if let Err(e) = privdrop::drop_to(id, &[privdrop::CAP_NET_ADMIN, privdrop::CAP_SYS_NICE]) {
             tracing::error!(error = %e, "privilege drop failed");
             return ExitCode::from(1);
         }
@@ -498,7 +495,11 @@ fn set_io_thread_realtime(id: usize) {
         libc::sched_setscheduler(0, SCHED_FIFO, &raw const param)
     };
     if rc == 0 {
-        tracing::debug!(worker = id, prio = RT_PRIO, "I/O worker promoted to SCHED_FIFO");
+        tracing::debug!(
+            worker = id,
+            prio = RT_PRIO,
+            "I/O worker promoted to SCHED_FIFO"
+        );
     } else {
         let err = io::Error::last_os_error();
         tracing::warn!(

@@ -124,7 +124,8 @@ pub struct Config {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub radius: Vec<SocketAddr>,
-    #[allow(dead_code)] // FUTURE: accounting servers consumed once Acct-Start/Update/Stop is wired (M4 finish).
+    #[allow(dead_code)]
+    // FUTURE: accounting servers consumed once Acct-Start/Update/Stop is wired (M4 finish).
     pub acct: Vec<SocketAddr>,
     pub io_threads: NonZeroUsize,
     pub auth_threads: NonZeroUsize,

@@ -28,8 +28,7 @@ use super::ipcp::{
 use super::lcp::{
     ConfigOption, ConfigOptionIter, LCP_HEADER_LEN, LCP_OPT_HEADER_LEN, LcpCode, LcpOptionId,
     LcpPacket, auth_protocol_chap_md5, auth_protocol_mschapv2, auth_protocol_pap,
-    decode_lcp_packet, write_lcp_header,
-    write_option,
+    decode_lcp_packet, write_lcp_header, write_option,
 };
 
 /// Which sub-protocol's restart timer the [`PppStep`] is asking to
@@ -87,7 +86,7 @@ pub enum PppEvent {
     NeedChapAuth {
         username: Vec<u8>,
         chap_id: u8,
-        challenge: Vec<u8>,
+        challenge: [u8; 16],
         response: [u8; 16],
     },
     /// Peer sent an MS-CHAPv2 `Response`; the session task must run
@@ -535,8 +534,9 @@ pub struct Ppp {
     /// CHAP challenge most recently sent to the peer ([RFC 1994]
     /// §4.1) — populated when entering `AuthPending` under CHAP
     /// and forwarded as `CHAP-Challenge` to RADIUS once the peer's
-    /// `Response` arrives. Empty under PAP.
-    chap_challenge: Vec<u8>,
+    /// `Response` arrives. `None` until the challenge is generated
+    /// (always `None` under PAP).
+    chap_challenge: Option<[u8; 16]>,
     /// Identifier counter for outbound CHAP packets.
     chap_id_counter: u8,
 }
@@ -552,7 +552,7 @@ impl Ppp {
             ipcp: None,
             pending_addrs: None,
             local_ip,
-            chap_challenge: Vec::new(),
+            chap_challenge: None,
             chap_id_counter: 0,
         }
     }
@@ -640,11 +640,7 @@ impl Ppp {
                 // text per [RFC 1994] §4.3); cap to keep the frame
                 // small.
                 let trimmed = message.get(..message.len().min(255)).unwrap_or(&[]);
-                step.push_frame(encode_chap_terminal(
-                    chap::Code::Failure,
-                    chap_id,
-                    trimmed,
-                ));
+                step.push_frame(encode_chap_terminal(chap::Code::Failure, chap_id, trimmed));
                 self.tear_down_after_reject(&mut step);
             }
             (InFlightMethod::MsChapV2 { .. }, _) => {
@@ -687,11 +683,7 @@ impl Ppp {
             AuthVerdict::Accept { addrs } => {
                 let body = auth_response.unwrap_or(&[]);
                 let trimmed = body.get(..body.len().min(255)).unwrap_or(&[]);
-                step.push_frame(encode_chap_terminal(
-                    chap::Code::Success,
-                    chap_id,
-                    trimmed,
-                ));
+                step.push_frame(encode_chap_terminal(chap::Code::Success, chap_id, trimmed));
                 self.advance_to_network(&mut step, addrs);
             }
             AuthVerdict::Reject { message } => {
@@ -704,11 +696,7 @@ impl Ppp {
                     synth.as_bytes()
                 };
                 let trimmed = body.get(..body.len().min(255)).unwrap_or(&[]);
-                step.push_frame(encode_chap_terminal(
-                    chap::Code::Failure,
-                    chap_id,
-                    trimmed,
-                ));
+                step.push_frame(encode_chap_terminal(chap::Code::Failure, chap_id, trimmed));
                 self.tear_down_after_reject(&mut step);
             }
         }
@@ -791,7 +779,10 @@ impl Ppp {
                 let mut response = [0u8; 16];
                 response.copy_from_slice(resp.value);
                 let username = resp.name.to_vec();
-                let challenge = self.chap_challenge.clone();
+                let Some(challenge) = self.chap_challenge else {
+                    // Peer responded before we sent a challenge.
+                    return PppStep::default();
+                };
                 self.phase = Phase::AuthInFlight {
                     method: InFlightMethod::Chap {
                         chap_id: resp.identifier,
@@ -825,12 +816,12 @@ impl Ppp {
                 nt_response.copy_from_slice(&resp.value[24..48]);
                 let flags = resp.value[48];
                 let mut authenticator_challenge = [0u8; 16];
-                if self.chap_challenge.len() != 16 {
+                let Some(challenge) = self.chap_challenge else {
                     // Should not happen — we generate a 16-byte
                     // challenge before sending it.
                     return PppStep::default();
-                }
-                authenticator_challenge.copy_from_slice(&self.chap_challenge);
+                };
+                authenticator_challenge.copy_from_slice(&challenge);
                 let username = resp.name.to_vec();
                 self.phase = Phase::AuthInFlight {
                     method: InFlightMethod::MsChapV2 {
@@ -893,7 +884,7 @@ impl Ppp {
                 let challenge = generate_chap_challenge();
                 let chap_id = self.next_chap_id();
                 let frame = encode_chap_challenge(chap_id, &challenge);
-                self.chap_challenge = challenge;
+                self.chap_challenge = Some(challenge);
                 out.push_frame(frame);
             }
         }
@@ -1006,11 +997,7 @@ fn render_ipcp_send(
             // (MikroTik picks from its default pool) or never
             // installs a usable next-hop, and ping across the
             // tunnel times out.
-            push_v4_option(
-                &mut body,
-                IpcpOptionId::IpAddress.as_u8(),
-                ipcp.local_ip,
-            );
+            push_v4_option(&mut body, IpcpOptionId::IpAddress.as_u8(), ipcp.local_ip);
             (IpcpCode::ConfigureRequest, id)
         }
         FsmSend::ConfigureAck => {
@@ -1090,13 +1077,12 @@ fn encode_chap_terminal(code: chap::Code, identifier: u8, message: &[u8]) -> Vec
 /// Generate a fresh 16-byte CHAP challenge ([RFC 1994] §4.1
 /// recommends ≥8 octets; 16 matches MD5 block size and is what
 /// FreeRADIUS / strongSwan emit).
-fn generate_chap_challenge() -> Vec<u8> {
+fn generate_chap_challenge() -> [u8; 16] {
     use std::mem::MaybeUninit;
     let mut buf = [MaybeUninit::<u8>::uninit(); 16];
     crate::crypto::rand::fill_bytes(&mut buf);
     // SAFETY: fill_bytes fully initialises every element.
-    let init = unsafe { buf.map(|x| x.assume_init()) };
-    init.to_vec()
+    unsafe { buf.map(|x| x.assume_init()) }
 }
 
 /// Build a PPP frame containing an LCP-format packet (Code +
@@ -1155,7 +1141,7 @@ mod tests {
 
     #[test]
     fn open_emits_lcp_configure_request_with_pap() {
-        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
+        let mut ppp = Ppp::new([0, 0, 0, 0], AuthMethod::Pap);
         let step = ppp.open();
         assert_eq!(step.frames.len(), 1);
         let (proto, code, _id, opts) = peel(&step.frames[0]);
@@ -1171,7 +1157,7 @@ mod tests {
 
     #[test]
     fn ack_acceptable_lcp_cr() {
-        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
+        let mut ppp = Ppp::new([0, 0, 0, 0], AuthMethod::Pap);
         let _open = ppp.open();
         // Client CR: MRU=1500, Magic, PFC, ACFC.
         let opts: Vec<u8> = vec![
@@ -1192,7 +1178,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_lcp_option() {
-        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
+        let mut ppp = Ppp::new([0, 0, 0, 0], AuthMethod::Pap);
         let _open = ppp.open();
         // Option type 99 (unknown) plus a known MRU.
         let opts: Vec<u8> = vec![
@@ -1211,7 +1197,7 @@ mod tests {
 
     #[test]
     fn lcp_opened_transitions_to_auth_pending() {
-        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
+        let mut ppp = Ppp::new([0, 0, 0, 0], AuthMethod::Pap);
         let _ = ppp.open();
         // Client sends an Ack to our CR (using id=1, the bumped id).
         let ack = encode_lcp_frame(
@@ -1246,7 +1232,7 @@ mod tests {
 
     #[test]
     fn pap_request_emits_need_auth_event() {
-        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
+        let mut ppp = Ppp::new([0, 0, 0, 0], AuthMethod::Pap);
         drive_to_auth_pending(&mut ppp);
 
         // PAP Authenticate-Request: id=2, peer-id="alice", pw="hunter2".
@@ -1285,7 +1271,7 @@ mod tests {
 
     #[test]
     fn auth_accept_acks_pap_and_starts_ipcp() {
-        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
+        let mut ppp = Ppp::new([0, 0, 0, 0], AuthMethod::Pap);
         drive_to_auth_pending(&mut ppp);
         // Send a PAP request to advance to AuthInFlight.
         let pap_body = vec![
@@ -1321,7 +1307,7 @@ mod tests {
 
     #[test]
     fn ipcp_naks_zero_ip_with_assigned() {
-        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
+        let mut ppp = Ppp::new([0, 0, 0, 0], AuthMethod::Pap);
         drive_to_auth_pending(&mut ppp);
         let pap_body = vec![
             pap::Code::AuthenticateRequest.as_u8(),
@@ -1355,7 +1341,7 @@ mod tests {
 
     #[test]
     fn ipcp_acks_matching_ip() {
-        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
+        let mut ppp = Ppp::new([0, 0, 0, 0], AuthMethod::Pap);
         drive_to_auth_pending(&mut ppp);
         let pap_body = vec![
             pap::Code::AuthenticateRequest.as_u8(),
@@ -1384,7 +1370,7 @@ mod tests {
 
     #[test]
     fn auth_reject_emits_nak_and_terminates() {
-        let mut ppp = Ppp::new([0,0,0,0], AuthMethod::Pap);
+        let mut ppp = Ppp::new([0, 0, 0, 0], AuthMethod::Pap);
         drive_to_auth_pending(&mut ppp);
         let pap_body = vec![
             pap::Code::AuthenticateRequest.as_u8(),

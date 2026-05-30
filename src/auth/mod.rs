@@ -12,7 +12,6 @@
 //! originator with `(peer, identifier)` correlation and RFC 5080
 //! retry semantics.
 
-
 pub mod accounting;
 pub mod acct_bridge;
 pub mod bridge;

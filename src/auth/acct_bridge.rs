@@ -24,9 +24,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::auth::accounting::{
-    AcctClient, AcctCounters, AcctError, AcctEvent, AcctSession,
-};
+use crate::auth::accounting::{AcctClient, AcctCounters, AcctError, AcctEvent, AcctSession};
 use crate::auth::request::AccessRequestCtx;
 
 /// Bounded queue depth, matched to [`AuthBridge`]. One outstanding

@@ -44,7 +44,10 @@ const PROMPT: &str = "sstp> ";
 /// values are short usage strings shown in help output.
 const COMMANDS: &[(&str, &str)] = &[
     ("help", "show this help"),
-    ("show info", "version, uptime, thread counts, active sessions"),
+    (
+        "show info",
+        "version, uptime, thread counts, active sessions",
+    ),
     ("show stat", "metrics snapshot"),
     ("show sess", "list active sessions"),
     ("show sess ", "details for a single session by id"),
@@ -66,9 +69,7 @@ struct ReplHelper {
 
 impl ReplHelper {
     fn new() -> Self {
-        Self {
-            trie: build_trie(),
-        }
+        Self { trie: build_trie() }
     }
 }
 
@@ -87,7 +88,11 @@ impl Hinter for ReplHelper {
         // a valid multi-word prefix — `command-trie` will tell us.
         let sub = self.trie.subtrie(line)?;
         let ext = sub.extension();
-        if ext.is_empty() { None } else { Some(ext.to_string()) }
+        if ext.is_empty() {
+            None
+        } else {
+            Some(ext.to_string())
+        }
     }
 }
 
@@ -169,7 +174,10 @@ fn parse_args() -> Result<Args, String> {
     let mut socket = PathBuf::from(DEFAULT_SOCKET);
     let mut one_shot: Option<String> = None;
 
-    let mut opts = Getopt::new(std::env::args_os(), "S:(socket)c:(command)h(help)V(version)");
+    let mut opts = Getopt::new(
+        std::env::args_os(),
+        "S:(socket)c:(command)h(help)V(version)",
+    );
     opts.set_opterr(false);
     let prog = opts.prog_name().to_string();
     for opt in opts.by_ref() {

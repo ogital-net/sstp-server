@@ -8,7 +8,6 @@
 //!
 //! Spec citations in this module refer to MS-SSTP-spec.md.
 
-
 pub mod attr;
 pub mod binding;
 pub mod frame;

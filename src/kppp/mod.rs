@@ -58,7 +58,8 @@ pub mod unit;
 pub struct SessionIpConfig {
     pub local: std::net::Ipv4Addr,
     pub peer: std::net::Ipv4Addr,
-    #[allow(dead_code)] // FUTURE: applied when RADIUS Framed-IP-Netmask is honoured (today the /32 P2P pair from netlink suffices).
+    #[allow(dead_code)]
+    // FUTURE: applied when RADIUS Framed-IP-Netmask is honoured (today the /32 P2P pair from netlink suffices).
     pub netmask: Option<std::net::Ipv4Addr>,
     pub mtu: Option<u32>,
 }

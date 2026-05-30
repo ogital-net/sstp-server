@@ -141,10 +141,7 @@ pub enum ShapeError {
     Netlink(#[source] io::Error),
     /// Kernel returned a non-zero errno on a `tc` request.
     #[error("kernel rejected {op}: errno {errno}")]
-    Kernel {
-        op: &'static str,
-        errno: i32,
-    },
+    Kernel { op: &'static str, errno: i32 },
 }
 
 /// Owns a `NETLINK_ROUTE` socket scoped to traffic-control work.
@@ -298,7 +295,9 @@ fn log_applied_rate(direction: &'static str, ifindex: u32, spec: &RateSpec) {
 /// can be snapshot-tested without a netlink socket.
 fn encode_htb_root(seq: u32, ifindex: u32) -> netlink::MessageBuf {
     use netlink::{MessageBuf, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST};
-    use tc::{KIND_HTB, RTM_NEWQDISC, TC_H_ROOT, TCA_KIND, TCA_OPTIONS, TcHtbGlob, Tcmsg, handle, htb};
+    use tc::{
+        KIND_HTB, RTM_NEWQDISC, TC_H_ROOT, TCA_KIND, TCA_OPTIONS, TcHtbGlob, Tcmsg, handle, htb,
+    };
 
     let mut buf = MessageBuf::new();
     buf.push_nlmsghdr(
@@ -343,8 +342,7 @@ fn encode_htb_leaf(
 ) -> netlink::MessageBuf {
     use netlink::{MessageBuf, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST};
     use tc::{
-        KIND_HTB, RTM_NEWTCLASS, TCA_KIND, TCA_OPTIONS, TcHtbOpt, TcRatespec, Tcmsg, handle,
-        htb,
+        KIND_HTB, RTM_NEWTCLASS, TCA_KIND, TCA_OPTIONS, TcHtbOpt, TcRatespec, Tcmsg, handle, htb,
     };
 
     // bits/s → bytes/s. Mikrotik VSAs are bit-rate; the kernel
@@ -494,7 +492,7 @@ fn encode_ingress_qdisc(seq: u32, ifindex: u32) -> netlink::MessageBuf {
 fn encode_ingress_police_filter(seq: u32, ifindex: u32, spec: &RateSpec) -> netlink::MessageBuf {
     use netlink::{MessageBuf, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST};
     use tc::{
-        ETH_P_ALL, KIND_U32, RTM_NEWTFILTER, TCA_KIND, TCA_OPTIONS, TC_ACT_SHOT, TcPolice,
+        ETH_P_ALL, KIND_U32, RTM_NEWTFILTER, TC_ACT_SHOT, TCA_KIND, TCA_OPTIONS, TcPolice,
         TcRatespec, TcU32Sel, Tcmsg, handle, police, u32_filter,
     };
 

@@ -58,14 +58,13 @@ pub fn decode_accept(
     // byte so the driver can splice the remainder verbatim into the
     // CHAP body.
     let mschap2_success =
-        radius_tokio::attributes::first_vsa(attrs, microsoft::attrs::MS_CHAP2_SUCCESS)
-            .map(|raw| {
-                if raw.is_empty() {
-                    Vec::new()
-                } else {
-                    raw[1..].to_vec()
-                }
-            });
+        radius_tokio::attributes::first_vsa(attrs, microsoft::attrs::MS_CHAP2_SUCCESS).map(|raw| {
+            if raw.is_empty() {
+                Vec::new()
+            } else {
+                raw[1..].to_vec()
+            }
+        });
 
     Ok(AuthAccept {
         framed_ip,

@@ -427,7 +427,10 @@ impl RtNetlink {
         match hdr.nlmsg_type {
             NLMSG_ERROR => {
                 if buf.len() < NLMSG_HDRLEN + 4 {
-                    return Err(NetlinkError::Unexpected { op: OP, got: hdr.nlmsg_type });
+                    return Err(NetlinkError::Unexpected {
+                        op: OP,
+                        got: hdr.nlmsg_type,
+                    });
                 }
                 let mut errbuf = [0u8; 4];
                 errbuf.copy_from_slice(&buf[NLMSG_HDRLEN..NLMSG_HDRLEN + 4]);
@@ -451,7 +454,10 @@ impl RtNetlink {
         // Skip nlmsghdr + ifinfomsg (16 bytes).
         let body_off = NLMSG_HDRLEN + mem::size_of::<Ifinfomsg>();
         if buf.len() < body_off {
-            return Err(NetlinkError::Unexpected { op: OP, got: hdr.nlmsg_type });
+            return Err(NetlinkError::Unexpected {
+                op: OP,
+                got: hdr.nlmsg_type,
+            });
         }
         let attrs = &buf[body_off..hdr.nlmsg_len as usize];
         find_stats64(attrs).ok_or(NetlinkError::Unexpected {

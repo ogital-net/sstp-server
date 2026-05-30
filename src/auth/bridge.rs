@@ -46,6 +46,38 @@ pub struct PapJob {
     pub reply: oneshot::Sender<PapOutcome>,
 }
 
+/// Bridge-level reject helper used by every method's failure paths
+/// (queue closed, dispatcher gone, server unreachable, authoritative
+/// reject). The `shaping` slot is always `None` on a reject.
+fn reject(message: impl Into<Vec<u8>>) -> AuthOutcome {
+    AuthOutcome {
+        verdict: AuthVerdict::Reject {
+            message: message.into(),
+        },
+        shaping: None,
+    }
+}
+
+/// Project an [`AuthAccept`] into the bridge's outcome shape.
+fn accept_outcome(accept: &AuthAccept) -> AuthOutcome {
+    AuthOutcome {
+        verdict: AuthVerdict::Accept {
+            addrs: project_addrs(accept),
+        },
+        shaping: accept.shaping,
+    }
+}
+
+/// Final reject emitted after exhausting every `--radius` server
+/// without an authoritative answer.
+fn transport_failure(last: Option<String>) -> AuthOutcome {
+    let msg = last.map_or_else(
+        || "auth failed: no RADIUS servers reachable".to_string(),
+        |e| format!("auth failed: {e}"),
+    );
+    reject(msg.into_bytes())
+}
+
 /// Result of a PAP RADIUS round-trip, returned by
 /// [`AuthBridge::submit_pap`].
 ///
@@ -56,11 +88,26 @@ pub struct PapJob {
 /// (today: `Mikrotik-Rate-Limit`). Kept separate from
 /// [`AuthVerdict`] so the PPP layer doesn't grow a dependency on
 /// [`crate::shape`].
+/// Result of a single-roundtrip RADIUS authentication (PAP or
+/// CHAP-MD5). Both methods produce the same outcome shape; method
+/// identity lives at the [`Job`] / [`AuthBridge::submit_*`] level.
+///
+/// `verdict` feeds the in-process PPP driver. `shaping` is a
+/// side-channel for the session task: present only on Accept, and
+/// only when the Access-Accept carried a recognised shaping VSA
+/// (today: `Mikrotik-Rate-Limit`). Kept separate from
+/// [`AuthVerdict`] so the PPP layer doesn't grow a dependency on
+/// [`crate::shape`].
 #[derive(Debug)]
-pub struct PapOutcome {
+pub struct AuthOutcome {
     pub verdict: AuthVerdict,
     pub shaping: Option<ShapingPolicy>,
 }
+
+/// Backwards-compatible alias so existing call sites that pattern-
+/// match on a method-specific outcome name keep compiling.
+pub type PapOutcome = AuthOutcome;
+pub type ChapOutcome = AuthOutcome;
 
 /// A CHAP-MD5 response to be verified against RADIUS.
 ///
@@ -72,18 +119,9 @@ pub struct ChapJob {
     pub username: String,
     pub chap_id: u8,
     pub response: [u8; 16],
-    pub challenge: Vec<u8>,
+    pub challenge: [u8; 16],
     pub peer: SocketAddr,
-    pub reply: oneshot::Sender<ChapOutcome>,
-}
-
-/// Result of a CHAP-MD5 RADIUS round-trip. Mirrors [`PapOutcome`];
-/// kept as a separate type so call sites don't have to muddle method
-/// identity at the bridge boundary.
-#[derive(Debug)]
-pub struct ChapOutcome {
-    pub verdict: AuthVerdict,
-    pub shaping: Option<ShapingPolicy>,
+    pub reply: oneshot::Sender<AuthOutcome>,
 }
 
 /// An MS-CHAPv2 response to be verified against RADIUS
@@ -121,6 +159,21 @@ pub struct MsChapOutcome {
     pub shaping: Option<ShapingPolicy>,
     pub auth_response: Option<Vec<u8>>,
     pub error_string: Option<String>,
+}
+
+impl MsChapOutcome {
+    /// Construct a Reject outcome with the given message and the
+    /// MS-CHAPv2-specific Accept-only fields cleared.
+    fn reject(message: impl Into<Vec<u8>>) -> Self {
+        Self {
+            verdict: AuthVerdict::Reject {
+                message: message.into(),
+            },
+            shaping: None,
+            auth_response: None,
+            error_string: None,
+        }
+    }
 }
 
 enum Job {
@@ -209,28 +262,18 @@ impl AuthBridge {
         username: String,
         password: Vec<u8>,
         peer: SocketAddr,
-    ) -> PapOutcome {
+    ) -> AuthOutcome {
         let (reply, rx) = oneshot::channel();
-        let job = Job::Pap(PapJob {
-            username,
-            password,
-            peer,
-            reply,
-        });
-        if self.tx.send(job).await.is_err() {
-            return PapOutcome {
-                verdict: AuthVerdict::Reject {
-                    message: b"auth dispatcher unavailable".to_vec(),
-                },
-                shaping: None,
-            };
-        }
-        rx.await.unwrap_or_else(|_| PapOutcome {
-            verdict: AuthVerdict::Reject {
-                message: b"auth dispatcher dropped reply".to_vec(),
-            },
-            shaping: None,
-        })
+        self.dispatch_basic(
+            Job::Pap(PapJob {
+                username,
+                password,
+                peer,
+                reply,
+            }),
+            rx,
+        )
+        .await
     }
 
     /// Submit a CHAP-MD5 response. Same backpressure / drop semantics
@@ -240,32 +283,33 @@ impl AuthBridge {
         username: String,
         chap_id: u8,
         response: [u8; 16],
-        challenge: Vec<u8>,
+        challenge: [u8; 16],
         peer: SocketAddr,
-    ) -> ChapOutcome {
+    ) -> AuthOutcome {
         let (reply, rx) = oneshot::channel();
-        let job = Job::Chap(ChapJob {
-            username,
-            chap_id,
-            response,
-            challenge,
-            peer,
-            reply,
-        });
+        self.dispatch_basic(
+            Job::Chap(ChapJob {
+                username,
+                chap_id,
+                response,
+                challenge,
+                peer,
+                reply,
+            }),
+            rx,
+        )
+        .await
+    }
+
+    /// Internal: send `job` to the dispatcher and wait for the
+    /// matching `AuthOutcome`. Surfaces full / closed queue and a
+    /// dropped reply channel uniformly as a `Reject`.
+    async fn dispatch_basic(&self, job: Job, rx: oneshot::Receiver<AuthOutcome>) -> AuthOutcome {
         if self.tx.send(job).await.is_err() {
-            return ChapOutcome {
-                verdict: AuthVerdict::Reject {
-                    message: b"auth dispatcher unavailable".to_vec(),
-                },
-                shaping: None,
-            };
+            return reject(b"auth dispatcher unavailable".as_slice());
         }
-        rx.await.unwrap_or_else(|_| ChapOutcome {
-            verdict: AuthVerdict::Reject {
-                message: b"auth dispatcher dropped reply".to_vec(),
-            },
-            shaping: None,
-        })
+        rx.await
+            .unwrap_or_else(|_| reject(b"auth dispatcher dropped reply".as_slice()))
     }
 
     /// Submit an MS-CHAPv2 response. Same backpressure / drop
@@ -293,23 +337,10 @@ impl AuthBridge {
             reply,
         });
         if self.tx.send(job).await.is_err() {
-            return MsChapOutcome {
-                verdict: AuthVerdict::Reject {
-                    message: b"auth dispatcher unavailable".to_vec(),
-                },
-                shaping: None,
-                auth_response: None,
-                error_string: None,
-            };
+            return MsChapOutcome::reject("auth dispatcher unavailable");
         }
-        rx.await.unwrap_or_else(|_| MsChapOutcome {
-            verdict: AuthVerdict::Reject {
-                message: b"auth dispatcher dropped reply".to_vec(),
-            },
-            shaping: None,
-            auth_response: None,
-            error_string: None,
-        })
+        rx.await
+            .unwrap_or_else(|_| MsChapOutcome::reject("auth dispatcher dropped reply"))
     }
 }
 
@@ -330,41 +361,21 @@ async fn run_pap(
     for (addr, secret) in servers.iter() {
         match authenticate_pap(&client, *addr, secret, &ctx, &job.password).await {
             Ok(accept) => {
-                let shaping = accept.shaping;
-                let _ = job.reply.send(PapOutcome {
-                    verdict: AuthVerdict::Accept {
-                        addrs: project_addrs(&accept),
-                    },
-                    shaping,
-                });
+                let _ = job.reply.send(accept_outcome(&accept));
                 return;
             }
             Err(AuthError::Rejected(msg)) => {
-                // Authoritative reject — do not fail over to the
-                // next server.
                 let bytes = msg.unwrap_or_else(|| "access rejected".into()).into_bytes();
-                let _ = job.reply.send(PapOutcome {
-                    verdict: AuthVerdict::Reject { message: bytes },
-                    shaping: None,
-                });
+                let _ = job.reply.send(reject(bytes));
                 return;
             }
             Err(e) => {
-                warn!(radius = %addr, user = %job.username, error = %e, "RADIUS auth attempt failed; trying next server");
+                warn!(radius = %addr, user = %job.username, error = %e, "RADIUS PAP attempt failed; trying next server");
                 last_transport_err = Some(e.to_string());
             }
         }
     }
-    let msg = last_transport_err.map_or_else(
-        || "auth failed: no RADIUS servers reachable".into(),
-        |e| format!("auth failed: {e}"),
-    );
-    let _ = job.reply.send(PapOutcome {
-        verdict: AuthVerdict::Reject {
-            message: msg.into_bytes(),
-        },
-        shaping: None,
-    });
+    let _ = job.reply.send(transport_failure(last_transport_err));
 }
 
 async fn run_chap(
@@ -394,21 +405,12 @@ async fn run_chap(
         .await
         {
             Ok(accept) => {
-                let shaping = accept.shaping;
-                let _ = job.reply.send(ChapOutcome {
-                    verdict: AuthVerdict::Accept {
-                        addrs: project_addrs(&accept),
-                    },
-                    shaping,
-                });
+                let _ = job.reply.send(accept_outcome(&accept));
                 return;
             }
             Err(AuthError::Rejected(msg)) => {
                 let bytes = msg.unwrap_or_else(|| "access rejected".into()).into_bytes();
-                let _ = job.reply.send(ChapOutcome {
-                    verdict: AuthVerdict::Reject { message: bytes },
-                    shaping: None,
-                });
+                let _ = job.reply.send(reject(bytes));
                 return;
             }
             Err(e) => {
@@ -417,16 +419,7 @@ async fn run_chap(
             }
         }
     }
-    let msg = last_transport_err.map_or_else(
-        || "auth failed: no RADIUS servers reachable".into(),
-        |e| format!("auth failed: {e}"),
-    );
-    let _ = job.reply.send(ChapOutcome {
-        verdict: AuthVerdict::Reject {
-            message: msg.into_bytes(),
-        },
-        shaping: None,
-    });
+    let _ = job.reply.send(transport_failure(last_transport_err));
 }
 
 async fn run_mschapv2(
@@ -463,27 +456,25 @@ async fn run_mschapv2(
             Ok(AccessOutcome::Accept {
                 authenticator,
                 attributes,
-            }) => {
-                match crate::auth::reply::decode_accept(&attributes, secret, &authenticator) {
-                    Ok(accept) => {
-                        let shaping = accept.shaping;
-                        let auth_response = accept.mschap2_success.clone();
-                        let _ = job.reply.send(MsChapOutcome {
-                            verdict: AuthVerdict::Accept {
-                                addrs: project_addrs(&accept),
-                            },
-                            shaping,
-                            auth_response,
-                            error_string: None,
-                        });
-                        return;
-                    }
-                    Err(e) => {
-                        warn!(radius = %addr, user = %job.username, error = %e, "MS-CHAPv2 Access-Accept malformed; trying next server");
-                        last_transport_err = Some(e.to_string());
-                    }
+            }) => match crate::auth::reply::decode_accept(&attributes, secret, &authenticator) {
+                Ok(accept) => {
+                    let shaping = accept.shaping;
+                    let auth_response = accept.mschap2_success.clone();
+                    let _ = job.reply.send(MsChapOutcome {
+                        verdict: AuthVerdict::Accept {
+                            addrs: project_addrs(&accept),
+                        },
+                        shaping,
+                        auth_response,
+                        error_string: None,
+                    });
+                    return;
                 }
-            }
+                Err(e) => {
+                    warn!(radius = %addr, user = %job.username, error = %e, "MS-CHAPv2 Access-Accept malformed; trying next server");
+                    last_transport_err = Some(e.to_string());
+                }
+            },
             Ok(AccessOutcome::Reject { attributes, .. }) => {
                 let error_string = crate::auth::reply::mschap_error(&attributes);
                 let reason = crate::auth::reply::reject_reason(&attributes)

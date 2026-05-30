@@ -22,7 +22,8 @@ pub const CMK_SEED: &[u8; 29] = b"SSTP inner method derived CMK";
 pub enum BindingOutcome {
     Ok,
     /// Attribute missing / wrong length / Status-Info with status != `NO_ERROR`.
-    #[allow(dead_code)] // FUTURE: produced once Call-Connected attribute validation rejects malformed inputs (today the verify path only flags MAC mismatch as `ValueNotSupported`).
+    #[allow(dead_code)]
+    // FUTURE: produced once Call-Connected attribute validation rejects malformed inputs (today the verify path only flags MAC mismatch as `ValueNotSupported`).
     AttribNotSupportedInMsg,
     /// Nonce mismatch, cert hash mismatch, unsupported hash algorithm,
     /// or invalid Compound MAC.

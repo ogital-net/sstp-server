@@ -83,10 +83,7 @@ impl Pool {
         let (a, b) = s
             .split_once('-')
             .ok_or_else(|| format!("--pool: expected START-END, got {s:?}"))?;
-        let start: Ipv4Addr = a
-            .trim()
-            .parse()
-            .map_err(|e| format!("--pool start: {e}"))?;
+        let start: Ipv4Addr = a.trim().parse().map_err(|e| format!("--pool start: {e}"))?;
         let end: Ipv4Addr = b.trim().parse().map_err(|e| format!("--pool end: {e}"))?;
         if u32::from(end) < u32::from(start) {
             return Err(format!("--pool: end {end} precedes start {start}"));
@@ -183,7 +180,10 @@ impl Handler for PapHandler {
             }
             Some(map) => match map.get(&username) {
                 Some(expected) => {
-                    matches!(auth::pap::verify(&request, expected), Ok(VerifyOutcome::Match))
+                    matches!(
+                        auth::pap::verify(&request, expected),
+                        Ok(VerifyOutcome::Match)
+                    )
                 }
                 None => false,
             },
@@ -314,7 +314,10 @@ async fn run() -> Result<(), String> {
     // localhost / lab use, so a single 0.0.0.0/0 entry is fine.
     let client = Arc::new(Client::new(secret_bytes.as_slice()));
     let store = StaticClients::builder()
-        .add(IpCidr::new(Ipv4Addr::UNSPECIFIED.into(), 0).expect("0.0.0.0/0"), client)
+        .add(
+            IpCidr::new(Ipv4Addr::UNSPECIFIED.into(), 0).expect("0.0.0.0/0"),
+            client,
+        )
         .build();
 
     let handler = PapHandler {

@@ -31,7 +31,10 @@ use radius_tokio::{
     Code, CodecError, PacketBuffer, authenticator,
     dict::rfc::{
         self,
-        values::{AcctAuthentic, AcctStatusType, AcctTerminateCause, FramedProtocol, NasPortType, ServiceType},
+        values::{
+            AcctAuthentic, AcctStatusType, AcctTerminateCause, FramedProtocol, NasPortType,
+            ServiceType,
+        },
     },
 };
 use tokio::net::UdpSocket;
@@ -332,7 +335,9 @@ impl AcctClient {
         let attempts = self.retry.max_attempts.max(1);
         for attempt in 0..attempts {
             let delay_secs = u32::try_from(started.elapsed().as_secs()).unwrap_or(u32::MAX);
-            let bytes = build(identifier, secret, ctx, session, event, counters, delay_secs)?;
+            let bytes = build(
+                identifier, secret, ctx, session, event, counters, delay_secs,
+            )?;
             self.socket.send_to(&bytes, peer).await?;
             match timeout(wait, &mut reply_rx).await {
                 Ok(Ok(reply)) => {
@@ -529,7 +534,13 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(saw_nas_ip && saw_framed_ip && saw_service_type && saw_framed_proto && saw_nas_port_type);
+        assert!(
+            saw_nas_ip
+                && saw_framed_ip
+                && saw_service_type
+                && saw_framed_proto
+                && saw_nas_port_type
+        );
     }
 
     #[test]

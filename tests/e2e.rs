@@ -71,8 +71,7 @@ fn sstpc_skip_reason() -> Option<String> {
     }
     if !std::path::Path::new("/dev/ppp").exists() {
         return Some(
-            "/dev/ppp not present (sstpc/pppd client-side requirement; server uses TUN)"
-                .into(),
+            "/dev/ppp not present (sstpc/pppd client-side requirement; server uses TUN)".into(),
         );
     }
     // EUID 0 is the simplest portable check; CAP_NET_ADMIN is a

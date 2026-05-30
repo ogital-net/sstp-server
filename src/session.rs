@@ -85,7 +85,8 @@ pub enum DisconnectReason {
     /// Operator-initiated (`disable session` on the control socket).
     AdminRequested,
     /// RADIUS CoA Disconnect-Request for this session.
-    #[allow(dead_code)] // FUTURE: emitted by the CoA receiver once its MPSC handoff to the registry lands.
+    #[allow(dead_code)]
+    // FUTURE: emitted by the CoA receiver once its MPSC handoff to the registry lands.
     RadiusDisconnect,
     /// Process-wide drain in progress (SIGTERM / `shutdown` command).
     ServerShutdown,
@@ -443,9 +444,9 @@ async fn drive_sstp(
         auth_method,
         &mut kppp,
         data_path,
-            &mut pending_shaping,
-            &mut pending_username,
-            &mut acct_state,
+        &mut pending_shaping,
+        &mut pending_username,
+        &mut acct_state,
     )
     .await
     {
@@ -591,9 +592,9 @@ async fn drive_sstp(
                     auth_method,
                     &mut kppp,
                     data_path,
-                                    &mut pending_shaping,
-                                    &mut pending_username,
-                                    &mut acct_state,
+                    &mut pending_shaping,
+                    &mut pending_username,
+                    &mut acct_state,
                 )
                 .await
                 {
@@ -617,9 +618,9 @@ async fn drive_sstp(
                     auth_method,
                     &mut kppp,
                     data_path,
-                                    &mut pending_shaping,
-                                    &mut pending_username,
-                                    &mut acct_state,
+                    &mut pending_shaping,
+                    &mut pending_username,
+                    &mut acct_state,
                 )
                 .await
                 {
@@ -632,11 +633,8 @@ async fn drive_sstp(
             }
             DriverEvent::AcctInterim => {
                 if let (Some(state), Some(bridge)) = (acct_state.as_mut(), auth.acct) {
-                    let counters = sample_acct_counters(
-                        state.ifindex,
-                        state.started,
-                        &state.last_counters,
-                    );
+                    let counters =
+                        sample_acct_counters(state.ifindex, state.started, &state.last_counters);
                     state.last_counters = counters.clone();
                     bridge.submit(
                         state.username.clone(),
@@ -666,9 +664,9 @@ async fn drive_sstp(
                     auth_method,
                     &mut kppp,
                     data_path,
-                                    &mut pending_shaping,
-                                    &mut pending_username,
-                                    &mut acct_state,
+                    &mut pending_shaping,
+                    &mut pending_username,
+                    &mut acct_state,
                 )
                 .await
                 {
@@ -693,9 +691,9 @@ async fn drive_sstp(
                         auth_method,
                         &mut kppp,
                         data_path,
-                                            &mut pending_shaping,
-                                            &mut pending_username,
-                                            &mut acct_state,
+                        &mut pending_shaping,
+                        &mut pending_username,
+                        &mut acct_state,
                     )
                     .await
                     {
@@ -796,9 +794,9 @@ async fn drive_sstp(
                                 auth_method,
                                 &mut kppp,
                                 data_path,
-                                                            &mut pending_shaping,
-                                                            &mut pending_username,
-                                                            &mut acct_state,
+                                &mut pending_shaping,
+                                &mut pending_username,
+                                &mut acct_state,
                             )
                             .await
                             {
@@ -876,9 +874,9 @@ async fn drive_sstp(
                                 auth_method,
                                 &mut kppp,
                                 data_path,
-                                                            &mut pending_shaping,
-                                                            &mut pending_username,
-                                                            &mut acct_state,
+                                &mut pending_shaping,
+                                &mut pending_username,
+                                &mut acct_state,
                             )
                             .await
                             {
@@ -908,9 +906,9 @@ async fn drive_sstp(
                                     auth_method,
                                     &mut kppp,
                                     data_path,
-                                                                    &mut pending_shaping,
-                                                                    &mut pending_username,
-                                                                    &mut acct_state,
+                                    &mut pending_shaping,
+                                    &mut pending_username,
+                                    &mut acct_state,
                                 )
                                 .await
                                 {
@@ -952,9 +950,9 @@ async fn drive_sstp(
                                         auth_method,
                                         &mut kppp,
                                         data_path,
-                                                                            &mut pending_shaping,
-                                                                            &mut pending_username,
-                                                                            &mut acct_state,
+                                        &mut pending_shaping,
+                                        &mut pending_username,
+                                        &mut acct_state,
                                     )
                                     .await
                                     {
@@ -1336,9 +1334,7 @@ async fn handle_ppp_step(
                             if let Some(policy) = pending_shaping.take() {
                                 match crate::shape::Shaper::open() {
                                     Ok(mut shaper) => {
-                                        if let Err(e) =
-                                            shaper.apply(k.ifindex(), &policy)
-                                        {
+                                        if let Err(e) = shaper.apply(k.ifindex(), &policy) {
                                             warn!(
                                                 %id,
                                                 ifindex = k.ifindex(),
@@ -1371,8 +1367,7 @@ async fn handle_ppp_step(
                             // or when no auth phase ran (anonymous
                             // negotiation paths, currently
                             // unreachable but handled defensively).
-                            if let (Some(user), Some(bridge)) =
-                                (pending_username.take(), auth.acct)
+                            if let (Some(user), Some(bridge)) = (pending_username.take(), auth.acct)
                             {
                                 let kppp_ref = kppp.as_ref().expect("just inserted");
                                 let session = crate::auth::accounting::AcctSession::new(
@@ -1390,8 +1385,7 @@ async fn handle_ppp_step(
                                     },
                                 );
                                 let started = std::time::Instant::now();
-                                let counters =
-                                    crate::auth::accounting::AcctCounters::default();
+                                let counters = crate::auth::accounting::AcctCounters::default();
                                 bridge.submit(
                                     user.clone(),
                                     auth.peer,
