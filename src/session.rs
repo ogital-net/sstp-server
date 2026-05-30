@@ -213,6 +213,7 @@ pub async fn run(
     local_ip: Ipv4Addr,
     auth_method: AuthMethod,
     data_path: DataPathMode,
+    mss_clamp_enabled: bool,
 ) {
     info!(%id, %peer, "session accepted");
 
@@ -313,6 +314,7 @@ pub async fn run(
         local_ip,
         auth_method,
         data_path,
+        mss_clamp_enabled,
     )
     .await;
 
@@ -343,6 +345,7 @@ async fn drive_sstp(
     local_ip: Ipv4Addr,
     auth_method: AuthMethod,
     data_path: DataPathMode,
+    mss_clamp_enabled: bool,
 ) {
     use std::future::poll_fn;
     use std::os::fd::OwnedFd;
@@ -374,6 +377,7 @@ async fn drive_sstp(
     let mut ppp_timer: Option<(TimerOwner, Pin<Box<Sleep>>)> = None;
     let mut kppp: Option<KpppSession> = None;
     let mut kppp_buf = [0u8; 2048];
+    let mut mss_clamp: Option<crate::shape::mss::MssClamp> = None;
     // Stashed at PAP Accept time (`NeedPapAuth` handler in
     // `handle_ppp_step`), consumed at `NetworkUp` time once the
     // kernel netdev exists. `None` after consumption or when the
@@ -447,6 +451,8 @@ async fn drive_sstp(
         &mut pending_shaping,
         &mut pending_username,
         &mut acct_state,
+        mss_clamp_enabled,
+        &mut mss_clamp,
     )
     .await
     {
@@ -595,6 +601,8 @@ async fn drive_sstp(
                     &mut pending_shaping,
                     &mut pending_username,
                     &mut acct_state,
+                    mss_clamp_enabled,
+                    &mut mss_clamp,
                 )
                 .await
                 {
@@ -621,6 +629,8 @@ async fn drive_sstp(
                     &mut pending_shaping,
                     &mut pending_username,
                     &mut acct_state,
+                    mss_clamp_enabled,
+                    &mut mss_clamp,
                 )
                 .await
                 {
@@ -667,6 +677,8 @@ async fn drive_sstp(
                     &mut pending_shaping,
                     &mut pending_username,
                     &mut acct_state,
+                    mss_clamp_enabled,
+                    &mut mss_clamp,
                 )
                 .await
                 {
@@ -694,6 +706,8 @@ async fn drive_sstp(
                         &mut pending_shaping,
                         &mut pending_username,
                         &mut acct_state,
+                        mss_clamp_enabled,
+                        &mut mss_clamp,
                     )
                     .await
                     {
@@ -797,6 +811,8 @@ async fn drive_sstp(
                                 &mut pending_shaping,
                                 &mut pending_username,
                                 &mut acct_state,
+                                mss_clamp_enabled,
+                                &mut mss_clamp,
                             )
                             .await
                             {
@@ -877,6 +893,8 @@ async fn drive_sstp(
                                 &mut pending_shaping,
                                 &mut pending_username,
                                 &mut acct_state,
+                                mss_clamp_enabled,
+                                &mut mss_clamp,
                             )
                             .await
                             {
@@ -909,6 +927,8 @@ async fn drive_sstp(
                                     &mut pending_shaping,
                                     &mut pending_username,
                                     &mut acct_state,
+                                    mss_clamp_enabled,
+                                    &mut mss_clamp,
                                 )
                                 .await
                                 {
@@ -953,6 +973,8 @@ async fn drive_sstp(
                                         &mut pending_shaping,
                                         &mut pending_username,
                                         &mut acct_state,
+                                        mss_clamp_enabled,
+                                        &mut mss_clamp,
                                     )
                                     .await
                                     {
@@ -1019,6 +1041,8 @@ async fn handle_sstp_step(
     pending_shaping: &mut Option<crate::shape::ShapingPolicy>,
     pending_username: &mut Option<String>,
     acct_state: &mut Option<AcctState>,
+    mss_clamp_enabled: bool,
+    mss_clamp: &mut Option<crate::shape::mss::MssClamp>,
 ) -> bool {
     let outcome = apply_step(id, tx, out, tx_buf, sstp_timer).await;
     if !outcome.keep_going {
@@ -1047,6 +1071,8 @@ async fn handle_sstp_step(
             pending_shaping,
             pending_username,
             acct_state,
+            mss_clamp_enabled,
+            mss_clamp,
         )
         .await
         {
@@ -1078,6 +1104,8 @@ async fn handle_ppp_step(
     pending_shaping: &mut Option<crate::shape::ShapingPolicy>,
     pending_username: &mut Option<String>,
     acct_state: &mut Option<AcctState>,
+    mss_clamp_enabled: bool,
+    mss_clamp: &mut Option<crate::shape::mss::MssClamp>,
 ) -> bool {
     use tokio::time::{Instant, sleep_until};
 
@@ -1213,6 +1241,7 @@ async fn handle_ppp_step(
             }
             Some(PppEvent::NetworkUp(addrs)) => {
                 let peer_ip = Ipv4Addr::from(addrs.ip);
+                let link_mtu = addrs.mtu.map(u32::from);
                 if kppp.is_some() {
                     debug!(%id, ip = %peer_ip, "spurious NetworkUp after kernel PPP unit already attached");
                 } else {
@@ -1311,6 +1340,7 @@ async fn handle_ppp_step(
                         tx.tls.tcp_fd(),
                         local_ip,
                         peer_ip,
+                        link_mtu,
                     ) {
                         Ok(k) => {
                             info!(
@@ -1355,6 +1385,26 @@ async fn handle_ppp_step(
                                             %id,
                                             error = %e,
                                             "shape::open failed; session continues unshaped"
+                                        );
+                                    }
+                                }
+                            }
+                            if mss_clamp_enabled {
+                                let mtu = link_mtu.unwrap_or(1500);
+                                match crate::shape::mss::MssClamp::install_for_ifname(
+                                    &k.ifname(),
+                                    mtu,
+                                ) {
+                                    Ok(guard) => {
+                                        *mss_clamp = Some(guard);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            %id,
+                                            ifname = %k.ifname(),
+                                            mtu,
+                                            error = %e,
+                                            "MSS clamp install failed; session continues without SYN rewrite"
                                         );
                                     }
                                 }

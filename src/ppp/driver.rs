@@ -113,6 +113,7 @@ pub enum PppEvent {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AssignedAddrs {
     pub ip: [u8; 4],
+    pub mtu: Option<u16>,
     pub dns1: Option<[u8; 4]>,
     pub dns2: Option<[u8; 4]>,
     pub nbns1: Option<[u8; 4]>,

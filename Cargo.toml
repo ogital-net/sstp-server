@@ -31,6 +31,8 @@ dotenvy = "0.15"
 fast-md5 = "1"
 getopt-iter = "1"
 libc = "0.2"
+mnl = "0.3"
+nftnl = "0.9"
 rustyline = { version = "18", optional = true }
 socket2 = { version = "0.6", features = ["all"] }
 radius-tokio = { git = "https://github.com/ogital-net/radius-tokio", branch = "client", default-features = false, features = ["dict-rfc", "dict-microsoft", "client", "fast-md5"] }

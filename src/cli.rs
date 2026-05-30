@@ -50,7 +50,8 @@ OPTIONS:
     -t, --threads <n>            I/O worker count (default: auto)
     -T, --auth-threads <n>       Auth runtime threads (default: max(2, ncpus/4))
     -s, --control-socket <path>  Control socket path (default: /run/sstp-server.sock)
-    -n, --no-control-socket      Disable the control socket
+     -n, --no-control-socket      Disable the control socket
+    -x, --no-mss-clamp           Disable TCP SYN MSS clamping
     -F, --log-format <fmt>       text | json | auto (default: auto)
     -L, --log-file <path>        Log to file instead of stderr
     -D, --data-path <mode>       auto | kernel | tun (default: auto)
@@ -89,6 +90,7 @@ t:(threads)\
 T:(auth-threads)\
 s:(control-socket)\
 n(no-control-socket)\
+x(no-mss-clamp)\
 F:(log-format)\
 L:(log-file)\
 D:(data-path)\
@@ -130,6 +132,7 @@ pub struct Config {
     pub io_threads: NonZeroUsize,
     pub auth_threads: NonZeroUsize,
     pub control_socket: Option<PathBuf>,
+    pub mss_clamp: bool,
     pub log_format: LogFormat,
     pub log_file: Option<PathBuf>,
     pub log_level: LevelFilter,
@@ -236,6 +239,7 @@ where
     let mut auth_threads: Option<usize> = None;
     let mut control_socket: Option<PathBuf> = None;
     let mut no_control_socket = false;
+    let mut no_mss_clamp = false;
     let mut log_format = LogFormat::Auto;
     let mut log_file: Option<PathBuf> = None;
     let mut data_path = DataPathMode::Auto;
@@ -278,6 +282,7 @@ where
             'T' => auth_threads = Some(parse_usize("auth-threads", opt.arg())?),
             's' => control_socket = opt.into_arg().map(cow_to_path),
             'n' => no_control_socket = true,
+            'x' => no_mss_clamp = true,
             'F' => {
                 let raw = opt.arg().unwrap_or("");
                 log_format = match raw {
@@ -385,6 +390,7 @@ where
         io_threads,
         auth_threads,
         control_socket,
+        mss_clamp: !no_mss_clamp,
         log_format,
         log_file,
         log_level,

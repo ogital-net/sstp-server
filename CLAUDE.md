@@ -68,167 +68,69 @@ shelling out to `pppd`. `pppd` spawns a process per session and routes every
 data packet through a pty, which caps throughput and inflates memory per
 session by orders of magnitude.
 
-**v0.1 reality — the userspace data path does not move IP traffic.**
-Mainline Linux has no generic userspace-channel API on `/dev/ppp` —
-channels are registered only by in-kernel transport drivers (`pppoe`,
-`pppol2tp`, `pptp`, and our own [`kmod/`](kmod/) once it ships). The
-`pppN` unit fd is **not** a substitute: empirically (kernel 6.8,
-verified end-to-end by [`tests/e2e.rs`](tests/e2e.rs)
-`sstpc_pap_login`), the unit fd's semantics are:
+**Status — the sstp kmod + kTLS path is the production fast path.**
+When `/dev/sstp` is loaded and the negotiated TLS session is
+kTLS-eligible (TLS 1.2/1.3 with AES-GCM or ChaCha20-Poly1305),
+`--data-path auto` selects the kernel path: userspace finishes
+the TLS handshake + SSTP/PPP negotiation, installs kTLS RX+TX on
+the TCP socket via [`crypto::tls::TlsStream::install_ktls`](src/crypto/tls.rs)
++ [`crypto::ktls`](src/crypto/ktls.rs), and hands the socket to
+the kernel via `SSTP_IOC_ATTACH`. From that point the per-frame
+data path runs entirely in kernel context (kTLS AEAD → SSTP
+demux → `ppp_input`); userspace only wakes up for control
+frames and TLS 1.3 `KeyUpdate` / `NewSessionTicket`. Verified
+end-to-end by [`tests/e2e.rs`](tests/e2e.rs) `sstpc_pap_login`,
+which asserts both `kmod_attach_succeeded` and that the
+resulting `pppN` netdev's `rx_bytes` grows under an ICMP echo.
 
-- `write()` is treated as **TX direction** by `ppp_xmit_process` — the
-  kernel tries to dispatch the frame to an attached channel and
-  silently drops it if none is bound. `tx_bytes` ticks up but no IP
-  packet is delivered anywhere.
-- `read()` returns EOF on a channel-less unit. There is no TX queue
-  for userspace to drain.
+The two reasons the daemon falls back to the TUN path are
+the kmod not being loaded (no `/dev/sstp`) and a kTLS-
+incompatible cipher being negotiated. Either case logs at
+`info` and the session continues unaffected, just slower (per-
+packet userspace copy + libssl AEAD).
 
-The doc comment on [`src/kppp/unit.rs`](src/kppp/unit.rs) used to claim
-the fd was bidirectional (write = inject as RX); that was wrong, and
-the corresponding fallback in [`src/session.rs`](src/session.rs) is a
-no-op in production. The session task still creates `pppN`, runs the
-full SSTP + PPP control plane, assigns the negotiated address via
-netlink, and answers LCP echoes — all of which is observable from
-`ip addr` / `ip -s link show pppN` — but no user-payload IP packet
-crosses the tunnel until one of the data-path options below is wired
-up.
+**Why we run PPP through `pppN` rather than a plain TUN device
+in kernel mode.** The kmod registers a real `ppp_channel`
+against the unit, so the kernel keeps `ppp_generic`'s NP-mode
+filtering, MRU enforcement, and the `ip -s link show pppN`
+accounting. The TUN fallback hands raw IP straight to the
+kernel netdev and bypasses `ppp_generic` entirely (no NP
+filtering, no unit-side stats), which is acceptable as a
+fallback but not as the headline path.
 
-We deliberately keep `pppN` (rather than switching to a plain TUN
-device) because the migration to a finished kmod becomes a swap of
-the data-path module rather than a redesign — the PPP unit lifecycle,
-NP-mode filtering, header compression negotiation, and the
-`ip -s link show pppN` accounting all carry over unchanged. The TUN
-alternative would save one kernel module dependency but add a
-per-packet PPP-header strip/add in userspace and force us to
-re-implement NP filtering by hand, for no win we'd recoup later.
+**Historical note on the unit fd.** Earlier versions of this
+document and the [`src/kppp/unit.rs`](src/kppp/unit.rs) doc
+comment claimed the unit fd was a bidirectional IP pipe (the
+`pppd`-over-pty model). That claim was wrong on mainline
+kernels: with no channel attached, `write()` is treated as TX
+and silently dropped, and `read()` returns EOF. The kernel
+path therefore *requires* the kmod (which registers the
+channel); there is no "userspace PPP copier" backend.
 
-**What it takes to actually pass traffic through the tunnel.** Two
-independent paths, listed in order of strategic priority:
-
-1. **Finish the sstp kmod + kTLS plumbing (preferred, headline path).**
-   This is the architecture the rest of the codebase was designed
-   around. Requirements, in order:
-   - **kTLS on the TCP socket.** Today
-     [`crypto::tls::TlsStream::ktls_eligibility`](src/crypto/tls.rs)
-     reports whether the negotiated cipher is suitable, but nothing
-     ever calls `setsockopt(SOL_TCP, TCP_ULP, "tls")` or installs
-     `TLS_TX` / `TLS_RX` `crypto_info_*` payloads. Need to (a)
-     extract the negotiated traffic keys + sequence numbers from
-     aws-lc-sys after handshake (TLS 1.2: `SSL_get_keyblock`-ish
-     dance; TLS 1.3: traffic secrets via the exporter or
-     `SSL_export_keying_material` with the proper labels), (b)
-     install them on the socket before the first post-handshake
-     `read`/`write` *or* arrange a clean cutover that drains the
-     TLS state-machine's read buffer first, (c) handle TLS 1.3
-     `KeyUpdate` (today, blow the session up; longer term, surface
-     `SSTP_EVT_TLS_REKEY_NEEDED` to userspace per the kmod ABI
-     header). aws-lc-sys does not expose a kTLS helper the way
-     boringssl's `bssl::SSL_get_traffic_secrets` does; this is a
-     few hundred lines of FFI plus careful state-machine work and
-     is the single largest remaining piece.
-   - **Finish the kmod data path.** Per [`kmod/README.md`](kmod/README.md)
-     the v0.2 RC kmod ships the full per-frame data path:
-     `sk_write_space` → `ppp_output_wakeup` for TX backpressure
-     ([`kmod/sstp_chan.c`](kmod/sstp_chan.c)), control-packet
-     (`C=1`) demux + queue + `SSTP_EVT_CONTROL_PACKET` event +
-     `SSTP_IOC_RECV_CONTROL` ioctl ([`kmod/sstp_demux.c`](kmod/sstp_demux.c),
-     [`kmod/sstp_event.c`](kmod/sstp_event.c)), and TLS 1.3
-     `KeyUpdate` / `NewSessionTicket` detection via
-     `TLS_GET_RECORD_TYPE` cmsg surfacing
-     `SSTP_EVT_TLS_REKEY_NEEDED`. ABI frozen at minor 2; see
-     [kernel-abi/sstp.h](kernel-abi/sstp.h) for the wire layout
-     and [`kmod/tests/test_sstp.c`](kmod/tests/test_sstp.c) for
-     the lifecycle harness.
-   - **Wire `DataPath::open` to actually request the kernel
-     path.** Today [`src/session.rs`](src/session.rs) falls back
-     in `Auto` mode whenever `ktls_eligibility().compatible` is
-     false; the EOPNOTSUPP return from `SSTP_IOC_ATTACH` confirms
-     this end of the wiring works (verified by the e2e probe
-     assertion). Once kTLS is installed, the existing fallback
-     logic should select the kernel path naturally — but a CI
-     `--data-path kernel` smoke test will be needed to keep it
-     from regressing.
-   - **Graduate `sstpc_pap_login` to a hard traffic assertion.**
-     The test already records `server rx_bytes` / `tx_bytes`
-     before/after a single ICMP echo from the client-side `pppN`.
-     When the kmod path is hot, server `rx_bytes` will grow on
-     each request and the eprintln "NOTE" branch becomes the
-     pass criterion (`assert!(server_rx_after > server_rx_before)`).
-   - **End-to-end interop matrix.** Run the same harness against
-     the Windows 10/11 built-in SSTP client, Windows Server RRAS,
-     and SoftEther's client. Each surfaces a different cipher
-     preference / quirk; `MS-SSTP` reference fixtures should be
-     captured under `tests/fixtures/` for any divergence.
-
-2. **TUN-device fallback (escape hatch / kmod-free deployments) —
-   LANDED.** Available on any kernel with `/dev/net/tun` (i.e.
-   every modern Linux). Selected automatically under
-   `--data-path auto` when the sstp kmod is absent or the
-   per-session attach fails, and explicitly via `--data-path tun`.
-   - Implementation: [`src/kppp/tun.rs`](src/kppp/tun.rs) opens
-     `/dev/net/tun`, `TUNSETIFF` with `IFF_TUN | IFF_NO_PI`,
-     reuses [`src/kppp/netlink.rs`](src/kppp/netlink.rs) for the
-     address + MTU + link-up sequence (the netlink code takes an
-     ifindex — the netdev type doesn't matter), and wraps the fd
-     in `AsyncFd`.
-   - `KpppSession` ([`src/kppp/session.rs`](src/kppp/session.rs))
-     is now a thin enum-of-backends: the PPP path is unchanged
-     for kernel-kmod mode, the TUN path takes over for
-     `DataPathMode::Tun`. `write_frame` strips the 2-byte PPP
-     protocol prefix via `decode_frame` and writes the IP body
-     to the tun fd; `read_frame` reads an IP packet, derives
-     IPv4-vs-IPv6 from the version nibble, and PPP-encodes
-     (uncompressed Address/Control + protocol field) into the
-     caller's buffer ready for `write_ppp_as_sstp_data`.
-   - `Auto` resolution order: kmod (if `/dev/sstp` present and
-     attach succeeds) → TUN. The legacy PPP-userspace path
-     ([`src/kppp/datapath.rs`](src/kppp/datapath.rs)) is
-     reachable only via explicit `--data-path userspace` and is
-     a no-op on mainline kernels (kept for kmod migration
-     symmetry, not for production).
-   - Verified end-to-end by
-     [`tests/e2e.rs`](tests/e2e.rs) `sstpc_pap_login`: a single
-     ICMP echo from the sstpc-side `pppN` lands on the
-     server-side `tun0` with `server rx_bytes` growing from
-     0 → 84 (the assertion is now hard, not informational).
-   - Cons unchanged from the original plan: per-packet
-     userspace round-trip caps throughput at ~1–2 Gbps per
-     session. The kmod path runs frames through
-     `ppp_input()` so it keeps `ppp_generic`'s NP-mode
-     filtering and the rest of the unit-side machinery; the
-     TUN backend hands raw IP straight to the kernel netdev
-     and bypasses `ppp_generic` entirely (no NP filtering, no
-     unit-side `ip -s link show pppN` accounting). The RX
-     direction (server → client) requires routing rules on
-     the host to send return traffic via `tun0` — out of scope
-     for the data-path code itself.
-
-**Future kmod ABI.** The intended kernel-side interface for v0.x is
-sketched in [kernel-abi/sstp.h](kernel-abi/sstp.h) as a draft UAPI
-header, with a v0.1 lifecycle-only kmod skeleton under [kmod/](kmod/)
-that builds against any Linux 6.12+ tree with `CONFIG_PPP=m`.
-Userspace will hand the kernel a kTLS-equipped TCP fd plus the
-negotiated PPP unit via an `SSTP_IOC_ATTACH` ioctl on `/dev/sstp`;
-the kernel then registers an SSTP PPP channel against that unit and
-runs the steady-state data path (kTLS decrypt → SSTP demux →
-`ppp_input`) without userspace involvement.
+**Kmod ABI.** The kernel-side interface is defined in
+[kernel-abi/sstp.h](kernel-abi/sstp.h) (UAPI v0.2, frozen for the
+v0.x series); the in-tree module lives at [kmod/](kmod/) and
+builds against any Linux 6.12+ tree with `CONFIG_PPP=m`.
+Userspace hands the kernel a kTLS-equipped TCP fd plus the
+negotiated PPP unit via `SSTP_IOC_ATTACH` on `/dev/sstp`; the
+kernel registers a `ppp_channel` against that unit and runs the
+steady-state data path (kTLS decrypt → SSTP demux → `ppp_input`)
+without userspace involvement. See [docs/data-path.md](docs/data-path.md)
+for a packet-level walkthrough.
 
 **Runtime selection.** The data path is selected via `-D/--data-path
-{auto,kernel,tun,userspace}` (default `auto`). At startup the process
+{auto,kernel,tun}` (default `auto`). At startup the process
 probes `/dev/sstp` once and logs the outcome (`data-path: kernel`,
 `data-path: tun (sstp kmod not loaded; falling back to /dev/net/tun)`,
 etc.). Per-session bring-up routes through `KpppSession::bring_up`,
 which under `auto` first attempts `SSTP_IOC_ATTACH` against
-`/dev/sstp` (via `kppp::datapath::DataPath::open`) and falls back to
-the TUN backend on any kmod error. `kernel` forces the attach
-(sessions fail without the kmod + kTLS); `tun` skips the kmod probe
-entirely; `userspace` selects the legacy PPP-unit-fd copier, which
-is a no-op on mainline kernels and is kept only for kmod-migration
-symmetry. Because kTLS is not yet plumbed into `TlsStream`,
-kernel-mode attach currently returns `EOPNOTSUPP` and the TUN
-fallback fires per session — verified by the `sstpc_pap_login` e2e
-test, which asserts both the fallback warning *and* a non-zero
-ICMP echo carrying byte count on the server-side `tun0`.
+`/dev/sstp` and falls back to the TUN backend on any kmod error
+(missing module, kTLS-incompatible cipher, attach refused).
+`kernel` forces the attach (sessions fail without the kmod +
+kTLS); `tun` skips the kmod probe entirely. The auto path is
+verified by [`tests/e2e.rs`](tests/e2e.rs) `sstpc_pap_login`,
+which asserts the kmod attach succeeded when `/dev/sstp` is
+present and that ICMP traffic crosses the tunnel either way.
 
 ### Crypto
 
@@ -828,15 +730,20 @@ PR with tests where the surface allows. Check items off as they merge.
       comments on every `unsafe` block. Const-fn `_IO`/`_IOR`/`_IOW`/
       `_IOWR` ports pinned by a numerical compile-time test against
       `<linux/ppp-ioctl.h>`.
-- [ ] Channel fd: write user-plane PPP frames demuxed from SSTP into the
+- [x] Channel fd: write user-plane PPP frames demuxed from SSTP into the
       kernel channel; control frames stay in userspace.
-      **NOTE:** mainline Linux has no generic userspace-channel
-      interface — channels are registered by kernel transport drivers
-      (`pppoe`, `pppol2tp`, `pptp`). Without a custom kernel module,
-      the data path stays in userspace and uses the unit fd
-      bidirectionally (read = TX, write = RX), the same model `pppd`
-      uses over a pty. Per-packet zero-copy via the kernel would need
-      a new in-tree channel driver or eBPF; out of scope for v0.1.
+      Implemented by the in-tree sstp kmod ([kmod/](kmod/), UAPI
+      v0.2 frozen): userspace installs kTLS RX+TX on the TCP
+      socket and hands it to the kernel via `SSTP_IOC_ATTACH`,
+      which registers a `ppp_channel` and runs the steady-state
+      data path (kTLS decrypt → [MS-SSTP] §2.2.3 demux →
+      `ppp_input`) entirely in kernel context. Control frames
+      (`C=1`) are queued and surfaced to userspace via
+      `SSTP_EVT_CONTROL_PACKET` + `SSTP_IOC_RECV_CONTROL`. TLS
+      1.3 `KeyUpdate` / `NewSessionTicket` are detected via the
+      `TLS_GET_RECORD_TYPE` cmsg and surfaced as
+      `SSTP_EVT_TLS_REKEY_NEEDED`. Verified end-to-end by
+      [`tests/e2e.rs`](tests/e2e.rs) `sstpc_pap_login`.
 - [x] Unit fd: create `pppN` netdev, push `Framed-IP-Address` and routes
       via netlink. Hand-rolled `NETLINK_ROUTE` client in
       `src/kppp/netlink.rs` (no `rtnetlink` crate dependency — the

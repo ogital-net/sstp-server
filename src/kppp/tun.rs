@@ -28,9 +28,10 @@ use crate::ppp::frame::{ProtocolId, decode_frame, encode_frame};
 use super::SessionIpConfig;
 use super::netlink::{NetlinkError, RtNetlink};
 
-/// MTU we configure on the tun device. Matches the PPP unit MTU so
-/// SSTP data-packet sizing is identical between paths.
-const DEFAULT_MTU: u32 = 1500;
+/// Max packet size we read from the tun fd in one syscall. The
+/// configured tun MTU can be lower (per-session), but never higher
+/// than the PPP/SSTP ceiling in current builds.
+const MAX_TUN_MTU: u32 = 1500;
 
 const TUN_DEV: &str = "/dev/net/tun";
 const IFF_TUN: u16 = 0x0001;
@@ -76,7 +77,7 @@ pub struct TunSession {
 impl TunSession {
     /// Open `/dev/net/tun`, allocate a new `tunN` interface, push
     /// the local + peer address pair via netlink, and bring it up.
-    pub fn bring_up(local: Ipv4Addr, peer: Ipv4Addr) -> Result<Self, TunError> {
+    pub fn bring_up(local: Ipv4Addr, peer: Ipv4Addr, mtu: u32) -> Result<Self, TunError> {
         let path = CString::new(TUN_DEV).expect("TUN_DEV has no interior NUL");
         // SAFETY: `path` is a valid NUL-terminated C string for the
         // duration of the call; flags are standard. Returns -1 and
@@ -120,7 +121,7 @@ impl TunSession {
             local,
             peer,
             netmask: None,
-            mtu: Some(DEFAULT_MTU),
+            mtu: Some(mtu),
         };
         nl.bring_up(ifindex, &cfg)?;
 
@@ -172,7 +173,7 @@ impl TunSession {
     /// `buf` (uncompressed header: Address + Control + 2-byte
     /// Protocol + payload). `buf` must be at least `4 + MTU`.
     pub async fn read_frame(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut scratch = [0u8; DEFAULT_MTU as usize + 64];
+        let mut scratch = [0u8; MAX_TUN_MTU as usize + 64];
         let n = self
             .async_fd
             .async_io(Interest::READABLE, |fd| read_fd(fd.as_fd(), &mut scratch))

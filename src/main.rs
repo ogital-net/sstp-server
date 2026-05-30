@@ -292,6 +292,7 @@ fn run(config: &Config) -> ExitCode {
         let local_ip = config.local_ip;
         let auth_method = config.auth_method;
         let data_path = effective_data_path;
+        let mss_clamp = config.mss_clamp;
         let worker_registry = registry.clone();
         let worker_shutdown = shutdown_tx.clone();
         let worker_tls = tls_ctx.clone();
@@ -313,6 +314,7 @@ fn run(config: &Config) -> ExitCode {
                     local_ip,
                     auth_method,
                     data_path,
+                    mss_clamp,
                 );
             })
             .expect("spawn I/O worker");
@@ -524,6 +526,7 @@ fn io_worker_main(
     local_ip: std::net::Ipv4Addr,
     auth_method: crate::ppp::AuthMethod,
     data_path: cli::DataPathMode,
+    mss_clamp: bool,
 ) {
     set_io_thread_realtime(id);
     let rt: Runtime = Builder::new_current_thread()
@@ -553,6 +556,7 @@ fn io_worker_main(
             local_ip,
             auth_method,
             data_path,
+            mss_clamp,
         )
         .await;
     });
@@ -571,6 +575,7 @@ async fn accept_loop(
     local_ip: std::net::Ipv4Addr,
     auth_method: crate::ppp::AuthMethod,
     data_path: cli::DataPathMode,
+    mss_clamp: bool,
 ) {
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
     loop {
@@ -600,7 +605,7 @@ async fn accept_loop(
                     let session_auth = auth_bridge.clone();
                     let session_acct = acct_bridge.clone();
                     let handle = tokio::task::spawn_local(session::run(
-                        stream, peer, id, registry, control_rx, drain_rx, session_tls, session_auth, session_acct, local_ip, auth_method, data_path,
+                        stream, peer, id, registry, control_rx, drain_rx, session_tls, session_auth, session_acct, local_ip, auth_method, data_path, mss_clamp,
                     ));
                     tasks.push(handle);
                 }

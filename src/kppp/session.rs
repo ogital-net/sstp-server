@@ -45,6 +45,10 @@ use super::unit::{Unit, UnitError};
 /// transport ceiling.
 const DEFAULT_MTU: u32 = 1500;
 
+fn effective_mtu(requested: Option<u32>) -> u32 {
+    requested.map_or(DEFAULT_MTU, |m| m.clamp(576, DEFAULT_MTU))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BringUpError {
     #[error("opening /dev/ppp: {0}")]
@@ -103,23 +107,25 @@ impl KpppSession {
         tcp_fd: BorrowedFd<'_>,
         local: Ipv4Addr,
         peer: Ipv4Addr,
+        mtu: Option<u32>,
     ) -> Result<Self, BringUpError> {
+        let mtu = effective_mtu(mtu);
         match mode {
             DataPathMode::Tun => {
-                let tun = TunSession::bring_up(local, peer)?;
+                let tun = TunSession::bring_up(local, peer, mtu)?;
                 Ok(Self {
                     inner: Backend::Tun(tun),
                 })
             }
-            DataPathMode::Kernel => Self::bring_up_ppp(tcp_fd, local, peer),
-            DataPathMode::Auto => match Self::bring_up_ppp(tcp_fd, local, peer) {
+            DataPathMode::Kernel => Self::bring_up_ppp(tcp_fd, local, peer, mtu),
+            DataPathMode::Auto => match Self::bring_up_ppp(tcp_fd, local, peer, mtu) {
                 Ok(s) => Ok(s),
                 Err(e) => {
                     warn!(
                         error = %e,
                         "kernel data path unavailable; falling back to TUN"
                     );
-                    let tun = TunSession::bring_up(local, peer)?;
+                    let tun = TunSession::bring_up(local, peer, mtu)?;
                     Ok(Self {
                         inner: Backend::Tun(tun),
                     })
@@ -132,6 +138,7 @@ impl KpppSession {
         tcp_fd: BorrowedFd<'_>,
         local: Ipv4Addr,
         peer: Ipv4Addr,
+        mtu: u32,
     ) -> Result<Self, BringUpError> {
         let unit = Unit::new()?;
         // Skip PPPIOCSMRU: in mainline kernels (≥6.x) the unit-fd
@@ -151,7 +158,7 @@ impl KpppSession {
             local,
             peer,
             netmask: None,
-            mtu: Some(DEFAULT_MTU),
+            mtu: Some(mtu),
         };
         nl.bring_up(ifindex, &cfg)?;
 
@@ -159,7 +166,7 @@ impl KpppSession {
         // PPP unit numbers are small non-negative; cast is lossless.
         #[allow(clippy::cast_possible_wrap)]
         let ppp_unit = unit.index() as i32;
-        let kmod = KmodSession::attach(tcp_fd, ppp_unit, DEFAULT_MTU)?;
+        let kmod = KmodSession::attach(tcp_fd, ppp_unit, mtu)?;
 
         Ok(Self {
             inner: Backend::Ppp(PppBackend {

@@ -516,8 +516,13 @@ async fn run_mschapv2(
 }
 
 fn project_addrs(accept: &AuthAccept) -> AssignedAddrs {
+    let mtu = accept
+        .framed_mtu
+        .and_then(|m| u16::try_from(m).ok())
+        .map(|m| m.clamp(576, 1500));
     AssignedAddrs {
         ip: accept.framed_ip.octets(),
+        mtu,
         dns1: accept.primary_dns.map(|a| a.octets()),
         dns2: accept.secondary_dns.map(|a| a.octets()),
         nbns1: accept.primary_nbns.map(|a| a.octets()),
