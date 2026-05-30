@@ -107,11 +107,13 @@ struct Rtattr {
 }
 
 #[inline]
+#[allow(dead_code)] // FUTURE: full nlmsg alignment helpers consumed once `Framed-Route` (RTM_NEWROUTE) lands.
 const fn nlmsg_align(len: usize) -> usize {
     (len + 3) & !3
 }
 
 #[inline]
+#[allow(dead_code)] // FUTURE: rta alignment helper for `Framed-Route` and other multi-attribute messages.
 const fn rta_align(len: usize) -> usize {
     (len + 3) & !3
 }
@@ -143,6 +145,7 @@ pub enum NetlinkError {
     #[error("{op}: unexpected reply type {got}")]
     Unexpected { op: &'static str, got: u16 },
     #[error("setting MTU via SIOCSIFMTU on {ifname}: {source}")]
+    #[allow(dead_code)] // FUTURE: paired with `set_mtu_ioctl` fallback above.
     SetMtu {
         ifname: String,
         #[source]
@@ -325,6 +328,7 @@ impl RtNetlink {
 /// both this and the netlink path because for a single attribute the
 /// ioctl is one syscall vs the netlink dance, and accel-ppp / pppd
 /// both reach for `SIOCSIFMTU` here.
+#[allow(dead_code)] // FUTURE: SIOCSIFMTU fallback consumed when the netlink IFLA_MTU path is unavailable.
 pub fn set_mtu_ioctl(ifname: &str, mtu: u32) -> Result<(), NetlinkError> {
     // SAFETY: standard socket(2) FFI.
     let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };

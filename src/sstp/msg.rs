@@ -76,7 +76,7 @@ pub enum ControlMessage<'a> {
     /// §2.2.10 / §2.2.12 — server-originated messages; the server
     /// never parses these. Carried opaquely so a client-mode test
     /// harness can hook in later.
-    Other(ControlPacket<'a>),
+    Other(#[allow(dead_code)] ControlPacket<'a>),
 }
 
 /// Parse a [`ControlPacket`] into a typed [`ControlMessage`].
@@ -282,6 +282,7 @@ fn write_status_info_attr(out: &mut [u8], attrib_id: u8, status: StatusCode) {
 /// Compound MAC zeroed, ready for HMAC computation by the caller
 /// (§3.2.5.2.3). After computing the MAC, write it back with
 /// [`install_compound_mac`].
+#[allow(dead_code)] // FUTURE: server-side `Call-Connected` builder; v0.1 only verifies the client-side packet.
 pub fn encode_call_connected_pre_mac(
     out: &mut [u8; CALL_CONNECTED_LEN],
     hash_protocol: u8,
@@ -324,6 +325,7 @@ pub fn encode_call_connected_pre_mac(
 /// Place a Compound MAC into a previously-encoded Call Connected
 /// buffer. `mac` must be 20 bytes (SHA1) or 32 bytes (SHA256); the
 /// trailing zero pad is preserved.
+#[allow(dead_code)] // FUTURE: paired with `encode_call_connected_pre_mac` once the server originates the binding handshake.
 pub fn install_compound_mac(buf: &mut [u8; CALL_CONNECTED_LEN], mac: &[u8]) {
     debug_assert!(mac.len() == 20 || mac.len() == 32);
     let mac_field = &mut buf[80..112];

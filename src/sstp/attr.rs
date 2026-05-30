@@ -11,6 +11,12 @@
 //! ```
 //! `Length` is 12 bits and includes the 4-byte attribute header.
 
+// Full SSTP attribute set. `StatusInfo` and several `AttributeId`
+// variants / accessor methods are decoded but not yet acted on by
+// the state machine (they fire on abort paths the server doesn't
+// originate today). Kept ready for spec-complete client interop.
+#![allow(dead_code)]
+
 use super::frame::ParseError;
 
 pub const ATTR_HEADER_LEN: usize = 4;

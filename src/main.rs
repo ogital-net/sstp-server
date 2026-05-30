@@ -115,9 +115,8 @@ fn run(config: &Config) -> ExitCode {
     // Restrict TLS 1.2 to AEAD ciphers only when the operator forced
     // the kernel data path. In that mode CBC-SHA suites would fail at
     // attach time anyway (kTLS only accelerates AEAD), so it's better
-    // to reject the handshake up-front. Auto / tun / userspace stay
-    // permissive — non-AEAD sessions transparently fall back to
-    // userspace TLS.
+    // to reject the handshake up-front. Auto / tun stay permissive —
+    // non-AEAD sessions transparently fall back to TUN.
     let aead_only = matches!(config.data_path, cli::DataPathMode::Kernel);
     let tls_ctx = match SslContext::server_from_pem(&config.cert, &config.key, aead_only) {
         Ok(c) => c,
@@ -358,14 +357,15 @@ fn resolve_drop_identity(
 
 /// Probe `/dev/sstp` once at boot and reconcile with the operator's
 /// `--data-path` choice. Returns the effective mode the per-session
-/// bring-up will pass to [`kppp::datapath::DataPath::open`].
+/// bring-up will pass to [`kppp::session::KpppSession::bring_up`].
 ///
-/// `Auto` collapses to either `Auto` (kmod present) or `Userspace`
-/// (kmod absent) so each session attach doesn't have to re-probe and
-/// re-log. `Kernel` and `Userspace` pass through; explicit `Kernel`
-/// with no kmod is logged as an error but not aborted here — the
-/// per-session attach will fail loudly per connection, which is the
-/// right granularity to alert on.
+/// `Auto` stays `Auto` when the kmod is present (the per-session
+/// attach decides per-connection based on kTLS eligibility), and
+/// collapses to `Tun` when the kmod is absent. `Kernel` and `Tun`
+/// pass through unchanged; explicit `Kernel` with no kmod is logged
+/// as an error but not aborted here — the per-session attach will
+/// fail loudly per connection, which is the right granularity to
+/// alert on.
 fn resolve_data_path_mode(requested: cli::DataPathMode) -> cli::DataPathMode {
     use cli::DataPathMode;
     use kppp::sstp_kmod::{self, KmodError};
@@ -374,10 +374,6 @@ fn resolve_data_path_mode(requested: cli::DataPathMode) -> cli::DataPathMode {
         (DataPathMode::Tun, _) => {
             info!("data-path: tun (operator-selected; /dev/net/tun)");
             DataPathMode::Tun
-        }
-        (DataPathMode::Userspace, _) => {
-            info!("data-path: userspace (operator-selected)");
-            DataPathMode::Userspace
         }
         (DataPathMode::Kernel, Ok(())) => {
             info!("data-path: kernel (sstp kmod present at /dev/sstp)");

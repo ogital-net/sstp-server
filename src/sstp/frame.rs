@@ -102,6 +102,7 @@ impl<'a> Packet<'a> {
 #[derive(Debug)]
 pub struct ControlPacket<'a> {
     pub msg_type: MessageType,
+    #[allow(dead_code)] // Used in tests; downstream consumers iterate `attrs` directly.
     pub num_attrs: u16,
     pub attrs: &'a [u8],
 }

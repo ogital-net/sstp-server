@@ -41,9 +41,6 @@
 //! and netlink-driven address/route push land with M6 when sessions
 //! actually need them.
 
-#![allow(dead_code)]
-
-pub mod datapath;
 pub mod ioctl;
 pub mod netlink;
 pub mod session;
@@ -61,6 +58,7 @@ pub mod unit;
 pub struct SessionIpConfig {
     pub local: std::net::Ipv4Addr,
     pub peer: std::net::Ipv4Addr,
+    #[allow(dead_code)] // FUTURE: applied when RADIUS Framed-IP-Netmask is honoured (today the /32 P2P pair from netlink suffices).
     pub netmask: Option<std::net::Ipv4Addr>,
     pub mtu: Option<u32>,
 }

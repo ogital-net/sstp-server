@@ -16,6 +16,13 @@
 //! synchronous `Unit` interface is what M5's tests and the netlink
 //! bring-up path need.
 
+// Synchronous `Unit` accessors (`as_fd`, `set_mru`, `set_flags`,
+// `close`, `Configure` channel variant) are scaffolding for the
+// kernel data-path migration described in CLAUDE.md M5. They have
+// no caller in the binary today (the kmod path drives the unit fd
+// directly) but are kept available for that migration.
+#![allow(dead_code)]
+
 use std::ffi::CStr;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};

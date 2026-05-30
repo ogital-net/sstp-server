@@ -15,21 +15,18 @@
 //! EAP plumbing exists in [`super::auth`] but is not yet wired through
 //! the orchestrator; LCP advertises `Auth-Protocol = PAP` only.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::auth::pap;
-use super::frame::{
-    ADDRESS_ALL_STATIONS, CONTROL_UI, FrameError, PppFrame, ProtocolId, decode_frame, encode_frame,
-};
+use super::frame::{ADDRESS_ALL_STATIONS, CONTROL_UI, ProtocolId, decode_frame, encode_frame};
 use super::fsm::{
-    DEFAULT_RESTART, Event as FsmEvent, Fsm, Notify as FsmNotify, RestartTimer, Send as FsmSend,
-    State as FsmState, StepOut as FsmStep,
+    DEFAULT_RESTART, Event as FsmEvent, Fsm, RestartTimer, Send as FsmSend, StepOut as FsmStep,
 };
 use super::ipcp::{
     IPV4_OPTION_TOTAL_LEN, IpcpCode, IpcpOptionId, read_ipv4_value, write_ipv4_option,
 };
 use super::lcp::{
-    self, ConfigOption, ConfigOptionIter, LCP_HEADER_LEN, LCP_OPT_HEADER_LEN, LcpCode, LcpOptionId,
+    ConfigOption, ConfigOptionIter, LCP_HEADER_LEN, LCP_OPT_HEADER_LEN, LcpCode, LcpOptionId,
     LcpPacket, auth_protocol_pap, decode_lcp_packet, write_lcp_header, write_option,
 };
 

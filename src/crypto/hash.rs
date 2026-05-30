@@ -9,6 +9,12 @@
 //! SHA-1 / SHA-256 remain on `aws-lc-sys` (stack-allocated, no EVP
 //! overhead, FIPS-validatable).
 
+// Hash primitives kept ready for future auth methods (MS-CHAPv2
+// NT-hash chain on MD5/SHA-1, Crypto Binding HLAK on SHA-256). Md5
+// is consumed by `auth::accounting` via `Md5::digest`; the rest
+// becomes live as those methods land.
+#![allow(dead_code)]
+
 use std::mem::MaybeUninit;
 
 use aws_lc_sys as aws;

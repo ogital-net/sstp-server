@@ -71,6 +71,7 @@ impl ProtocolId {
     /// Protocol Phase"). PPP forwards these only after LCP Opened and
     /// authentication completed.
     #[must_use]
+    #[allow(dead_code)] // FUTURE: spec-defined predicate; live once IPv6CP / NP-mode filtering lands.
     pub const fn is_network_layer(self) -> bool {
         matches!(self, Self::Ip | Self::Ipv6)
     }
@@ -161,6 +162,7 @@ pub fn encode_frame(out: &mut [u8], protocol: u16, info: &[u8]) -> usize {
 /// 0x00–0xFF are eligible).
 ///
 /// Caller must only use this once LCP has negotiated both options.
+#[allow(dead_code)] // FUTURE: caller selects compressed encoding once Address/Control/Protocol-Field-Compression LCP options are negotiated.
 pub fn encode_frame_compressed(out: &mut [u8], protocol: u16, info: &[u8]) -> usize {
     if protocol <= 0xFF {
         let need = 1 + info.len();

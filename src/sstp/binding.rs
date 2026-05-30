@@ -8,8 +8,8 @@
 
 use super::attr::{CERT_HASH_PROTOCOL_SHA1, CERT_HASH_PROTOCOL_SHA256, CryptoBinding};
 use crate::crypto::{
-    HmacSha1, HmacSha256, const_time_eq,
-    hmac::{prf_plus_sha1_cmk, prf_plus_sha256_cmk},
+    const_time_eq,
+    hmac::{HmacSha1, HmacSha256, prf_plus_sha1_cmk, prf_plus_sha256_cmk},
 };
 
 /// CMK seed string ([MS-SSTP] §3.2.5.2.2 / §3.2.5.2.4).
@@ -22,6 +22,7 @@ pub const CMK_SEED: &[u8; 29] = b"SSTP inner method derived CMK";
 pub enum BindingOutcome {
     Ok,
     /// Attribute missing / wrong length / Status-Info with status != `NO_ERROR`.
+    #[allow(dead_code)] // FUTURE: produced once Call-Connected attribute validation rejects malformed inputs (today the verify path only flags MAC mismatch as `ValueNotSupported`).
     AttribNotSupportedInMsg,
     /// Nonce mismatch, cert hash mismatch, unsupported hash algorithm,
     /// or invalid Compound MAC.

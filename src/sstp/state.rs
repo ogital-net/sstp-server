@@ -12,6 +12,15 @@
 //! * Hello timer — §3.1.2.3. Negotiation timer — §3.3.2.1. Abort/Disc
 //!   timers — §3.1.2.1, §3.1.2.2.
 
+// Several FSM hooks (`on_inner_auth_completed`, `set_server_cert_hash`,
+// `on_hello_timeout_no_response`, `state` accessor, `Abrupt` reason)
+// are spec-driven entry points that no caller exercises today —
+// inner-method auth completion belongs to non-PAP futures, the cert
+// hash is plumbed at construction, and abrupt teardown surfaces only
+// once the data path runs over the kmod. Kept available so wiring
+// them up later is a single grep.
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use super::attr::{AttributeId, StatusCode};
@@ -793,8 +802,7 @@ mod tests {
 
     #[test]
     fn call_connected_with_valid_binding_advances_to_connected() {
-        use crate::crypto::HmacSha256;
-        use crate::crypto::hmac::prf_plus_sha256_cmk;
+        use crate::crypto::hmac::{HmacSha256, prf_plus_sha256_cmk};
         use crate::sstp::binding::CMK_SEED;
         use crate::sstp::msg::{encode_call_connected_pre_mac, install_compound_mac};
 

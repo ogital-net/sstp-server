@@ -21,6 +21,12 @@
 //! require Message-Authenticator (RFC 5080 §2.2.2 / `BlastRADIUS`
 //! mitigation).
 
+// M4 (partial): parser + responder are landed and unit-tested; the
+// MPSC handoff to the session registry is not yet wired, so the
+// public surface (`CoaListener`, `Handler`, `PeerSecrets`) has no
+// caller in the binary build.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;

@@ -17,7 +17,6 @@
 // `peer` surface get their consumers in M7 (control socket) and M4
 // (CoA → session lookup). Keep them visible now so the scaffolding
 // shape is committed.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -56,6 +55,7 @@ impl SessionId {
     }
 
     #[must_use]
+    #[allow(dead_code)] // Used in tests; exposed for future control-socket numeric formatting.
     pub fn as_u64(self) -> u64 {
         self.0
     }
@@ -84,6 +84,7 @@ pub enum DisconnectReason {
     /// Operator-initiated (`disable session` on the control socket).
     AdminRequested,
     /// RADIUS CoA Disconnect-Request for this session.
+    #[allow(dead_code)] // FUTURE: emitted by the CoA receiver once its MPSC handoff to the registry lands.
     RadiusDisconnect,
     /// Process-wide drain in progress (SIGTERM / `shutdown` command).
     ServerShutdown,
@@ -375,13 +376,6 @@ async fn drive_sstp(
     // kernel's `SSTP_CONTROL_MAX` so the ioctl never returns
     // `EMSGSIZE`.
     let mut ctrl_buf = vec![0u8; SSTP_CONTROL_MAX];
-    // Mainline `/dev/ppp` unit fds return `Ok(0)` from `read(2)` —
-    // the unit fd does not deliver TX frames in userspace (that's a
-    // channel-fd path, which requires our SSTP kmod). Until the
-    // kmod is wired in, the userspace data path is RX-only; flip
-    // this flag after the first spurious EOF and stop polling the
-    // unit fd to keep the control plane alive.
-    let mut kppp_read_disabled = false;
     let auth = AuthCtx {
         peer,
         bridge: &auth_bridge,
@@ -448,15 +442,13 @@ async fn drive_sstp(
                 Some((_, sleep)) => sleep.as_mut().poll(cx),
                 None => Poll::Pending,
             });
-            // Read one PPP frame from the kernel `pppN` unit fd when
-            // present *and* we're on the userspace data path. In
-            // kernel mode the SSTP kmod owns the byte path and there
-            // is nothing for us to copy.
+            // Read one IP packet from the TUN device when the
+            // session is on the TUN backend. In kernel-kmod mode the
+            // sstp kmod owns the byte path and there is nothing for
+            // us to copy.
             let kppp_read_fut = async {
                 match kppp.as_ref() {
-                    Some(k) if !k.is_kernel() && !kppp_read_disabled => {
-                        k.read_frame(&mut kppp_buf).await
-                    }
+                    Some(k) if k.is_tun() => k.read_frame(&mut kppp_buf).await,
                     _ => std::future::pending::<std::io::Result<usize>>().await,
                 }
             };
@@ -631,16 +623,11 @@ async fn drive_sstp(
                 warn!(%id, error = %e, "kernel PPP unit read failed");
             }
             DriverEvent::KpppRead(Ok(0)) => {
-                // Mainline ppp_generic returns EOF from a unit-fd
-                // read because TX frames flow through channels, not
-                // the unit. TUN by contrast returns EOF only on
-                // genuine close. Branch on backend.
-                if kppp.as_ref().is_some_and(KpppSession::is_tun) {
-                    warn!(%id, "tun fd returned EOF; tearing down session");
-                    return;
-                }
-                warn!(%id, "ppp unit fd returned EOF; userspace RX path disabled (no kernel channel; needs sstp kmod + kTLS)");
-                kppp_read_disabled = true;
+                // Only the TUN backend feeds this branch (kernel
+                // mode never resolves `read_frame`). EOF means the
+                // tun fd was closed out from under us — tear down.
+                warn!(%id, "tun fd returned EOF; tearing down session");
+                return;
             }
             DriverEvent::KpppRead(Ok(n)) => {
                 if let Err(e) = write_ppp_as_sstp_data(&mut tx, &kppp_buf[..n]).await {

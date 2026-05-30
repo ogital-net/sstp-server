@@ -14,6 +14,11 @@
 //! bridge (`auth/` module, M4); this layer hands the raw fields off
 //! and reassembles RADIUS replies into PPP packets.
 
+// PAP is in active use; CHAP / MS-CHAPv2 / EAP encoders/decoders are
+// scaffolding for future milestones (M6+ once non-PAP RADIUS
+// round-trips land) and have no caller in the binary build today.
+#![allow(dead_code)]
+
 use thiserror::Error;
 
 // --- PAP ([RFC 1334] §2.1) -------------------------------------------------

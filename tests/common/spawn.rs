@@ -222,8 +222,23 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // SIGKILL is fine — this is a test harness and the binary
-            // has no on-disk state that needs cleanup.
+            // SIGTERM + bounded wait so the binary's `atexit` handlers
+            // run — notably LLVM's coverage flush, which writes the
+            // .profraw under `cargo llvm-cov`. SIGKILL would skip it
+            // and the spawned-server code paths would show as 0%.
+            // SAFETY: `kill(2)` with a valid pid and signal number.
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) if Instant::now() >= deadline => break,
+                    Ok(None) => thread::sleep(Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
         }

@@ -12,7 +12,6 @@
 //! originator with `(peer, identifier)` correlation and RFC 5080
 //! retry semantics.
 
-#![allow(dead_code)]
 
 pub mod accounting;
 pub mod bridge;
@@ -29,6 +28,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 /// bring-up path to bind a kernel PPP unit, advertise IPCP options
 /// to the peer, and seed the SSTP Crypto Binding HLAK.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // FUTURE: framed_netmask/framed_mtu/MPPE keys consumed once non-PAP auth + Crypto Binding HLAK are wired.
 pub struct AuthAccept {
     /// `Framed-IP-Address` (RFC 2865 §5.8) — required.
     pub framed_ip: Ipv4Addr,
@@ -78,6 +78,7 @@ pub enum AuthError {
 
 /// Configuration for a single RADIUS auth server.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // FUTURE: per-server `ServerConfig` consumed once the multi-server bridge is configured beyond a single `--radius` flag.
 pub struct ServerConfig {
     pub addr: SocketAddr,
     /// Shared secret; held in a `Vec<u8>` rather than a `String` so it

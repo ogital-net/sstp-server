@@ -4,6 +4,13 @@
 //! the context lives on the stack without a heap round-trip.  The one-shot
 //! path calls the single `HMAC()` FFI function directly.
 
+// Each `impl_hmac!` instance generates the full `new` / `update` /
+// `finish` / `oneshot` quartet; concrete callers use either the
+// streaming triplet (HmacSha384, ktls KDF) or the one-shot
+// (HmacSha1 / HmacSha256, Crypto Binding) but not both. The unused
+// arm of each instance is dead.
+#![allow(dead_code)]
+
 use std::mem::MaybeUninit;
 
 use aws_lc_sys as aws;

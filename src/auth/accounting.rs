@@ -15,6 +15,12 @@
 //! at a small number of attempts — and is independent per
 //! `(server_addr, identifier)` correlation slot.
 
+// M4 (partial): the transport, packet build/verify helpers, and
+// per-session state are landed; wiring from the session task
+// (interim updates, byte-counter sampling) and the retry/peer state
+// machine are not yet enabled, so most items here have no caller.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -474,7 +480,7 @@ mod tests {
             to_hash.extend_from_slice(&reply[..4]);
             to_hash.extend_from_slice(&req_auth);
             to_hash.extend_from_slice(&secret_srv);
-            let digest = crate::crypto::Md5::digest(&to_hash);
+            let digest = crate::crypto::hash::Md5::digest(&to_hash);
             reply[4..20].copy_from_slice(&digest);
             server.send_to(&reply, src).await.expect("send");
         });

@@ -74,6 +74,7 @@ pub enum Event {
     /// Lower layer reports it is up.
     Up,
     /// Lower layer reports it is down.
+    #[allow(dead_code)] // FUTURE: emitted when SSTP signals lower-layer-down (today the session task tears down end-to-end).
     Down,
     /// Administrative open.
     Open,
@@ -101,6 +102,7 @@ pub enum Event {
     /// rejected code is not catastrophic to the FSM.
     RcvCodeRejPermitted,
     /// Receive a Code-Reject (or Protocol-Reject) we cannot tolerate.
+    #[allow(dead_code)] // FUTURE: emitted by the driver once Code-Reject classification (RFC 1661 §5.5) lands.
     RcvCodeRejCatastrophic,
     /// Receive an unknown packet code (drives a Code-Reject).
     RcvUnknownCode,
@@ -233,6 +235,7 @@ impl Fsm {
     }
 
     #[must_use]
+    #[allow(dead_code)] // FUTURE: state inspection for control-socket `show sess <id>` once exposed.
     pub fn state(&self) -> State {
         self.state
     }
@@ -240,6 +243,7 @@ impl Fsm {
     /// Identifier to stamp into the next Configure-Request /
     /// Terminate-Request the driver emits in response to [`Send`].
     #[must_use]
+    #[allow(dead_code)] // FUTURE: identifier inspection for the same control-socket surface.
     pub fn current_identifier(&self) -> u8 {
         self.identifier
     }

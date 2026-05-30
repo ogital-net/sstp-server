@@ -11,6 +11,11 @@
 //!   (Access-Challenge → forward EAP-Request to PPP → receive
 //!   EAP-Response → Access-Request with echoed `State` → repeat).
 
+// PAP path is the only consumer today. MS-CHAPv2 (`authenticate_mschapv2`)
+// and the EAP loop (`EapSession` / `EapStep`) are scaffolding for
+// future PPP auth phases (M6+).
+#![allow(dead_code)]
+
 use std::net::SocketAddr;
 
 use radius_tokio::{

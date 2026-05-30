@@ -44,6 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi"
 vergen-git2 = { version = "9", default-features = false }
 
 [dev-dependencies]
+libc = "0.2"
 tokio = { version = "1", features = ["process", "test-util"] }
 # Pull in the server-side surface for the E2E integration test's dummy
 # RADIUS authenticator. Feature unification with the [dependencies] entry

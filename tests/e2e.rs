@@ -420,10 +420,7 @@ async fn sstpc_pap_login() {
     // Traffic observation: push an ICMP echo from the client and
     // measure the server-side interface counters. Both kernel-mode
     // (sstp kmod + kTLS, ifname=pppN) and TUN-mode (ifname=tunN)
-    // are real data paths and should bump `server rx_bytes`. The
-    // PPP-userspace path (only reachable via explicit
-    // `--data-path userspace`) is a no-op on mainline kernels and
-    // is intentionally not exercised here.
+    // are real data paths and should bump `server rx_bytes`.
     let kernel_path_active = ifname.starts_with("ppp") && kmod_attach_succeeded;
     let tun_path_active = ifname.starts_with("tun");
     match traffic_result {
@@ -436,10 +433,9 @@ async fn sstpc_pap_login() {
         }) => {
             let path_label = if kernel_path_active {
                 "kernel (sstp kmod + kTLS)"
-            } else if tun_path_active {
-                "TUN"
             } else {
-                "PPP-userspace (informational)"
+                assert!(tun_path_active, "unexpected ifname `{ifname}`");
+                "TUN"
             };
             eprintln!(
                 "traffic observation ({path_label}):\n  \

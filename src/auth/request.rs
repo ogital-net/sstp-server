@@ -11,6 +11,11 @@
 //! closure is invoked with a fresh `PacketBuffer` and the just-drawn
 //! Request Authenticator.
 
+// PAP request builder is the only consumer today; `apply_mschapv2`
+// and `apply_eap` (and their `MAX_ATTR_VALUE` cap) are scaffolding
+// for future PPP auth phases (M6+).
+#![allow(dead_code)]
+
 use radius_tokio::{
     CodecError, PacketBuffer,
     dict::{

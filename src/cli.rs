@@ -14,7 +14,6 @@
 // Most of these fields and constants are consumed in later milestones
 // (TLS context, RADIUS bridge, control socket). Allow dead code module-wide
 // until M1+ wires them up.
-#![allow(dead_code)]
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
@@ -26,7 +25,9 @@ use thiserror::Error;
 use tracing::level_filters::LevelFilter;
 
 pub const SSTP_RADIUS_SECRET: &str = "SSTP_RADIUS_SECRET";
+#[allow(dead_code)] // FUTURE: separate accounting secret consumed once Acct-Start/Update/Stop is wired (M4 finish).
 pub const SSTP_RADIUS_ACCT_SECRET: &str = "SSTP_RADIUS_ACCT_SECRET";
+#[allow(dead_code)] // FUTURE: TLS key passphrase consumed once encrypted-PEM key loading lands.
 pub const SSTP_TLS_KEY_PASSWORD: &str = "SSTP_TLS_KEY_PASSWORD";
 
 const DEFAULT_LISTEN: &str = "[::]:443";
@@ -52,7 +53,7 @@ OPTIONS:
     -n, --no-control-socket      Disable the control socket
     -F, --log-format <fmt>       text | json | auto (default: auto)
     -L, --log-file <path>        Log to file instead of stderr
-    -D, --data-path <mode>       auto | kernel | tun | userspace (default: auto)
+    -D, --data-path <mode>       auto | kernel | tun (default: auto)
     -i, --local-ip <ipv4>        Server-side IPv4 for every pppN interface (required)
     -u, --user <name>            Drop privileges to this user after binding sockets (root only)
     -g, --group <name>           Group to drop to (defaults to the user's primary GID)
@@ -102,17 +103,13 @@ pub enum LogFormat {
 
 /// Operator-selectable data-path mode. `Auto` tries the kernel path
 /// first and falls back to a TUN device with a warning log if the
-/// `sstp` kmod isn't present or the attach fails. `Userspace` keeps
-/// the legacy `/dev/ppp` unit-fd copier — useful for debugging but
-/// **does not move IP traffic on mainline kernels** (the unit fd is
-/// TX-only and has no attached channel).
+/// `sstp` kmod isn't present or the attach fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DataPathMode {
     #[default]
     Auto,
     Kernel,
     Tun,
-    Userspace,
 }
 
 /// Parsed configuration. `Result::Ok` here means the daemon should start;
@@ -123,6 +120,7 @@ pub struct Config {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub radius: Vec<SocketAddr>,
+    #[allow(dead_code)] // FUTURE: accounting servers consumed once Acct-Start/Update/Stop is wired (M4 finish).
     pub acct: Vec<SocketAddr>,
     pub io_threads: NonZeroUsize,
     pub auth_threads: NonZeroUsize,
@@ -290,12 +288,11 @@ where
                     "auto" => DataPathMode::Auto,
                     "kernel" => DataPathMode::Kernel,
                     "tun" => DataPathMode::Tun,
-                    "userspace" => DataPathMode::Userspace,
                     other => {
                         return Err(ParseError::invalid(
                             "data-path",
                             other,
-                            BadEnumValue("expected one of: auto, kernel, tun, userspace"),
+                            BadEnumValue("expected one of: auto, kernel, tun"),
                         ));
                     }
                 };

@@ -1,24 +1,30 @@
-//! Per-SSTP-session kernel-PPP bring-up and userspace data path.
+//! Per-SSTP-session data-path bring-up.
 //!
-//! M6g: once IPCP converges, the session task allocates a fresh
-//! `/dev/ppp` unit ([`Unit`]), pushes the negotiated MRU and the
-//! P2P address pair via netlink, and then drives a bidirectional
-//! byte path between the TLS socket (in the session task) and the
-//! kernel PPP unit fd:
+//! Once IPCP converges, the session task allocates a per-session
+//! data-path backend:
 //!
-//! - **TX (TLS → kernel):** each PPP frame demuxed out of an SSTP
-//!   `Data` packet whose Protocol is IP is written to the unit fd.
-//! - **RX (kernel → TLS):** PPP frames emitted by the kernel (IPv4
-//!   traffic egressing the netdev) are read from the unit fd, wrapped
-//!   in an SSTP `Data` packet, and written back through TLS.
+//! - **Kernel PPP** ([`Backend::Ppp`]) — open `/dev/ppp`, allocate a
+//!   fresh unit with `PPPIOCNEWUNIT`, push the negotiated MRU and
+//!   the P2P address pair via netlink, then attach the kTLS-equipped
+//!   TCP fd to the in-tree sstp kmod via `SSTP_IOC_ATTACH`. The
+//!   kmod owns the steady-state byte path (kTLS decrypt → SSTP
+//!   demux → `ppp_input`); userspace only sees control packets via
+//!   the kmod event channel.
+//! - **TUN** ([`Backend::Tun`]) — `/dev/net/tun`, used when the kmod
+//!   is not loaded or kTLS is not negotiable. Per-packet userspace
+//!   round-trip; bypass `ppp_generic` entirely.
 //!
-//! Dropping a [`KpppSession`] closes the unit fd, which causes the
-//! kernel to remove the `pppN` netdev — that's the only teardown
-//! required for v0.1.
+//! The legacy `/dev/ppp` userspace-copier path was removed: the
+//! mainline kernel does not deliver TX frames through a unit fd
+//! when no channel is attached, so without the sstp kmod the
+//! unit-fd path is a no-op. TUN is the supported kmod-free option.
+//!
+//! Dropping a [`KpppSession`] tears down the backend (closes
+//! `/dev/ppp` to remove `pppN`, or closes the tun fd).
 
 use std::io;
 use std::net::Ipv4Addr;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{BorrowedFd, OwnedFd};
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
@@ -28,9 +34,8 @@ use tracing::warn;
 use crate::cli::DataPathMode;
 
 use super::SessionIpConfig;
-use super::datapath::{DataPath, DataPathError};
 use super::netlink::{NetlinkError, RtNetlink};
-use super::sstp_kmod::{EventRaw, KmodError};
+use super::sstp_kmod::{self, EventRaw, KmodError, KmodSession};
 use super::tun::{TunError, TunSession};
 use super::unit::{Unit, UnitError};
 
@@ -46,14 +51,10 @@ pub enum BringUpError {
     Unit(#[from] UnitError),
     #[error("netlink: {0}")]
     Netlink(#[from] NetlinkError),
-    #[error("data path: {0}")]
-    DataPath(#[from] DataPathError),
+    #[error("kmod: {0}")]
+    Kmod(#[from] KmodError),
     #[error("tun: {0}")]
     Tun(#[from] TunError),
-    #[error("duplicating unit fd for async I/O: {0}")]
-    Dup(#[source] io::Error),
-    #[error("registering unit fd with tokio: {0}")]
-    Register(#[source] io::Error),
     #[error("resolving ifindex for {ifname}: {source}")]
     ResolveIfindex {
         ifname: String,
@@ -64,16 +65,8 @@ pub enum BringUpError {
 
 /// Live data-path session bound to a single SSTP session.
 ///
-/// Dispatches between two backends:
-///
-/// - **PPP** — a `/dev/ppp` unit fd plus an attached [`DataPath`]
-///   (kernel kmod or userspace copy). Used when the operator asks
-///   for `--data-path kernel` or `--data-path userspace`, and the
-///   first choice tried under `--data-path auto`.
-/// - **TUN** — a plain `/dev/net/tun` netdev. Used under
-///   `--data-path tun` and as the fallback under `--data-path auto`
-///   when the kmod attach fails. This is the path that actually
-///   moves IP traffic on mainline kernels without the sstp kmod.
+/// Dispatches between the kernel PPP path (sstp kmod) and the TUN
+/// fallback. Selection happens in [`KpppSession::bring_up`].
 #[derive(Debug)]
 pub struct KpppSession {
     inner: Backend,
@@ -93,25 +86,18 @@ struct PppBackend {
     /// [`Unit::index`] (the PPP unit number) — netlink wants the
     /// `IFLA_INDEX`, not the unit number.
     ifindex: u32,
-    /// Per-session data-path attachment. `Kernel` means the SSTP
-    /// kmod owns the steady-state byte path; `Userspace` means
-    /// frames flow through this process via [`Self::async_fd`].
-    path: DataPath,
-    /// Userspace mode only: async-wrapped duplicate of the unit fd
-    /// for the session task's `select!`. `None` in kernel mode.
-    async_fd: Option<AsyncFd<OwnedFd>>,
+    /// Per-session sstp-kmod attach. Drop detaches.
+    kmod: KmodSession,
 }
 
 impl KpppSession {
-    /// Resolve the operator-selected `mode` to a concrete backend,
-    /// bring it up, and return a live session.
+    /// Resolve the operator-selected `mode` to a concrete backend
+    /// and bring it up.
     ///
-    /// `tcp_fd` is required for the kernel kmod attach but ignored
-    /// for the userspace and TUN paths. Under `DataPathMode::Auto`,
-    /// the kmod is tried first; on failure the session falls back
-    /// to TUN (the legacy PPP-userspace copier is a no-op on
-    /// mainline kernels and is reachable only via the explicit
-    /// `--data-path userspace` flag).
+    /// `tcp_fd` is required for the kernel kmod attach and must
+    /// have kTLS already installed; it is ignored for the TUN path.
+    /// Under [`DataPathMode::Auto`] the kmod is tried first; on
+    /// failure the session falls back to TUN with a warning log.
     pub fn bring_up(
         mode: DataPathMode,
         tcp_fd: BorrowedFd<'_>,
@@ -121,36 +107,28 @@ impl KpppSession {
         match mode {
             DataPathMode::Tun => {
                 let tun = TunSession::bring_up(local, peer)?;
-                return Ok(Self {
+                Ok(Self {
                     inner: Backend::Tun(tun),
-                });
+                })
             }
-            DataPathMode::Auto => {
-                // Try the PPP+kmod path first; if it fails, fall
-                // back to TUN. The PPP-userspace path is *not*
-                // tried under Auto because it doesn't move IP
-                // traffic on mainline kernels.
-                match Self::bring_up_ppp(DataPathMode::Kernel, tcp_fd, local, peer) {
-                    Ok(s) => return Ok(s),
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            "kernel data path unavailable; falling back to TUN"
-                        );
-                        let tun = TunSession::bring_up(local, peer)?;
-                        return Ok(Self {
-                            inner: Backend::Tun(tun),
-                        });
-                    }
+            DataPathMode::Kernel => Self::bring_up_ppp(tcp_fd, local, peer),
+            DataPathMode::Auto => match Self::bring_up_ppp(tcp_fd, local, peer) {
+                Ok(s) => Ok(s),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "kernel data path unavailable; falling back to TUN"
+                    );
+                    let tun = TunSession::bring_up(local, peer)?;
+                    Ok(Self {
+                        inner: Backend::Tun(tun),
+                    })
                 }
-            }
-            DataPathMode::Kernel | DataPathMode::Userspace => {}
+            },
         }
-        Self::bring_up_ppp(mode, tcp_fd, local, peer)
     }
 
     fn bring_up_ppp(
-        mode: DataPathMode,
         tcp_fd: BorrowedFd<'_>,
         local: Ipv4Addr,
         peer: Ipv4Addr,
@@ -177,32 +155,17 @@ impl KpppSession {
         };
         nl.bring_up(ifindex, &cfg)?;
 
-        let path = DataPath::open(mode, tcp_fd, &unit, DEFAULT_MTU)?;
-
-        let async_fd = match &path {
-            DataPath::Kernel(_) => None,
-            DataPath::Userspace(_) => {
-                // `try_clone_to_owned` is `dup3(F_DUPFD_CLOEXEC)`;
-                // both fds share the same open-file-description,
-                // including the `O_NONBLOCK` flag that `Unit::new`
-                // already set.
-                let dup = unit
-                    .as_fd()
-                    .try_clone_to_owned()
-                    .map_err(BringUpError::Dup)?;
-                Some(
-                    AsyncFd::with_interest(dup, Interest::READABLE | Interest::WRITABLE)
-                        .map_err(BringUpError::Register)?,
-                )
-            }
-        };
+        sstp_kmod::probe()?;
+        // PPP unit numbers are small non-negative; cast is lossless.
+        #[allow(clippy::cast_possible_wrap)]
+        let ppp_unit = unit.index() as i32;
+        let kmod = KmodSession::attach(tcp_fd, ppp_unit, DEFAULT_MTU)?;
 
         Ok(Self {
             inner: Backend::Ppp(PppBackend {
                 unit,
                 ifindex,
-                path,
-                async_fd,
+                kmod,
             }),
         })
     }
@@ -224,18 +187,14 @@ impl KpppSession {
     }
 
     /// `true` when the kernel SSTP module owns the steady-state byte
-    /// path for this session. The session driver uses this to skip
-    /// its userspace copy loop. False for TUN and for the PPP
-    /// userspace fallback.
+    /// path for this session. Always true for `Backend::Ppp`, false
+    /// for TUN.
     #[must_use]
     pub fn is_kernel(&self) -> bool {
-        matches!(&self.inner, Backend::Ppp(p) if p.path.is_kernel())
+        matches!(&self.inner, Backend::Ppp(_))
     }
 
-    /// `true` when the backend is a TUN device. Lets the session
-    /// driver know an EOF from `read_frame` is a real error (TUN
-    /// reads return packets, not EOF) rather than the
-    /// channel-less-pppN no-op behaviour.
+    /// `true` when the backend is a TUN device.
     #[must_use]
     pub fn is_tun(&self) -> bool {
         matches!(&self.inner, Backend::Tun(_))
@@ -245,23 +204,18 @@ impl KpppSession {
     /// session driver wraps this in [`AsyncFd`] (READABLE) and
     /// `select!`s on it; readable means there is at least one event
     /// queued for [`Self::read_event`] to drain.
-    ///
-    /// Returns `None` for TUN and userspace-PPP backends.
     #[must_use]
     pub fn kmod_fd(&self) -> Option<BorrowedFd<'_>> {
         match &self.inner {
-            Backend::Ppp(p) => match &p.path {
-                DataPath::Kernel(s) => Some(s.as_fd()),
-                DataPath::Userspace(_) => None,
-            },
+            Backend::Ppp(p) => Some(p.kmod.as_fd()),
             Backend::Tun(_) => None,
         }
     }
 
     /// Dup the kmod session fd and wrap it in an [`AsyncFd`] for the
-    /// session driver's `select!`. Returns `Ok(None)` for non-kernel
-    /// backends. The dup shares the open-file-description, including
-    /// the `O_NONBLOCK` flag set by [`KmodSession::attach`].
+    /// session driver's `select!`. Returns `Ok(None)` for TUN. The
+    /// dup shares the open-file-description, including the
+    /// `O_NONBLOCK` flag set by [`KmodSession::attach`].
     pub fn kmod_async_fd(&self) -> io::Result<Option<AsyncFd<OwnedFd>>> {
         let Some(fd) = self.kmod_fd() else {
             return Ok(None);
@@ -272,101 +226,47 @@ impl KpppSession {
     }
 
     /// Drain one event from the kmod session fd. Returns `None` on
-    /// `EAGAIN` (queue empty) or when the backend is not kernel
-    /// mode. The fd is non-blocking; pair with an `AsyncFd::readable`
-    /// wait in the caller's `select!`.
+    /// `EAGAIN` (queue empty) or for TUN. The fd is non-blocking;
+    /// pair with an `AsyncFd::readable` wait in the caller's
+    /// `select!`.
     pub fn read_event(&self) -> Result<Option<EventRaw>, KmodError> {
         match &self.inner {
-            Backend::Ppp(p) => match &p.path {
-                DataPath::Kernel(s) => s.read_event(),
-                DataPath::Userspace(_) => Ok(None),
-            },
+            Backend::Ppp(p) => p.kmod.read_event(),
             Backend::Tun(_) => Ok(None),
         }
     }
 
     /// Drain one queued SSTP control packet (`C=1`, header already
     /// stripped by the kmod) into `buf`. Returns the number of
-    /// payload bytes written, `None` if the queue is empty, or
-    /// `None` for non-kernel-mode backends.
-    ///
-    /// Pair with a `SSTP_EVT_CONTROL_PACKET` event seen via
-    /// [`Self::read_event`].
+    /// payload bytes written, or `None` if the queue is empty / the
+    /// backend is TUN.
     pub fn recv_control(&self, buf: &mut [u8]) -> Result<Option<usize>, KmodError> {
         match &self.inner {
-            Backend::Ppp(p) => match &p.path {
-                DataPath::Kernel(s) => s.recv_control(buf),
-                DataPath::Userspace(_) => Ok(None),
-            },
+            Backend::Ppp(p) => p.kmod.recv_control(buf),
             Backend::Tun(_) => Ok(None),
         }
     }
 
-    /// Write one PPP frame to the backing data path.
-    ///
-    /// - PPP backend: the bytes go straight to the unit fd.
-    /// - TUN backend: the PPP header is stripped and just the IP
-    ///   payload is written to the tun fd.
-    ///
-    /// Calling this in kernel mode is a programming error.
+    /// Write one PPP frame to the backing data path. Only meaningful
+    /// for the TUN backend; calling this in kernel mode is a
+    /// programming error.
     pub async fn write_frame(&self, frame: &[u8]) -> io::Result<usize> {
         match &self.inner {
-            Backend::Ppp(p) => {
-                let fd = p.async_fd.as_ref().ok_or_else(|| {
-                    io::Error::other("write_frame called on kernel-mode KpppSession")
-                })?;
-                fd.async_io(Interest::WRITABLE, |fd| write_fd(fd.as_fd(), frame))
-                    .await
-            }
+            Backend::Ppp(_) => Err(io::Error::other(
+                "write_frame called on kernel-mode KpppSession",
+            )),
             Backend::Tun(t) => t.write_frame(frame).await,
         }
     }
 
     /// Read one PPP frame from the backing data path into `buf`.
-    ///
-    /// - PPP backend: bytes read from the unit fd verbatim.
-    /// - TUN backend: an IP packet is read from the tun fd and
-    ///   PPP-encoded (uncompressed header + protocol field) into
-    ///   `buf`.
-    ///
-    /// In kernel mode the future will never resolve.
+    /// Only meaningful for the TUN backend; in kernel mode the
+    /// future never resolves.
     pub async fn read_frame(&self, buf: &mut [u8]) -> io::Result<usize> {
         match &self.inner {
-            Backend::Ppp(p) => {
-                let fd = p.async_fd.as_ref().ok_or_else(|| {
-                    io::Error::other("read_frame called on kernel-mode KpppSession")
-                })?;
-                fd.async_io(Interest::READABLE, |fd| read_fd(fd.as_fd(), buf))
-                    .await
-            }
+            Backend::Ppp(_) => std::future::pending().await,
             Backend::Tun(t) => t.read_frame(buf).await,
         }
-    }
-}
-
-/// `write(2)` against a borrowed fd, returning `WouldBlock` on `EAGAIN`
-/// so [`AsyncFd::async_io`] can re-arm and retry.
-fn write_fd(fd: BorrowedFd<'_>, buf: &[u8]) -> io::Result<usize> {
-    // SAFETY: `fd` is valid for the duration of the call; `buf` is a
-    // valid initialised slice.
-    let rc = unsafe { libc::write(fd.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
-    if rc < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(usize::try_from(rc).expect("non-negative ssize_t"))
-    }
-}
-
-/// `read(2)` against a borrowed fd, returning `WouldBlock` on `EAGAIN`
-/// so [`AsyncFd::async_io`] can re-arm and retry.
-fn read_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
-    // SAFETY: `fd` is valid for the duration of the call; `buf` is a
-    // valid initialised slice we have exclusive access to.
-    let rc = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-    if rc < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(usize::try_from(rc).expect("non-negative ssize_t"))
     }
 }
 

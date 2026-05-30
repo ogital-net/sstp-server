@@ -9,7 +9,6 @@
 //! §2.2.3) rather than as an octet stream.
 
 // Consumers land in M4 (RADIUS bridge) and M5 (kernel PPP plumbing).
-#![allow(dead_code, unused_imports)]
 
 pub mod auth;
 pub mod driver;
@@ -19,12 +18,3 @@ pub mod ipcp;
 pub mod lcp;
 
 pub use driver::{AssignedAddrs, AuthVerdict, Ppp, PppEvent, PppStep, TimerOwner};
-
-pub use frame::{
-    ADDRESS_ALL_STATIONS, CONTROL_UI, FrameError, PppFrame, ProtocolId, decode_frame, encode_frame,
-    encode_frame_compressed,
-};
-pub use lcp::{
-    ConfigOption, ConfigOptionIter, LcpCode, LcpOptionId, LcpPacket, LcpPacketError,
-    decode_lcp_packet,
-};

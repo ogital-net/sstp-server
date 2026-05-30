@@ -5,7 +5,6 @@
 //! `unsafe` block carries a `// SAFETY:` comment.
 
 // Consumers land in later milestones (SSTP framing, PPP, RADIUS bridge).
-#![allow(dead_code, unused_imports)]
 
 pub mod ffi;
 pub mod hash;
@@ -13,11 +12,6 @@ pub mod hmac;
 pub mod ktls;
 pub mod rand;
 pub mod tls;
-
-pub use hash::{Md5, Sha1, Sha256};
-pub use hmac::{HmacSha1, HmacSha256};
-pub use rand::fill_bytes;
-pub use tls::{SslContext, TlsError, TlsStream};
 
 /// Constant-time equality. Returns `false` immediately if the lengths
 /// differ (length is not a secret), otherwise dispatches to AWS-LC's

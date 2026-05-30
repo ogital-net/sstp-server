@@ -6,6 +6,14 @@
 //! self-documenting and amenable to a compile-time check against the
 //! canonical resolved values (see the test at the bottom).
 
+// The constants and the generic `_IO`/`_IOR`/`_IOW`/`_IOWR` builders
+// are kept verbatim against `<linux/ppp-ioctl.h>` (numerical
+// compile-time test pins them) so kmod migration can swap data-path
+// modules without touching this file. Most are unused in the binary
+// today \u2014 the kernel sstp kmod path is the only consumer of
+// `PPPIOCATTCHAN` / `PPPIOCNEWUNIT`.
+#![allow(dead_code)]
+
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd};
 // ---------------------------------------------------------------------------

@@ -16,6 +16,12 @@
 //! See `kmod/README.md` for the kernel side and `kmod/tests/test_sstp.c`
 //! for a parallel C-language harness.
 
+// Mirrors the full `kernel-abi/sstp.h` ABI surface. Stats / detach
+// ioctl wrappers and accessor methods are present so the data-path
+// driver can consume them without further FFI work; they have no
+// caller in the binary today (M5 wires probe + attach only).
+#![allow(dead_code)]
+
 use std::ffi::CStr;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};

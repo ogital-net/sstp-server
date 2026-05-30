@@ -360,6 +360,7 @@ impl TlsStream {
     /// RFC 5705 / TLS 1.3 §7.5 keying material exporter. Used by SSTP
     /// for CMK derivation when no inner-method MSK is available
     /// ([MS-SSTP] §3.2.5.2).
+    #[allow(dead_code)] // FUTURE: wired by the Crypto Binding HLAK path once non-PAP auth methods land.
     pub fn export_keying_material(
         &self,
         out: &mut [u8],
