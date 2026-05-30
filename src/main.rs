@@ -41,6 +41,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
+use crate::auth::acct_bridge::AcctBridge;
 use crate::auth::bridge::AuthBridge;
 use crate::cli::{Config, LogFormat, ParseOutcome};
 use crate::crypto::tls::SslContext;
@@ -147,6 +148,21 @@ fn run(config: &Config) -> ExitCode {
         .map(|addr| (*addr, std::sync::Arc::clone(&radius_secret)))
         .collect();
 
+    // RADIUS NAS-Identifier: explicit `--nas-identifier` wins; empty
+    // string opts out; otherwise derive from `gethostname(2)`. The
+    // result is shared by `Arc` across both bridges and every
+    // per-record spawn.
+    let nas_identifier: Option<std::sync::Arc<str>> = match config.nas_identifier.as_deref() {
+        Some("") => None,
+        Some(s) => Some(std::sync::Arc::<str>::from(s)),
+        None => resolve_hostname().map(std::sync::Arc::<str>::from),
+    };
+    if let Some(id) = nas_identifier.as_deref() {
+        info!(nas_identifier = %id, "RADIUS NAS-Identifier resolved");
+    } else {
+        info!("RADIUS NAS-Identifier disabled (empty override)");
+    }
+
     // Bind one SO_REUSEPORT std listener per I/O worker. Done now,
     // before any tokio runtime exists, so we can hand the listeners
     // to workers post-`privdrop` — they'd lack CAP_NET_BIND_SERVICE
@@ -230,11 +246,42 @@ fn run(config: &Config) -> ExitCode {
         auth_runtime.handle(),
         "0.0.0.0:0".parse().expect("valid bind addr"),
         radius_servers,
+        nas_identifier.clone(),
     )) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, "failed to bind RADIUS client socket");
             return ExitCode::from(1);
+        }
+    };
+
+    // RADIUS accounting bridge — only constructed when --acct
+    // servers are configured. The shared secret falls back to
+    // SSTP_RADIUS_SECRET when SSTP_RADIUS_ACCT_SECRET is unset, per
+    // the convention every accel-ppp / FreeRADIUS deployment uses.
+    let acct_bridge: Option<AcctBridge> = if config.acct.is_empty() {
+        None
+    } else {
+        let acct_secret: std::sync::Arc<[u8]> = match std::env::var(cli::SSTP_RADIUS_ACCT_SECRET) {
+            Ok(s) if !s.is_empty() => s.into_bytes().into(),
+            _ => std::sync::Arc::clone(&radius_secret),
+        };
+        let acct_servers: Vec<(std::net::SocketAddr, std::sync::Arc<[u8]>)> = config
+            .acct
+            .iter()
+            .map(|addr| (*addr, std::sync::Arc::clone(&acct_secret)))
+            .collect();
+        match auth_runtime.block_on(AcctBridge::spawn(
+            auth_runtime.handle(),
+            "0.0.0.0:0".parse().expect("valid bind addr"),
+            acct_servers,
+            nas_identifier.clone(),
+        )) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to bind RADIUS accounting socket");
+                return ExitCode::from(1);
+            }
         }
     };
 
@@ -252,6 +299,7 @@ fn run(config: &Config) -> ExitCode {
         let worker_shutdown = shutdown_tx.clone();
         let worker_tls = tls_ctx.clone();
         let worker_auth = auth_bridge.clone();
+        let worker_acct = acct_bridge.clone();
         let handle = thread::Builder::new()
             .name(format!("sstp-io-{id}"))
             .spawn(move || {
@@ -264,6 +312,7 @@ fn run(config: &Config) -> ExitCode {
                     worker_shutdown,
                     worker_tls,
                     worker_auth,
+                    worker_acct,
                     local_ip,
                     auth_method,
                     data_path,
@@ -358,6 +407,29 @@ fn resolve_drop_identity(
     Ok(Some(id))
 }
 
+/// Look up the system hostname via `gethostname(2)`. Returns `None`
+/// when the syscall fails or yields an empty string; the caller
+/// (RADIUS NAS-Identifier resolution) treats either as "no
+/// identifier".
+fn resolve_hostname() -> Option<String> {
+    // Linux caps `HOST_NAME_MAX` at 64 plus the trailing NUL; allow
+    // 256 to comfortably cover any future expansion.
+    let mut buf = [0u8; 256];
+    // SAFETY: passing a writable buffer of `buf.len()` bytes; the
+    // kernel writes at most that many bytes including a trailing
+    // NUL on success, and returns -1 on error without touching the
+    // buffer.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    if nul == 0 {
+        return None;
+    }
+    std::str::from_utf8(&buf[..nul]).ok().map(str::to_owned)
+}
+
 /// Probe `/dev/sstp` once at boot and reconcile with the operator's
 /// `--data-path` choice. Returns the effective mode the per-session
 /// bring-up will pass to [`kppp::session::KpppSession::bring_up`].
@@ -447,6 +519,7 @@ fn io_worker_main(
     shutdown_tx: broadcast::Sender<()>,
     tls_ctx: SharedTlsContext,
     auth_bridge: AuthBridge,
+    acct_bridge: Option<AcctBridge>,
     local_ip: std::net::Ipv4Addr,
     auth_method: crate::ppp::AuthMethod,
     data_path: cli::DataPathMode,
@@ -475,6 +548,7 @@ fn io_worker_main(
             shutdown_tx,
             tls_ctx,
             auth_bridge,
+            acct_bridge,
             local_ip,
             auth_method,
             data_path,
@@ -492,6 +566,7 @@ async fn accept_loop(
     shutdown_tx: broadcast::Sender<()>,
     tls_ctx: SharedTlsContext,
     auth_bridge: AuthBridge,
+    acct_bridge: Option<AcctBridge>,
     local_ip: std::net::Ipv4Addr,
     auth_method: crate::ppp::AuthMethod,
     data_path: cli::DataPathMode,
@@ -522,8 +597,9 @@ async fn accept_loop(
                         .expect("TLS context RwLock poisoned")
                         .clone();
                     let session_auth = auth_bridge.clone();
+                    let session_acct = acct_bridge.clone();
                     let handle = tokio::task::spawn_local(session::run(
-                        stream, peer, id, registry, control_rx, drain_rx, session_tls, session_auth, local_ip, auth_method, data_path,
+                        stream, peer, id, registry, control_rx, drain_rx, session_tls, session_auth, session_acct, local_ip, auth_method, data_path,
                     ));
                     tasks.push(handle);
                 }

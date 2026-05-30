@@ -5,10 +5,10 @@
 //! ([RFC 1661] §4.2) lives in a sibling module so the codec stays
 //! free of state.
 
-// Negotiation accessors (`as_mru`, `as_magic_number`, `as_auth_protocol`,
-// `is_configure`) and `auth_protocol_{mschapv2,eap}` builders are
-// scaffolding for non-PAP authentication phases (M6+). PAP-only
-// negotiation is what's wired today.
+// Some negotiation accessors (`as_mru`, `as_magic_number`,
+// `as_auth_protocol`, `is_configure`) and the `auth_protocol_eap`
+// builder are scaffolding for the future EAP pass-through phase.
+// PAP, CHAP-MD5, and MS-CHAPv2 negotiation are wired today.
 #![allow(dead_code)]
 
 use super::frame::ProtocolId;

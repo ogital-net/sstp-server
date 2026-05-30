@@ -11,9 +11,10 @@
 //!   (Access-Challenge → forward EAP-Request to PPP → receive
 //!   EAP-Response → Access-Request with echoed `State` → repeat).
 
-// PAP path is the only consumer today. MS-CHAPv2 (`authenticate_mschapv2`)
-// and the EAP loop (`EapSession` / `EapStep`) are scaffolding for
-// future PPP auth phases (M6+).
+// PAP, CHAP-MD5, and MS-CHAPv2 paths are wired through the auth
+// bridge. The EAP loop (`EapSession` / `EapStep`) is scaffolding
+// for the future EAP pass-through phase and has no caller in the
+// binary build today.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
@@ -137,7 +138,7 @@ pub enum EapStep {
     /// EAP-Response, then call [`EapSession::step`] again.
     Continue { eap_request: Vec<u8> },
     /// RADIUS returned Access-Accept. EAP is done.
-    Accept(AuthAccept),
+    Accept(Box<AuthAccept>),
     /// RADIUS returned Access-Reject.
     Reject(Option<String>),
 }
@@ -179,7 +180,7 @@ impl EapSession {
             } => {
                 self.reset();
                 let accept = super::reply::decode_accept(&attributes, secret, &authenticator)?;
-                Ok(EapStep::Accept(accept))
+                Ok(EapStep::Accept(Box::new(accept)))
             }
             AccessOutcome::Reject { attributes, .. } => {
                 self.reset();

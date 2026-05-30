@@ -61,12 +61,17 @@ const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 
 const RTM_NEWLINK: u16 = 16;
+const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 
 const IFLA_MTU: u16 = 4;
+/// `IFLA_STATS64` — kernel-maintained per-netdev byte/packet counters
+/// (`struct rtnl_link_stats64` from `<linux/if_link.h>`). 192 bytes,
+/// 24 × `u64` little-endian-on-LE-host (host byte order in netlink).
+const IFLA_STATS64: u16 = 23;
 
 const NLMSG_HDRLEN: usize = mem::size_of::<libc::nlmsghdr>();
 
@@ -104,6 +109,73 @@ struct Ifinfomsg {
 struct Rtattr {
     rta_len: u16,
     rta_type: u16,
+}
+
+/// Subset of `struct rtnl_link_stats64` from `<linux/if_link.h>`.
+///
+/// The kernel struct is 24 × `u64`; we surface only the four
+/// counters the RADIUS accounting client needs (octets / packets in
+/// each direction). Errors / drops are intentionally omitted —
+/// adding them is one struct field plus one offset constant if a
+/// future caller needs them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LinkStats64 {
+    /// `rx_packets` (offset 0).
+    pub rx_packets: u64,
+    /// `tx_packets` (offset 8).
+    pub tx_packets: u64,
+    /// `rx_bytes` (offset 16).
+    pub rx_bytes: u64,
+    /// `tx_bytes` (offset 24).
+    pub tx_bytes: u64,
+}
+
+impl LinkStats64 {
+    /// Parse a 32-byte (or longer — we only consume the prefix)
+    /// `rtnl_link_stats64` payload.
+    fn from_payload(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 32 {
+            return None;
+        }
+        let read_u64 = |off: usize| -> u64 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&payload[off..off + 8]);
+            // Netlink payloads are host byte order.
+            u64::from_ne_bytes(b)
+        };
+        Some(Self {
+            rx_packets: read_u64(0),
+            tx_packets: read_u64(8),
+            rx_bytes: read_u64(16),
+            tx_bytes: read_u64(24),
+        })
+    }
+}
+
+/// Walk a sequence of `rtattr` records and return the
+/// `IFLA_STATS64` payload if present.
+fn find_stats64(mut attrs: &[u8]) -> Option<LinkStats64> {
+    while attrs.len() >= 4 {
+        let mut len_bytes = [0u8; 2];
+        let mut type_bytes = [0u8; 2];
+        len_bytes.copy_from_slice(&attrs[0..2]);
+        type_bytes.copy_from_slice(&attrs[2..4]);
+        let rta_len = u16::from_ne_bytes(len_bytes) as usize;
+        let rta_type = u16::from_ne_bytes(type_bytes);
+        if rta_len < 4 || rta_len > attrs.len() {
+            return None;
+        }
+        if rta_type == IFLA_STATS64 {
+            return LinkStats64::from_payload(&attrs[4..rta_len]);
+        }
+        // RTA_ALIGN(rta_len).
+        let aligned = (rta_len + 3) & !3;
+        if aligned >= attrs.len() {
+            return None;
+        }
+        attrs = &attrs[aligned..];
+    }
+    None
 }
 
 #[inline]
@@ -277,6 +349,115 @@ impl RtNetlink {
         buf.push_attr(IFLA_MTU, &mtu.to_ne_bytes());
         buf.finalize();
         self.exchange("RTM_NEWLINK(IFLA_MTU)", &buf)
+    }
+
+    /// `RTM_GETLINK` for the given `ifindex`, returning the kernel's
+    /// `IFLA_STATS64` counters (`struct rtnl_link_stats64`).
+    ///
+    /// Used by the RADIUS accounting client to sample
+    /// `Acct-{Input,Output}-{Octets,Packets}` (and Gigawords) on
+    /// Interim and Stop records. The kernel maintains these on every
+    /// netdev; for our purposes that's `pppN` (kmod data path) or
+    /// `tun0` (TUN data path) — the netdev type is irrelevant to the
+    /// query.
+    pub fn link_stats64(&mut self, ifindex: u32) -> Result<LinkStats64, NetlinkError> {
+        let mut buf = MessageBuf::new();
+        buf.push_nlmsghdr(RTM_GETLINK, NLM_F_REQUEST | NLM_F_ACK, self.next_seq());
+        buf.push_struct(&Ifinfomsg {
+            ifi_family: libc::AF_UNSPEC as u8,
+            _pad: 0,
+            ifi_type: 0,
+            ifi_index: i32::try_from(ifindex).expect("ifindex fits in i32"),
+            ifi_flags: 0,
+            ifi_change: 0,
+        });
+        buf.finalize();
+        self.exchange_link_stats(&buf)
+    }
+
+    fn exchange_link_stats(&self, buf: &MessageBuf) -> Result<LinkStats64, NetlinkError> {
+        const OP: &str = "RTM_GETLINK(IFLA_STATS64)";
+        let mut addr: libc::sockaddr_nl = unsafe { mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as u16;
+        // SAFETY: `buf.bytes` is a valid initialized slice; addr is a
+        // valid sockaddr_nl describing the kernel.
+        let sent = unsafe {
+            libc::sendto(
+                self.fd.as_raw_fd(),
+                buf.bytes.as_ptr().cast(),
+                buf.bytes.len(),
+                0,
+                std::ptr::addr_of!(addr).cast(),
+                mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            return Err(NetlinkError::Send {
+                op: "RTM_GETLINK",
+                source: io::Error::last_os_error(),
+            });
+        }
+
+        // 8 KiB is comfortably more than `rtnl_link_stats64` (192 B)
+        // plus the dozen other IFLA attributes the kernel always
+        // returns alongside it (IFLA_IFNAME, IFLA_QDISC, etc.).
+        let mut reply = [0u8; 8192];
+        // SAFETY: `reply` is a valid &mut [u8].
+        let n = unsafe {
+            libc::recv(
+                self.fd.as_raw_fd(),
+                reply.as_mut_ptr().cast(),
+                reply.len(),
+                0,
+            )
+        };
+        if n < 0 {
+            return Err(NetlinkError::Recv {
+                op: "RTM_GETLINK",
+                source: io::Error::last_os_error(),
+            });
+        }
+        let buf = &reply[..n as usize];
+        if buf.len() < NLMSG_HDRLEN {
+            return Err(NetlinkError::Unexpected { op: OP, got: 0 });
+        }
+        // SAFETY: bounds-checked above; nlmsghdr is plain-old-data.
+        let hdr: libc::nlmsghdr =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<libc::nlmsghdr>()) };
+        match hdr.nlmsg_type {
+            NLMSG_ERROR => {
+                if buf.len() < NLMSG_HDRLEN + 4 {
+                    return Err(NetlinkError::Unexpected { op: OP, got: hdr.nlmsg_type });
+                }
+                let mut errbuf = [0u8; 4];
+                errbuf.copy_from_slice(&buf[NLMSG_HDRLEN..NLMSG_HDRLEN + 4]);
+                let err = i32::from_ne_bytes(errbuf);
+                if err == 0 {
+                    // Bare ACK without payload — kernel didn't return
+                    // the link. Treat as ENODEV-equivalent.
+                    return Err(NetlinkError::Kernel {
+                        op: OP,
+                        errno: libc::ENODEV,
+                    });
+                }
+                return Err(NetlinkError::Kernel {
+                    op: OP,
+                    errno: -err,
+                });
+            }
+            RTM_NEWLINK => {}
+            other => return Err(NetlinkError::Unexpected { op: OP, got: other }),
+        }
+        // Skip nlmsghdr + ifinfomsg (16 bytes).
+        let body_off = NLMSG_HDRLEN + mem::size_of::<Ifinfomsg>();
+        if buf.len() < body_off {
+            return Err(NetlinkError::Unexpected { op: OP, got: hdr.nlmsg_type });
+        }
+        let attrs = &buf[body_off..hdr.nlmsg_len as usize];
+        find_stats64(attrs).ok_or(NetlinkError::Unexpected {
+            op: OP,
+            got: IFLA_STATS64,
+        })
     }
 
     fn exchange(&self, op: &'static str, buf: &MessageBuf) -> Result<(), NetlinkError> {

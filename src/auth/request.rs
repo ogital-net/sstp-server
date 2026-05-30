@@ -11,9 +11,9 @@
 //! closure is invoked with a fresh `PacketBuffer` and the just-drawn
 //! Request Authenticator.
 
-// PAP request builder is the only consumer today; `apply_mschapv2`
-// and `apply_eap` (and their `MAX_ATTR_VALUE` cap) are scaffolding
-// for future PPP auth phases (M6+).
+// PAP, CHAP-MD5, and MS-CHAPv2 request builders are in active use.
+// `apply_eap` (and the `MAX_ATTR_VALUE` cap shared with it) is
+// scaffolding for the future EAP pass-through phase.
 #![allow(dead_code)]
 
 use radius_tokio::{

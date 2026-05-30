@@ -14,6 +14,7 @@
 
 
 pub mod accounting;
+pub mod acct_bridge;
 pub mod bridge;
 pub mod client;
 pub mod coa;
@@ -51,6 +52,12 @@ pub struct AuthAccept {
     pub mppe_send_key: Vec<u8>,
     /// MPPE Recv key (RFC 3079) — peer-to-server.
     pub mppe_recv_key: Vec<u8>,
+    /// `MS-CHAP2-Success` body (RFC 2548 §2.3.3): the
+    /// `S=<40-hex-chars>` Authenticator-Response string the peer
+    /// expects in the PPP CHAP `Success` packet ([RFC 2759] §6).
+    /// Populated only for MS-CHAPv2 Access-Accepts; the leading
+    /// CHAP-Identifier byte from the VSA has been stripped.
+    pub mschap2_success: Option<Vec<u8>>,
     /// Per-session traffic-shaping policy projected from RADIUS
     /// VSAs (today: `Mikrotik-Rate-Limit`, vendor 14988, attr 8).
     /// `None` when the Access-Accept carried no recognised shaping

@@ -54,8 +54,9 @@ OPTIONS:
     -F, --log-format <fmt>       text | json | auto (default: auto)
     -L, --log-file <path>        Log to file instead of stderr
     -D, --data-path <mode>       auto | kernel | tun (default: auto)
-    -M, --auth-method <method>   pap | chap (default: pap)
+    -M, --auth-method <method>   pap | chap | mschapv2 (default: pap)
     -i, --local-ip <ipv4>        Server-side IPv4 for every pppN interface (required)
+    -N, --nas-identifier <id>    RADIUS NAS-Identifier (default: hostname)
     -u, --user <name>            Drop privileges to this user after binding sockets (root only)
     -g, --group <name>           Group to drop to (defaults to the user's primary GID)
     -v                           Increase verbosity (-v, -vv, -vvv)
@@ -93,6 +94,7 @@ L:(log-file)\
 D:(data-path)\
 M:(auth-method)\
 i:(local-ip)\
+N:(nas-identifier)\
 u:(user)\
 g:(group)";
 
@@ -140,6 +142,11 @@ pub struct Config {
     /// (`Framed-IP-Address`); the local half has no useful default
     /// at startup.
     pub local_ip: Ipv4Addr,
+    /// `NAS-Identifier` to attach to every RADIUS Access-Request
+    /// and Accounting-Request. `None` here means "derive from
+    /// `gethostname(2)` at startup"; an explicit empty string on
+    /// the command line opts out entirely.
+    pub nas_identifier: Option<String>,
     /// Unprivileged user to drop to after startup. `None` keeps the
     /// current uid. When set, the daemon must be started as root.
     pub drop_user: Option<String>,
@@ -233,6 +240,7 @@ where
     let mut data_path = DataPathMode::Auto;
     let mut auth_method = crate::ppp::AuthMethod::Pap;
     let mut local_ip: Option<String> = None;
+    let mut nas_identifier: Option<String> = None;
     let mut drop_user: Option<String> = None;
     let mut drop_group: Option<String> = None;
     let mut verbose: i32 = 0;
@@ -286,6 +294,7 @@ where
             }
             'L' => log_file = opt.into_arg().map(cow_to_path),
             'i' => local_ip = opt.into_arg().map(std::borrow::Cow::into_owned),
+            'N' => nas_identifier = opt.into_arg().map(std::borrow::Cow::into_owned),
             'u' => drop_user = opt.into_arg().map(std::borrow::Cow::into_owned),
             'g' => drop_group = opt.into_arg().map(std::borrow::Cow::into_owned),
             'D' => {
@@ -308,11 +317,12 @@ where
                 auth_method = match raw {
                     "pap" => crate::ppp::AuthMethod::Pap,
                     "chap" | "chap-md5" => crate::ppp::AuthMethod::ChapMd5,
+                    "mschapv2" | "ms-chap-v2" => crate::ppp::AuthMethod::MsChapV2,
                     other => {
                         return Err(ParseError::invalid(
                             "auth-method",
                             other,
-                            BadEnumValue("expected one of: pap, chap"),
+                            BadEnumValue("expected one of: pap, chap, mschapv2"),
                         ));
                     }
                 };
@@ -380,6 +390,7 @@ where
         data_path,
         auth_method,
         local_ip,
+        nas_identifier,
         drop_user,
         drop_group,
     })))

@@ -15,22 +15,23 @@
 //! at a small number of attempts — and is independent per
 //! `(server_addr, identifier)` correlation slot.
 
-// M4 (partial): the transport, packet build/verify helpers, and
-// per-session state are landed; wiring from the session task
-// (interim updates, byte-counter sampling) and the retry/peer state
-// machine are not yet enabled, so most items here have no caller.
+// M4 wire-up in progress: the transport, packet build/verify
+// helpers, and per-session state are landed; integration from the
+// session task (Start on NetworkUp, periodic Interim, Stop on
+// teardown) lands alongside the [`crate::auth::AcctBridge`] facade.
+// Once that's wired the blanket `dead_code` allow comes off.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use radius_tokio::{
     Code, CodecError, PacketBuffer, authenticator,
     dict::rfc::{
         self,
-        values::{AcctAuthentic, AcctStatusType, AcctTerminateCause},
+        values::{AcctAuthentic, AcctStatusType, AcctTerminateCause, FramedProtocol, NasPortType, ServiceType},
     },
 };
 use tokio::net::UdpSocket;
@@ -56,6 +57,66 @@ impl AcctEvent {
             AcctEvent::Start => AcctStatusType::START,
             AcctEvent::InterimUpdate => AcctStatusType::INTERIM_UPDATE,
             AcctEvent::Stop(_) => AcctStatusType::STOP,
+        }
+    }
+}
+
+/// How a session ended, expressed in terms a RADIUS authenticator
+/// can act on. Wider than [`crate::session::DisconnectReason`] (which
+/// is just the cross-worker control-channel subset) — we also cover
+/// the natural-completion paths the session task observes directly:
+/// peer-initiated PPP teardown, transport loss, and authenticator
+/// rejection.
+///
+/// Mapping to RFC 2866 §5.10 `Acct-Terminate-Cause` follows the
+/// FreeRADIUS / accel-ppp convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// Peer requested teardown (LCP `Terminate-Request`, SSTP
+    /// `Call-Disconnect`).
+    UserRequest,
+    /// TCP / TLS EOF, read/write error, or IPCP failure mid-session.
+    LostCarrier,
+    /// Per-session idle timer (PPP echo loss).
+    IdleTimeout,
+    /// Operator action via control socket (`disable session`).
+    AdminReset,
+    /// Process-wide drain in progress (SIGTERM, `shutdown`).
+    NasReboot,
+    /// Authenticator-side error during initial auth.
+    NasError,
+    /// Service unavailable (e.g. RADIUS unreachable).
+    ServiceUnavailable,
+}
+
+impl SessionEnd {
+    /// Project to a RADIUS `Acct-Terminate-Cause`.
+    #[must_use]
+    pub fn to_terminate_cause(self) -> AcctTerminateCause {
+        match self {
+            SessionEnd::UserRequest => AcctTerminateCause::USER_REQUEST,
+            SessionEnd::LostCarrier => AcctTerminateCause::LOST_CARRIER,
+            SessionEnd::IdleTimeout => AcctTerminateCause::IDLE_TIMEOUT,
+            SessionEnd::AdminReset => AcctTerminateCause::ADMIN_RESET,
+            SessionEnd::NasReboot => AcctTerminateCause::NAS_REBOOT,
+            SessionEnd::NasError => AcctTerminateCause::NAS_ERROR,
+            SessionEnd::ServiceUnavailable => AcctTerminateCause::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+impl From<crate::session::DisconnectReason> for SessionEnd {
+    fn from(reason: crate::session::DisconnectReason) -> Self {
+        use crate::session::DisconnectReason as D;
+        // Both `AdminRequested` (control socket) and `RadiusDisconnect`
+        // (RFC 5176 CoA) are administrative actions from the user's
+        // perspective; RFC 2866 §5.10 has no separate code for the
+        // RADIUS-driven path, so they collapse onto `Admin-Reset`.
+        #[allow(clippy::match_same_arms)]
+        match reason {
+            D::AdminRequested => SessionEnd::AdminReset,
+            D::RadiusDisconnect => SessionEnd::AdminReset,
+            D::ServerShutdown => SessionEnd::NasReboot,
         }
     }
 }
@@ -87,6 +148,19 @@ pub struct AcctSession {
     /// `Acct-Authentic` (RFC 2866 §5.6) — how the user was
     /// authenticated. Defaults to `RADIUS`.
     pub authentic: AcctAuthentic,
+    /// `Framed-IP-Address` (RFC 2865 §5.8) — the IPv4 the
+    /// authenticator handed out and we assigned to `pppN` / `tun0`.
+    /// Echoed in every accounting record for correlation.
+    pub framed_ip: Ipv4Addr,
+    /// `NAS-IP-Address` (RFC 2865 §5.4) — IPv4 of the local
+    /// interface the SSTP listener accepted on, when available.
+    /// Some deployments prefer the symbolic `NAS-Identifier` only;
+    /// the two attributes are independent and may both appear.
+    pub nas_ip: Option<Ipv4Addr>,
+    /// `NAS-Port` (RFC 2865 §5.5) — 32-bit virtual port number
+    /// uniquely identifying the session on this NAS. We use the
+    /// per-process session id, which is monotonically allocated.
+    pub nas_port: u32,
 }
 
 impl AcctSession {
@@ -94,20 +168,17 @@ impl AcctSession {
     /// Callers with a better identifier (e.g. SSTP correlation ID)
     /// should construct the struct directly.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(framed_ip: Ipv4Addr, nas_port: u32) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         Self {
             session_id: format!("{nanos:016x}"),
             authentic: AcctAuthentic(1), // RADIUS
+            framed_ip,
+            nas_ip: None,
+            nas_port,
         }
-    }
-}
-
-impl Default for AcctSession {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -251,11 +322,17 @@ impl AcctClient {
         counters: &AcctCounters,
         mut reply_rx: oneshot::Receiver<Vec<u8>>,
     ) -> Result<(), AcctError> {
-        let bytes = build(identifier, secret, ctx, session, event, counters)?;
-
+        // Anchor for `Acct-Delay-Time` (RFC 2866 §5.2). The first
+        // send carries delay = 0; each retry rebuilds the packet so
+        // the field reflects the elapsed wait. Rebuilding is cheap
+        // (a few hundred bytes) and gives the authenticator an
+        // accurate "how long has this event been buffered" hint.
+        let started = Instant::now();
         let mut wait = self.retry.initial_timeout;
         let attempts = self.retry.max_attempts.max(1);
         for attempt in 0..attempts {
+            let delay_secs = u32::try_from(started.elapsed().as_secs()).unwrap_or(u32::MAX);
+            let bytes = build(identifier, secret, ctx, session, event, counters, delay_secs)?;
             self.socket.send_to(&bytes, peer).await?;
             match timeout(wait, &mut reply_rx).await {
                 Ok(Ok(reply)) => {
@@ -308,31 +385,53 @@ fn build(
     session: &AcctSession,
     event: AcctEvent,
     counters: &AcctCounters,
+    delay_secs: u32,
 ) -> Result<Vec<u8>, AcctError> {
     let mut buf = PacketBuffer::new(Code::ACCOUNTING_REQUEST, identifier);
     buf.add(rfc::attrs::USER_NAME, ctx.username)?;
-    if let Some(csid) = ctx.calling_station_id {
-        buf.add(rfc::attrs::CALLING_STATION_ID, csid)?;
+    if let Some(nas_ip) = session.nas_ip {
+        buf.add(rfc::attrs::NAS_IP_ADDRESS, nas_ip)?;
     }
     if let Some(nid) = ctx.nas_identifier {
         buf.add(rfc::attrs::NAS_IDENTIFIER, nid)?;
     }
+    buf.add(rfc::attrs::NAS_PORT, session.nas_port)?;
+    buf.add(rfc::attrs::NAS_PORT_TYPE, NasPortType::VIRTUAL)?;
+    buf.add(rfc::attrs::SERVICE_TYPE, ServiceType::FRAMED_USER)?;
+    buf.add(rfc::attrs::FRAMED_PROTOCOL, FramedProtocol::PPP)?;
+    buf.add(rfc::attrs::FRAMED_IP_ADDRESS, session.framed_ip)?;
+    if let Some(csid) = ctx.calling_station_id {
+        buf.add(rfc::attrs::CALLING_STATION_ID, csid)?;
+    }
     buf.add(rfc::attrs::ACCT_STATUS_TYPE, event.status_type())?;
     buf.add(rfc::attrs::ACCT_AUTHENTIC, session.authentic)?;
     buf.add(rfc::attrs::ACCT_SESSION_ID, session.session_id.as_str())?;
+    if delay_secs != 0 {
+        buf.add(rfc::attrs::ACCT_DELAY_TIME, delay_secs)?;
+    }
 
     // RFC 2866 §5.7: Acct-Session-Time MUST NOT appear on Start.
     if !matches!(event, AcctEvent::Start) {
         buf.add(rfc::attrs::ACCT_SESSION_TIME, counters.session_time)?;
-        // Octet counters: 32-bit attributes; emit only the low 32 bits.
-        // (Acct-Input-Gigawords / Acct-Output-Gigawords carry the high
-        // bits — added when the codebase grows long-duration sessions.)
+        // Octet counters are 32-bit; the high 32 bits travel in the
+        // Acct-{Input,Output}-Gigawords companion attributes
+        // (RFC 2869 §5.1, §5.2). Emit the Gigaword attribute only
+        // when the high half is non-zero so we don't pad every
+        // packet with zeros.
         #[allow(clippy::cast_possible_truncation)]
-        let in_o = counters.input_octets as u32;
+        let in_lo = counters.input_octets as u32;
         #[allow(clippy::cast_possible_truncation)]
-        let out_o = counters.output_octets as u32;
-        buf.add(rfc::attrs::ACCT_INPUT_OCTETS, in_o)?;
-        buf.add(rfc::attrs::ACCT_OUTPUT_OCTETS, out_o)?;
+        let out_lo = counters.output_octets as u32;
+        let in_hi = u32::try_from(counters.input_octets >> 32).unwrap_or(u32::MAX);
+        let out_hi = u32::try_from(counters.output_octets >> 32).unwrap_or(u32::MAX);
+        buf.add(rfc::attrs::ACCT_INPUT_OCTETS, in_lo)?;
+        buf.add(rfc::attrs::ACCT_OUTPUT_OCTETS, out_lo)?;
+        if in_hi != 0 {
+            buf.add(rfc::attrs::ACCT_INPUT_GIGAWORDS, in_hi)?;
+        }
+        if out_hi != 0 {
+            buf.add(rfc::attrs::ACCT_OUTPUT_GIGAWORDS, out_hi)?;
+        }
         buf.add(rfc::attrs::ACCT_INPUT_PACKETS, counters.input_packets)?;
         buf.add(rfc::attrs::ACCT_OUTPUT_PACKETS, counters.output_packets)?;
     }
@@ -381,6 +480,9 @@ mod tests {
         AcctSession {
             session_id: "deadbeefcafebabe".into(),
             authentic: AcctAuthentic(1),
+            framed_ip: Ipv4Addr::new(10, 99, 0, 42),
+            nas_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            nas_port: 0xdead_beef,
         }
     }
 
@@ -394,6 +496,7 @@ mod tests {
             &session(),
             AcctEvent::Start,
             &AcctCounters::default(),
+            0,
         )
         .expect("build");
         assert_eq!(bytes[0], 4, "Accounting-Request");
@@ -407,10 +510,26 @@ mod tests {
         let want = authenticator::compute_zeroed_request(&probe, secret);
         assert_eq!(sent_auth, want);
 
-        // Start MUST NOT carry Acct-Session-Time.
+        // Start MUST NOT carry Acct-Session-Time and MUST carry the
+        // identifying / framing attributes.
+        let mut saw_nas_ip = false;
+        let mut saw_framed_ip = false;
+        let mut saw_service_type = false;
+        let mut saw_framed_proto = false;
+        let mut saw_nas_port_type = false;
         for raw in radius_tokio::attributes::iter(&bytes[20..]).filter_map(Result::ok) {
             assert_ne!(raw.attribute_type(), rfc::attrs::ACCT_SESSION_TIME.code);
+            assert_ne!(raw.attribute_type(), rfc::attrs::ACCT_DELAY_TIME.code);
+            match raw.attribute_type() {
+                4 => saw_nas_ip = true,
+                8 => saw_framed_ip = true,
+                6 => saw_service_type = true,
+                7 => saw_framed_proto = true,
+                61 => saw_nas_port_type = true,
+                _ => {}
+            }
         }
+        assert!(saw_nas_ip && saw_framed_ip && saw_service_type && saw_framed_proto && saw_nas_port_type);
     }
 
     #[test]
@@ -430,12 +549,15 @@ mod tests {
             &session(),
             AcctEvent::Stop(AcctTerminateCause::USER_REQUEST),
             &counters,
+            0,
         )
         .expect("build");
 
         let mut saw_status = false;
         let mut saw_cause = false;
         let mut saw_time = false;
+        let mut saw_in_giga = false;
+        let mut saw_out_giga = false;
         for raw in radius_tokio::attributes::iter(&bytes[20..]).filter_map(Result::ok) {
             match raw.attribute_type() {
                 40 => {
@@ -450,10 +572,108 @@ mod tests {
                     saw_time = true;
                     assert_eq!(raw.value(), 600u32.to_be_bytes());
                 }
+                52 => saw_in_giga = true,
+                53 => saw_out_giga = true,
                 _ => {}
             }
         }
         assert!(saw_status && saw_cause && saw_time);
+        // Counters under 4 GiB → no Gigawords companion attrs.
+        assert!(!saw_in_giga && !saw_out_giga);
+    }
+
+    #[test]
+    fn gigawords_emitted_when_high32_nonzero() {
+        let counters = AcctCounters {
+            session_time: 86_400,
+            input_octets: (3u64 << 32) | 7, // 3 Gigawords + 7 octets
+            output_octets: (5u64 << 32) | 11,
+            input_packets: 0,
+            output_packets: 0,
+        };
+        let bytes = build(
+            1,
+            b"sssh",
+            &ctx(),
+            &session(),
+            AcctEvent::InterimUpdate,
+            &counters,
+            0,
+        )
+        .expect("build");
+        let mut in_giga = None;
+        let mut out_giga = None;
+        let mut in_oct = None;
+        let mut out_oct = None;
+        for raw in radius_tokio::attributes::iter(&bytes[20..]).filter_map(Result::ok) {
+            match raw.attribute_type() {
+                42 => in_oct = Some(u32::from_be_bytes(raw.value().try_into().unwrap())),
+                43 => out_oct = Some(u32::from_be_bytes(raw.value().try_into().unwrap())),
+                52 => in_giga = Some(u32::from_be_bytes(raw.value().try_into().unwrap())),
+                53 => out_giga = Some(u32::from_be_bytes(raw.value().try_into().unwrap())),
+                _ => {}
+            }
+        }
+        assert_eq!(in_oct, Some(7));
+        assert_eq!(out_oct, Some(11));
+        assert_eq!(in_giga, Some(3));
+        assert_eq!(out_giga, Some(5));
+    }
+
+    #[test]
+    fn delay_time_emitted_only_when_nonzero() {
+        let bytes_zero = build(
+            1,
+            b"sssh",
+            &ctx(),
+            &session(),
+            AcctEvent::Start,
+            &AcctCounters::default(),
+            0,
+        )
+        .expect("build");
+        let bytes_delayed = build(
+            2,
+            b"sssh",
+            &ctx(),
+            &session(),
+            AcctEvent::Start,
+            &AcctCounters::default(),
+            5,
+        )
+        .expect("build");
+        let saw_delay = |bytes: &[u8]| {
+            radius_tokio::attributes::iter(&bytes[20..])
+                .filter_map(Result::ok)
+                .any(|a| a.attribute_type() == rfc::attrs::ACCT_DELAY_TIME.code)
+        };
+        assert!(!saw_delay(&bytes_zero));
+        assert!(saw_delay(&bytes_delayed));
+    }
+
+    #[test]
+    fn session_end_maps_to_terminate_cause() {
+        use crate::session::DisconnectReason;
+        assert_eq!(
+            SessionEnd::UserRequest.to_terminate_cause(),
+            AcctTerminateCause::USER_REQUEST
+        );
+        assert_eq!(
+            SessionEnd::LostCarrier.to_terminate_cause(),
+            AcctTerminateCause::LOST_CARRIER
+        );
+        assert_eq!(
+            SessionEnd::from(DisconnectReason::AdminRequested),
+            SessionEnd::AdminReset
+        );
+        assert_eq!(
+            SessionEnd::from(DisconnectReason::RadiusDisconnect),
+            SessionEnd::AdminReset
+        );
+        assert_eq!(
+            SessionEnd::from(DisconnectReason::ServerShutdown),
+            SessionEnd::NasReboot
+        );
     }
 
     #[tokio::test]

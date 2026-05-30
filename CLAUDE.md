@@ -801,12 +801,20 @@ PR with tests where the surface allows. Check items off as they merge.
       RADIUS server — we just shuttle EAP-Message bytes between the
       PPP peer and the authenticator.
 - [x] Accounting: Start / Interim-Update / Stop with byte counters
-      pulled from the kernel PPP unit, not the userspace path.
+      pulled from the kernel netdev (`pppN` for kmod path, `tun0`
+      for TUN fallback) via netlink `IFLA_STATS64`.
       Implemented in `src/auth/accounting.rs` as a tokio-UDP
       `AcctClient` with `(peer, identifier)` correlation and
-      RFC 5080 retry semantics. Byte / packet counters are supplied
-      by the caller; M6 will sample them via `rtnetlink`
-      `IFLA_STATS64` against `pppN`.
+      RFC 5080 retry semantics; the per-session lifecycle hookup
+      is in `src/session.rs` with stats sampling via
+      `kppp::netlink::RtNetlink::link_stats64` against
+      `KpppSession::ifindex()`. Cross-runtime dispatch through
+      `src/auth/acct_bridge.rs` (mirrors `AuthBridge` but is
+      fire-and-forget — accounting failure never affects the
+      session). Stop dedup is RAII via `AcctStopGuard`; cause
+      mapping (`DisconnectReason → Acct-Terminate-Cause`) lives
+      in `accounting::SessionEnd`. Interim cadence is hardcoded
+      at 60s (TODO: honour `Acct-Interim-Interval` VSA).
 - [x] CoA / Disconnect-Request receiver → session teardown via MPSC
       channel to the owning I/O worker.
       v0.1: parser + responder live in `src/auth/coa.rs`

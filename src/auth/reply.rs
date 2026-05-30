@@ -51,6 +51,22 @@ pub fn decode_accept(
 
     let shaping = mikrotik_rate_limit(attrs);
 
+    // MS-CHAP2-Success (RFC 2548 §2.3.3) carries the
+    // Authenticator-Response the peer expects to see echoed inside
+    // the PPP CHAP Success packet ([RFC 2759] §6). Wire format is
+    // `Ident(1) || S=<40-hex>...`; we strip the leading identifier
+    // byte so the driver can splice the remainder verbatim into the
+    // CHAP body.
+    let mschap2_success =
+        radius_tokio::attributes::first_vsa(attrs, microsoft::attrs::MS_CHAP2_SUCCESS)
+            .map(|raw| {
+                if raw.is_empty() {
+                    Vec::new()
+                } else {
+                    raw[1..].to_vec()
+                }
+            });
+
     Ok(AuthAccept {
         framed_ip,
         framed_netmask,
@@ -61,6 +77,7 @@ pub fn decode_accept(
         secondary_nbns,
         mppe_send_key,
         mppe_recv_key,
+        mschap2_success,
         shaping,
     })
 }
@@ -69,6 +86,23 @@ pub fn decode_accept(
 #[must_use]
 pub fn reject_reason(attrs: &[u8]) -> Option<String> {
     radius_tokio::attributes::first(attrs, rfc::attrs::REPLY_MESSAGE).map(str::to_owned)
+}
+
+/// `MS-CHAP-Error` (RFC 2548 §2.1.2) from an Access-Reject, if any.
+/// Wire format is `Ident(1) || "E=...R=...C=...V=...M=..."`. The
+/// leading identifier byte is stripped; the remainder is the
+/// payload the PPP CHAP Failure packet should carry verbatim
+/// ([RFC 2759] §7).
+#[must_use]
+pub fn mschap_error(attrs: &[u8]) -> Option<String> {
+    radius_tokio::attributes::first_vsa(attrs, microsoft::attrs::MS_CHAP_ERROR).map(|s| {
+        let bytes = s.as_bytes();
+        if bytes.is_empty() {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&bytes[1..]).into_owned()
+        }
+    })
 }
 
 /// Decode a `Mikrotik-Rate-Limit` VSA (vendor 14988, attr 8) into a

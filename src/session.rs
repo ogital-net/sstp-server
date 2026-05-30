@@ -28,6 +28,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
+use crate::auth::acct_bridge::AcctBridge;
 use crate::auth::bridge::AuthBridge;
 use crate::cli::DataPathMode;
 use crate::crypto::tls::{SslContext, TlsStream};
@@ -207,6 +208,7 @@ pub async fn run(
     mut drain_rx: broadcast::Receiver<()>,
     tls_ctx: SslContext,
     auth_bridge: AuthBridge,
+    acct_bridge: Option<AcctBridge>,
     local_ip: Ipv4Addr,
     auth_method: AuthMethod,
     data_path: DataPathMode,
@@ -305,6 +307,7 @@ pub async fn run(
         control_rx,
         drain_rx,
         auth_bridge,
+        acct_bridge,
         cert_hash,
         local_ip,
         auth_method,
@@ -334,6 +337,7 @@ async fn drive_sstp(
     mut control_rx: mpsc::Receiver<ControlCommand>,
     mut drain_rx: broadcast::Receiver<()>,
     auth_bridge: AuthBridge,
+    acct_bridge: Option<AcctBridge>,
     cert_hash: [u8; 32],
     local_ip: Ipv4Addr,
     auth_method: AuthMethod,
@@ -387,6 +391,41 @@ async fn drive_sstp(
     let auth = AuthCtx {
         peer,
         bridge: &auth_bridge,
+        acct: acct_bridge.as_ref(),
+    };
+
+    // Accounting state: populated when IPCP converges and the
+    // kernel netdev is up. Until then, the [`AcctStopGuard`]'s
+    // drop path is a no-op (no Start was ever emitted).
+    let mut acct_state: Option<AcctState> = None;
+    // Captured at PAP/CHAP/MS-CHAPv2 Accept time, drained at
+    // [`PppEvent::NetworkUp`] when the AcctState is finalized.
+    let mut pending_username: Option<String> = None;
+    // Read by [`AcctStopGuard::drop`] to choose the
+    // `Acct-Terminate-Cause`. Default `LostCarrier` covers every
+    // unscheduled exit (peer-FIN, TLS error, IPCP failure); the
+    // few sites with a more specific cause set this explicitly
+    // before exiting.
+    let acct_cause = std::cell::Cell::new(crate::auth::accounting::SessionEnd::LostCarrier);
+    // Periodic Acct-Status-Type=Interim-Update. Configurable via
+    // RADIUS Acct-Interim-Interval VSA is a v0.x TODO; for now
+    // hardcoded at 60s. First tick fires at `now + 60s` (rather
+    // than immediately) so we don't race the Start record.
+    let acct_interim_period = std::time::Duration::from_secs(60);
+    let mut acct_interim_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + acct_interim_period,
+        acct_interim_period,
+    );
+    acct_interim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // The Drop-guard MUST be declared after the locals it points
+    // at — Rust drops in reverse declaration order, so this guard
+    // drops first (while the borrowed locals are still alive).
+    let _acct_stop_guard = AcctStopGuard {
+        bridge: acct_bridge.as_ref().map(std::ptr::from_ref),
+        state_ptr: &raw mut acct_state,
+        cause_ptr: &raw const acct_cause,
+        peer,
     };
 
     // Spec entry point: `New HTTPS Connection Received` (§3.3.2.1).
@@ -405,6 +444,8 @@ async fn drive_sstp(
         &mut kppp,
         data_path,
             &mut pending_shaping,
+            &mut pending_username,
+            &mut acct_state,
     )
     .await
     {
@@ -491,6 +532,7 @@ async fn drive_sstp(
                 biased;
                 _ = drain_rx.recv() => DriverEvent::Drain,
                 c = control_rx.recv() => DriverEvent::Control(c),
+                _ = acct_interim_tick.tick() => DriverEvent::AcctInterim,
                 () = sstp_timer_fut => DriverEvent::SstpTimer,
                 () = ppp_timer_fut => DriverEvent::PppTimer,
                 r = kppp_read_fut => DriverEvent::KpppRead(r),
@@ -534,6 +576,7 @@ async fn drive_sstp(
         match outcome {
             DriverEvent::Drain => {
                 info!(%id, "session draining (server shutdown)");
+                acct_cause.set(crate::auth::accounting::SessionEnd::NasReboot);
                 let out = ssm.on_higher_layer_disconnect(&mut tx_buf);
                 if !handle_sstp_step(
                     id,
@@ -549,6 +592,8 @@ async fn drive_sstp(
                     &mut kppp,
                     data_path,
                                     &mut pending_shaping,
+                                    &mut pending_username,
+                                    &mut acct_state,
                 )
                 .await
                 {
@@ -557,6 +602,7 @@ async fn drive_sstp(
             }
             DriverEvent::Control(Some(ControlCommand::Disconnect(reason))) => {
                 info!(%id, ?reason, "session control: disconnect");
+                acct_cause.set(crate::auth::accounting::SessionEnd::from(reason));
                 let out = ssm.on_higher_layer_disconnect(&mut tx_buf);
                 if !handle_sstp_step(
                     id,
@@ -572,6 +618,8 @@ async fn drive_sstp(
                     &mut kppp,
                     data_path,
                                     &mut pending_shaping,
+                                    &mut pending_username,
+                                    &mut acct_state,
                 )
                 .await
                 {
@@ -581,6 +629,23 @@ async fn drive_sstp(
             DriverEvent::Control(None) => {
                 debug!(%id, "control channel closed by all senders");
                 return;
+            }
+            DriverEvent::AcctInterim => {
+                if let (Some(state), Some(bridge)) = (acct_state.as_mut(), auth.acct) {
+                    let counters = sample_acct_counters(
+                        state.ifindex,
+                        state.started,
+                        &state.last_counters,
+                    );
+                    state.last_counters = counters.clone();
+                    bridge.submit(
+                        state.username.clone(),
+                        peer,
+                        state.session.clone(),
+                        crate::auth::accounting::AcctEvent::InterimUpdate,
+                        counters,
+                    );
+                }
             }
             DriverEvent::SstpTimer => {
                 let (which, _) = sstp_timer
@@ -602,6 +667,8 @@ async fn drive_sstp(
                     &mut kppp,
                     data_path,
                                     &mut pending_shaping,
+                                    &mut pending_username,
+                                    &mut acct_state,
                 )
                 .await
                 {
@@ -627,6 +694,8 @@ async fn drive_sstp(
                         &mut kppp,
                         data_path,
                                             &mut pending_shaping,
+                                            &mut pending_username,
+                                            &mut acct_state,
                     )
                     .await
                     {
@@ -728,6 +797,8 @@ async fn drive_sstp(
                                 &mut kppp,
                                 data_path,
                                                             &mut pending_shaping,
+                                                            &mut pending_username,
+                                                            &mut acct_state,
                             )
                             .await
                             {
@@ -806,6 +877,8 @@ async fn drive_sstp(
                                 &mut kppp,
                                 data_path,
                                                             &mut pending_shaping,
+                                                            &mut pending_username,
+                                                            &mut acct_state,
                             )
                             .await
                             {
@@ -836,6 +909,8 @@ async fn drive_sstp(
                                     &mut kppp,
                                     data_path,
                                                                     &mut pending_shaping,
+                                                                    &mut pending_username,
+                                                                    &mut acct_state,
                                 )
                                 .await
                                 {
@@ -878,6 +953,8 @@ async fn drive_sstp(
                                         &mut kppp,
                                         data_path,
                                                                             &mut pending_shaping,
+                                                                            &mut pending_username,
+                                                                            &mut acct_state,
                                     )
                                     .await
                                     {
@@ -907,6 +984,9 @@ enum DriverEvent {
     SstpTimer,
     PppTimer,
     KpppRead(std::io::Result<usize>),
+    /// Periodic 60s tick that emits a RADIUS
+    /// `Acct-Status-Type=Interim-Update`.
+    AcctInterim,
     /// Kmod session fd became readable; the select arm body has
     /// already drained all queued events to `EAGAIN` and cleared
     /// readiness on the guard.
@@ -939,6 +1019,8 @@ async fn handle_sstp_step(
     kppp: &mut Option<KpppSession>,
     data_path: DataPathMode,
     pending_shaping: &mut Option<crate::shape::ShapingPolicy>,
+    pending_username: &mut Option<String>,
+    acct_state: &mut Option<AcctState>,
 ) -> bool {
     let outcome = apply_step(id, tx, out, tx_buf, sstp_timer).await;
     if !outcome.keep_going {
@@ -965,6 +1047,8 @@ async fn handle_sstp_step(
             kppp,
             data_path,
             pending_shaping,
+            pending_username,
+            acct_state,
         )
         .await
         {
@@ -994,6 +1078,8 @@ async fn handle_ppp_step(
     kppp: &mut Option<KpppSession>,
     data_path: DataPathMode,
     pending_shaping: &mut Option<crate::shape::ShapingPolicy>,
+    pending_username: &mut Option<String>,
+    acct_state: &mut Option<AcctState>,
 ) -> bool {
     use tokio::time::{Instant, sleep_until};
 
@@ -1031,7 +1117,7 @@ async fn handle_ppp_step(
                 info!(%id, user = %user, "PAP credentials received; dispatching to RADIUS");
                 let outcome = auth
                     .bridge
-                    .submit_pap(user.clone(), password, auth.peer, None)
+                    .submit_pap(user.clone(), password, auth.peer)
                     .await;
                 let crate::auth::bridge::PapOutcome { verdict, shaping } = outcome;
                 match &verdict {
@@ -1041,6 +1127,9 @@ async fn handle_ppp_step(
                         // PPP unit is up; applied alongside
                         // bring-up at `NetworkUp` below.
                         *pending_shaping = shaping;
+                        // Captured for accounting; finalized into
+                        // an `AcctState` once the netdev is up.
+                        *pending_username = Some(user.clone());
                     }
                     AuthVerdict::Reject { message } => {
                         let msg = String::from_utf8_lossy(message);
@@ -1061,13 +1150,14 @@ async fn handle_ppp_step(
                 info!(%id, user = %user, chap_id, "CHAP-MD5 response received; dispatching to RADIUS");
                 let outcome = auth
                     .bridge
-                    .submit_chap(user.clone(), chap_id, response, challenge, auth.peer, None)
+                    .submit_chap(user.clone(), chap_id, response, challenge, auth.peer)
                     .await;
                 let crate::auth::bridge::ChapOutcome { verdict, shaping } = outcome;
                 match &verdict {
                     AuthVerdict::Accept { addrs } => {
                         info!(%id, user = %user, ip = ?addrs.ip, shaping = ?shaping, "RADIUS Access-Accept (CHAP)");
                         *pending_shaping = shaping;
+                        *pending_username = Some(user.clone());
                     }
                     AuthVerdict::Reject { message } => {
                         let msg = String::from_utf8_lossy(message);
@@ -1075,6 +1165,52 @@ async fn handle_ppp_step(
                     }
                 }
                 step = ppp.on_auth_result(verdict);
+                continue;
+            }
+            Some(PppEvent::NeedMsChapV2Auth {
+                username,
+                chap_id,
+                authenticator_challenge,
+                peer_challenge,
+                nt_response,
+                flags,
+            }) => {
+                let user = String::from_utf8_lossy(&username).into_owned();
+                info!(%id, user = %user, chap_id, "MS-CHAPv2 response received; dispatching to RADIUS");
+                let outcome = auth
+                    .bridge
+                    .submit_mschapv2(
+                        user.clone(),
+                        chap_id,
+                        authenticator_challenge,
+                        peer_challenge,
+                        nt_response,
+                        flags,
+                        auth.peer,
+                    )
+                    .await;
+                let crate::auth::bridge::MsChapOutcome {
+                    verdict,
+                    shaping,
+                    auth_response,
+                    error_string,
+                } = outcome;
+                match &verdict {
+                    AuthVerdict::Accept { addrs } => {
+                        info!(%id, user = %user, ip = ?addrs.ip, shaping = ?shaping, "RADIUS Access-Accept (MS-CHAPv2)");
+                        *pending_shaping = shaping;
+                        *pending_username = Some(user.clone());
+                    }
+                    AuthVerdict::Reject { message } => {
+                        let msg = String::from_utf8_lossy(message);
+                        info!(%id, user = %user, reason = %msg, "RADIUS Access-Reject (MS-CHAPv2)");
+                    }
+                }
+                step = ppp.on_mschap_result(
+                    verdict,
+                    auth_response.as_deref(),
+                    error_string.as_deref(),
+                );
                 continue;
             }
             Some(PppEvent::NetworkUp(addrs)) => {
@@ -1228,6 +1364,49 @@ async fn handle_ppp_step(
                                 }
                             }
                             *kppp = Some(k);
+
+                            // Finalize accounting state and emit
+                            // the Start record. Skipped silently
+                            // when no `--acct` server is configured
+                            // or when no auth phase ran (anonymous
+                            // negotiation paths, currently
+                            // unreachable but handled defensively).
+                            if let (Some(user), Some(bridge)) =
+                                (pending_username.take(), auth.acct)
+                            {
+                                let kppp_ref = kppp.as_ref().expect("just inserted");
+                                let session = crate::auth::accounting::AcctSession::new(
+                                    peer_ip,
+                                    // Acct-Session-Id derives from the
+                                    // SessionId; NAS-Port is the low
+                                    // 32 bits (RFC 2865 §5.5 only
+                                    // requires uniqueness within a
+                                    // NAS reboot, and the SessionId
+                                    // counter takes ~136 years to
+                                    // wrap u32 at 1Hz).
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    {
+                                        id.as_u64() as u32
+                                    },
+                                );
+                                let started = std::time::Instant::now();
+                                let counters =
+                                    crate::auth::accounting::AcctCounters::default();
+                                bridge.submit(
+                                    user.clone(),
+                                    auth.peer,
+                                    session.clone(),
+                                    crate::auth::accounting::AcctEvent::Start,
+                                    counters.clone(),
+                                );
+                                *acct_state = Some(AcctState {
+                                    username: user,
+                                    ifindex: kppp_ref.ifindex(),
+                                    session,
+                                    started,
+                                    last_counters: counters,
+                                });
+                            }
                         }
                         Err(e) => {
                             warn!(%id, error = %e, "kernel PPP unit bring-up failed; tearing session down");
@@ -1254,6 +1433,119 @@ async fn handle_ppp_step(
 struct AuthCtx<'a> {
     peer: SocketAddr,
     bridge: &'a AuthBridge,
+    /// Optional accounting bridge — `None` when no `--acct` server
+    /// is configured. Cloning the whole `AcctBridge` per session
+    /// would be cheap (it's just an `mpsc::Sender`) but a borrow
+    /// keeps the `AuthCtx` allocation footprint flat.
+    acct: Option<&'a AcctBridge>,
+}
+
+/// Per-session accounting state, populated once IPCP converges and
+/// the kernel netdev is up. Carries everything the dispatcher needs
+/// to emit Interim / Stop records without re-deriving it.
+///
+/// Construction is "all or nothing": if any required input (the
+/// authenticated username, framed IP, kernel ifindex) is missing,
+/// no `AcctState` is constructed and accounting is silently skipped
+/// for the session.
+struct AcctState {
+    /// `User-Name` from the inbound auth response.
+    username: String,
+    /// Kernel netdev ifindex (`pppN` or `tun0`) used to sample
+    /// `IFLA_STATS64` for Interim/Stop counters.
+    ifindex: u32,
+    /// Snapshot of the [`AcctSession`] identity attributes
+    /// (Acct-Session-Id, Framed-IP-Address, NAS-Port) — immutable
+    /// for the session's lifetime.
+    session: crate::auth::accounting::AcctSession,
+    /// Wall-clock instant of the Start record. Used to compute
+    /// `Acct-Session-Time` for subsequent Interim/Stop records.
+    started: std::time::Instant,
+    /// Last successfully sampled counters, kept so a Stop record
+    /// can be emitted with the most recent stats even when the
+    /// final netlink sample fails.
+    last_counters: crate::auth::accounting::AcctCounters,
+}
+
+/// Sample `IFLA_STATS64` for `ifindex` and project to
+/// [`AcctCounters`]. Returns the previous best-known counters
+/// (passed in as `fallback`) on netlink failure so Interim/Stop
+/// records still go out with monotonically-non-decreasing values.
+fn sample_acct_counters(
+    ifindex: u32,
+    started: std::time::Instant,
+    fallback: &crate::auth::accounting::AcctCounters,
+) -> crate::auth::accounting::AcctCounters {
+    use crate::auth::accounting::AcctCounters;
+    use crate::kppp::netlink::RtNetlink;
+    // `Acct-Session-Time` is a u32 of seconds; 136 years before
+    // wrap, so the cast is safe in practice.
+    #[allow(clippy::cast_possible_truncation)]
+    let session_time = started.elapsed().as_secs() as u32;
+    match RtNetlink::open().and_then(|mut nl| nl.link_stats64(ifindex)) {
+        Ok(stats) => AcctCounters {
+            session_time,
+            input_octets: stats.rx_bytes,
+            output_octets: stats.tx_bytes,
+            // RFC 2866 packet attrs are u32; if a session ever
+            // wraps 4G packets (~30 days at 1.5 Mpps line rate)
+            // the wrap is silent and matches NAS-vendor practice.
+            #[allow(clippy::cast_possible_truncation)]
+            input_packets: stats.rx_packets as u32,
+            #[allow(clippy::cast_possible_truncation)]
+            output_packets: stats.tx_packets as u32,
+        },
+        Err(e) => {
+            warn!(ifindex, error = ?e, "IFLA_STATS64 sample failed; reusing last counters");
+            AcctCounters {
+                session_time,
+                ..*fallback
+            }
+        }
+    }
+}
+
+/// RAII Stop emitter: on drop, fires a single
+/// [`AcctEvent::Stop`] record for the session if Start has been
+/// emitted (i.e. `state` is `Some`). Holds raw pointers into
+/// [`drive_sstp`]'s locals; sound because the guard is the
+/// last-declared local and therefore drops first while those
+/// locals are still alive, and the surrounding task is single-
+/// threaded (`!Send`) so there is no aliasing race.
+struct AcctStopGuard {
+    bridge: Option<*const AcctBridge>,
+    /// Pointer to the [`drive_sstp`] local `acct_state`. Read
+    /// (via `*mut::take`) only at drop time.
+    state_ptr: *mut Option<AcctState>,
+    /// Pointer to the [`drive_sstp`] local `acct_cause`. Read
+    /// (`Cell::get`) at drop time.
+    cause_ptr: *const std::cell::Cell<crate::auth::accounting::SessionEnd>,
+    peer: SocketAddr,
+}
+
+impl Drop for AcctStopGuard {
+    fn drop(&mut self) {
+        // SAFETY: the pointers reference locals in `drive_sstp`'s
+        // stack frame; this guard is declared after those locals
+        // and therefore drops *before* them. The session task is
+        // single-threaded (`tokio::task::spawn_local`), so no
+        // other code is executing in parallel.
+        let state = unsafe { (*self.state_ptr).take() };
+        let cause = unsafe { (*self.cause_ptr).get() };
+        let Some(state) = state else { return };
+        let Some(bridge) = self.bridge else { return };
+        // SAFETY: same justification as above; the AcctBridge lives
+        // in the caller's stack via the borrowed `acct_bridge` arg.
+        let bridge = unsafe { &*bridge };
+        let counters = sample_acct_counters(state.ifindex, state.started, &state.last_counters);
+        bridge.submit(
+            state.username,
+            self.peer,
+            state.session,
+            crate::auth::accounting::AcctEvent::Stop(cause.to_terminate_cause()),
+            counters,
+        );
+    }
 }
 
 /// Wrap a raw PPP frame in an SSTP data packet and write it to TLS.

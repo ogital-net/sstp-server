@@ -41,10 +41,6 @@ pub struct PapJob {
     pub password: Vec<u8>,
     /// SSTP peer's source address — used as `Calling-Station-Id`.
     pub peer: SocketAddr,
-    /// Optional `NAS-Identifier`. Defaults to nothing; deployments
-    /// that need a stable identifier will wire this through CLI in
-    /// a later milestone.
-    pub nas_identifier: Option<String>,
     /// Verdict channel. The dispatcher always sends exactly one
     /// reply on this; a dropped sender surfaces as a Reject.
     pub reply: oneshot::Sender<PapOutcome>,
@@ -78,7 +74,6 @@ pub struct ChapJob {
     pub response: [u8; 16],
     pub challenge: Vec<u8>,
     pub peer: SocketAddr,
-    pub nas_identifier: Option<String>,
     pub reply: oneshot::Sender<ChapOutcome>,
 }
 
@@ -91,9 +86,47 @@ pub struct ChapOutcome {
     pub shaping: Option<ShapingPolicy>,
 }
 
+/// An MS-CHAPv2 response to be verified against RADIUS
+/// (RFC 2548 §2.3.2 / [RFC 2759]).
+#[derive(Debug)]
+pub struct MsChapJob {
+    pub username: String,
+    /// CHAP packet identifier from the peer's `Response`.
+    pub chap_id: u8,
+    /// The 16-byte Authenticator-Challenge we sent in the CHAP
+    /// `Challenge` packet.
+    pub authenticator_challenge: [u8; 16],
+    /// Peer-Challenge from the peer's MS-CHAPv2 Response field.
+    pub peer_challenge: [u8; 16],
+    /// 24-byte NT-Response from the peer's MS-CHAPv2 Response.
+    pub nt_response: [u8; 24],
+    /// MS-CHAPv2 Flags byte (typically 0).
+    pub flags: u8,
+    pub peer: SocketAddr,
+    pub reply: oneshot::Sender<MsChapOutcome>,
+}
+
+/// Result of an MS-CHAPv2 RADIUS round-trip.
+///
+/// In addition to [`AuthVerdict`] + shaping, an Accept carries the
+/// `MS-CHAP2-Success` Authenticator-Response body the driver must
+/// echo verbatim in the PPP CHAP `Success` packet ([RFC 2759] §6).
+/// A Reject carries an `MS-CHAP-Error`-formatted body when the
+/// authenticator supplied one, otherwise [`None`] and the driver
+/// synthesises a minimal `E=691 R=0 V=3 M=...` payload from
+/// `verdict`'s reject message.
+#[derive(Debug)]
+pub struct MsChapOutcome {
+    pub verdict: AuthVerdict,
+    pub shaping: Option<ShapingPolicy>,
+    pub auth_response: Option<Vec<u8>>,
+    pub error_string: Option<String>,
+}
+
 enum Job {
     Pap(PapJob),
     Chap(ChapJob),
+    MsChap(MsChapJob),
 }
 
 /// Cloneable handle to the auth dispatcher. Cheap to clone — wraps
@@ -138,6 +171,7 @@ impl AuthBridge {
         handle: &Handle,
         bind_addr: SocketAddr,
         servers: Vec<(SocketAddr, Arc<[u8]>)>,
+        nas_identifier: Option<Arc<str>>,
     ) -> std::io::Result<Self> {
         assert!(
             !servers.is_empty(),
@@ -151,10 +185,12 @@ impl AuthBridge {
             while let Some(job) = rx.recv().await {
                 let client = Arc::clone(&client);
                 let servers = Arc::clone(&servers);
+                let nas = nas_identifier.clone();
                 tokio::spawn(async move {
                     match job {
-                        Job::Pap(j) => run_pap(client, servers, j).await,
-                        Job::Chap(j) => run_chap(client, servers, j).await,
+                        Job::Pap(j) => run_pap(client, servers, nas, j).await,
+                        Job::Chap(j) => run_chap(client, servers, nas, j).await,
+                        Job::MsChap(j) => run_mschapv2(client, servers, nas, j).await,
                     }
                 });
             }
@@ -173,14 +209,12 @@ impl AuthBridge {
         username: String,
         password: Vec<u8>,
         peer: SocketAddr,
-        nas_identifier: Option<String>,
     ) -> PapOutcome {
         let (reply, rx) = oneshot::channel();
         let job = Job::Pap(PapJob {
             username,
             password,
             peer,
-            nas_identifier,
             reply,
         });
         if self.tx.send(job).await.is_err() {
@@ -208,7 +242,6 @@ impl AuthBridge {
         response: [u8; 16],
         challenge: Vec<u8>,
         peer: SocketAddr,
-        nas_identifier: Option<String>,
     ) -> ChapOutcome {
         let (reply, rx) = oneshot::channel();
         let job = Job::Chap(ChapJob {
@@ -217,7 +250,6 @@ impl AuthBridge {
             response,
             challenge,
             peer,
-            nas_identifier,
             reply,
         });
         if self.tx.send(job).await.is_err() {
@@ -235,14 +267,63 @@ impl AuthBridge {
             shaping: None,
         })
     }
+
+    /// Submit an MS-CHAPv2 response. Same backpressure / drop
+    /// semantics as [`AuthBridge::submit_pap`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_mschapv2(
+        &self,
+        username: String,
+        chap_id: u8,
+        authenticator_challenge: [u8; 16],
+        peer_challenge: [u8; 16],
+        nt_response: [u8; 24],
+        flags: u8,
+        peer: SocketAddr,
+    ) -> MsChapOutcome {
+        let (reply, rx) = oneshot::channel();
+        let job = Job::MsChap(MsChapJob {
+            username,
+            chap_id,
+            authenticator_challenge,
+            peer_challenge,
+            nt_response,
+            flags,
+            peer,
+            reply,
+        });
+        if self.tx.send(job).await.is_err() {
+            return MsChapOutcome {
+                verdict: AuthVerdict::Reject {
+                    message: b"auth dispatcher unavailable".to_vec(),
+                },
+                shaping: None,
+                auth_response: None,
+                error_string: None,
+            };
+        }
+        rx.await.unwrap_or_else(|_| MsChapOutcome {
+            verdict: AuthVerdict::Reject {
+                message: b"auth dispatcher dropped reply".to_vec(),
+            },
+            shaping: None,
+            auth_response: None,
+            error_string: None,
+        })
+    }
 }
 
-async fn run_pap(client: Arc<RadiusClient>, servers: Arc<[(SocketAddr, Arc<[u8]>)]>, job: PapJob) {
+async fn run_pap(
+    client: Arc<RadiusClient>,
+    servers: Arc<[(SocketAddr, Arc<[u8]>)]>,
+    nas_identifier: Option<Arc<str>>,
+    job: PapJob,
+) {
     let peer_ip = job.peer.ip().to_string();
     let ctx = AccessRequestCtx {
         username: &job.username,
         calling_station_id: Some(&peer_ip),
-        nas_identifier: job.nas_identifier.as_deref(),
+        nas_identifier: nas_identifier.as_deref(),
     };
 
     let mut last_transport_err: Option<String> = None;
@@ -289,13 +370,14 @@ async fn run_pap(client: Arc<RadiusClient>, servers: Arc<[(SocketAddr, Arc<[u8]>
 async fn run_chap(
     client: Arc<RadiusClient>,
     servers: Arc<[(SocketAddr, Arc<[u8]>)]>,
+    nas_identifier: Option<Arc<str>>,
     job: ChapJob,
 ) {
     let peer_ip = job.peer.ip().to_string();
     let ctx = AccessRequestCtx {
         username: &job.username,
         calling_station_id: Some(&peer_ip),
-        nas_identifier: job.nas_identifier.as_deref(),
+        nas_identifier: nas_identifier.as_deref(),
     };
 
     let mut last_transport_err: Option<String> = None;
@@ -344,6 +426,101 @@ async fn run_chap(
             message: msg.into_bytes(),
         },
         shaping: None,
+    });
+}
+
+async fn run_mschapv2(
+    client: Arc<RadiusClient>,
+    servers: Arc<[(SocketAddr, Arc<[u8]>)]>,
+    nas_identifier: Option<Arc<str>>,
+    job: MsChapJob,
+) {
+    use radius_tokio::client::AccessOutcome;
+
+    let peer_ip = job.peer.ip().to_string();
+    let ctx = AccessRequestCtx {
+        username: &job.username,
+        calling_station_id: Some(&peer_ip),
+        nas_identifier: nas_identifier.as_deref(),
+    };
+
+    let mut last_transport_err: Option<String> = None;
+    for (addr, secret) in servers.iter() {
+        let outcome = client
+            .access_request(*addr, secret, |buf, _ra| {
+                crate::auth::request::apply_mschapv2(
+                    buf,
+                    &ctx,
+                    &job.authenticator_challenge,
+                    job.chap_id,
+                    &job.peer_challenge,
+                    &job.nt_response,
+                    job.flags,
+                )
+            })
+            .await;
+        match outcome {
+            Ok(AccessOutcome::Accept {
+                authenticator,
+                attributes,
+            }) => {
+                match crate::auth::reply::decode_accept(&attributes, secret, &authenticator) {
+                    Ok(accept) => {
+                        let shaping = accept.shaping;
+                        let auth_response = accept.mschap2_success.clone();
+                        let _ = job.reply.send(MsChapOutcome {
+                            verdict: AuthVerdict::Accept {
+                                addrs: project_addrs(&accept),
+                            },
+                            shaping,
+                            auth_response,
+                            error_string: None,
+                        });
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(radius = %addr, user = %job.username, error = %e, "MS-CHAPv2 Access-Accept malformed; trying next server");
+                        last_transport_err = Some(e.to_string());
+                    }
+                }
+            }
+            Ok(AccessOutcome::Reject { attributes, .. }) => {
+                let error_string = crate::auth::reply::mschap_error(&attributes);
+                let reason = crate::auth::reply::reject_reason(&attributes)
+                    .or_else(|| error_string.clone())
+                    .unwrap_or_else(|| "access rejected".into());
+                let _ = job.reply.send(MsChapOutcome {
+                    verdict: AuthVerdict::Reject {
+                        message: reason.into_bytes(),
+                    },
+                    shaping: None,
+                    auth_response: None,
+                    error_string,
+                });
+                return;
+            }
+            Ok(AccessOutcome::Challenge { .. }) => {
+                warn!(radius = %addr, user = %job.username, "MS-CHAPv2: unexpected Access-Challenge; trying next server");
+                last_transport_err = Some("unexpected Access-Challenge".into());
+            }
+            Err(e) => {
+                let auth_err: AuthError = e.into();
+                warn!(radius = %addr, user = %job.username, error = %auth_err, "RADIUS MS-CHAPv2 attempt failed; trying next server");
+                last_transport_err = Some(auth_err.to_string());
+            }
+        }
+    }
+    let msg = last_transport_err.map_or_else(
+        || "auth failed: no RADIUS servers reachable".into(),
+        |e| format!("auth failed: {e}"),
+    );
+    let _ = job.reply.send(MsChapOutcome {
+        verdict: AuthVerdict::Reject {
+            message: msg.into_bytes(),
+        },
+        shaping: None,
+        auth_response: None,
+        error_string: None,
     });
 }
 
@@ -400,6 +577,7 @@ mod tests {
             &Handle::current(),
             "127.0.0.1:0".parse().unwrap(),
             vec![(server_addr, secret)],
+            None,
         )
         .await
         .expect("spawn bridge");
@@ -409,7 +587,6 @@ mod tests {
                 "alice".into(),
                 b"pw".to_vec(),
                 "127.0.0.1:5000".parse().unwrap(),
-                None,
             )
             .await;
         assert!(outcome.shaping.is_none());
@@ -443,6 +620,7 @@ mod tests {
             &Handle::current(),
             "127.0.0.1:0".parse().unwrap(),
             vec![(server_addr, secret)],
+            None,
         )
         .await
         .expect("spawn bridge");
@@ -452,7 +630,6 @@ mod tests {
                 "alice".into(),
                 b"pw".to_vec(),
                 "127.0.0.1:5000".parse().unwrap(),
-                None,
             )
             .await;
         assert!(outcome.shaping.is_none());

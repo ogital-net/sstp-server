@@ -27,7 +27,8 @@ use super::ipcp::{
 };
 use super::lcp::{
     ConfigOption, ConfigOptionIter, LCP_HEADER_LEN, LCP_OPT_HEADER_LEN, LcpCode, LcpOptionId,
-    LcpPacket, auth_protocol_chap_md5, auth_protocol_pap, decode_lcp_packet, write_lcp_header,
+    LcpPacket, auth_protocol_chap_md5, auth_protocol_mschapv2, auth_protocol_pap,
+    decode_lcp_packet, write_lcp_header,
     write_option,
 };
 
@@ -76,18 +77,31 @@ impl PppStep {
 #[derive(Debug)]
 pub enum PppEvent {
     /// Peer sent PAP `Authenticate-Request`; the session task must
-    /// run RADIUS (M6e) and feed the verdict back via
+    /// run RADIUS and feed the verdict back via
     /// [`Ppp::on_auth_result`].
     NeedPapAuth { peer_id: Vec<u8>, password: Vec<u8> },
-    /// Peer sent CHAP `Response`; the session task must run RADIUS
-    /// and feed the verdict back via [`Ppp::on_auth_result`]. The
-    /// 16-byte response hash is forwarded as `CHAP-Password`; the
-    /// `challenge` we originally sent goes as `CHAP-Challenge`.
+    /// Peer sent CHAP-MD5 `Response`; the session task must run
+    /// RADIUS and feed the verdict back via [`Ppp::on_auth_result`].
+    /// The 16-byte response hash is forwarded as `CHAP-Password`;
+    /// the `challenge` we originally sent goes as `CHAP-Challenge`.
     NeedChapAuth {
         username: Vec<u8>,
         chap_id: u8,
         challenge: Vec<u8>,
         response: [u8; 16],
+    },
+    /// Peer sent an MS-CHAPv2 `Response`; the session task must run
+    /// RADIUS and feed the verdict back via
+    /// [`Ppp::on_mschap_result`] together with the
+    /// `MS-CHAP2-Success` Authenticator-Response body the
+    /// authenticator returned ([RFC 2759] §6 / RFC 2548 §2.3.3).
+    NeedMsChapV2Auth {
+        username: Vec<u8>,
+        chap_id: u8,
+        authenticator_challenge: [u8; 16],
+        peer_challenge: [u8; 16],
+        nt_response: [u8; 24],
+        flags: u8,
     },
     /// IPCP converged: the kernel-PPP layer (M6g) can now bring the
     /// `pppN` interface up with the assigned addresses.
@@ -114,13 +128,15 @@ pub enum AuthVerdict {
 }
 
 /// PPP authentication method advertised by the server in its LCP
-/// `Configure-Request`. v0.1 supports PAP ([RFC 1334]) and CHAP-MD5
-/// ([RFC 1994]); MS-CHAPv2 lands in a follow-up.
+/// `Configure-Request`. v0.1 supports PAP ([RFC 1334]), CHAP-MD5
+/// ([RFC 1994]), and MS-CHAPv2 ([RFC 2759]); EAP pass-through
+/// lands in a later milestone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuthMethod {
     #[default]
     Pap,
     ChapMd5,
+    MsChapV2,
 }
 
 // =============================================================================
@@ -258,6 +274,12 @@ impl LcpServer {
             }
             AuthMethod::ChapMd5 => {
                 let proto = auth_protocol_chap_md5();
+                let mut tmp = [0u8; LCP_OPT_HEADER_LEN + 3];
+                let n = write_option(&mut tmp, LcpOptionId::AuthProtocol.as_u8(), &proto);
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            AuthMethod::MsChapV2 => {
+                let proto = auth_protocol_mschapv2();
                 let mut tmp = [0u8; LCP_OPT_HEADER_LEN + 3];
                 let n = write_option(&mut tmp, LcpOptionId::AuthProtocol.as_u8(), &proto);
                 buf.extend_from_slice(&tmp[..n]);
@@ -492,6 +514,7 @@ enum Phase {
 enum InFlightMethod {
     Pap { pap_id: u8 },
     Chap { chap_id: u8 },
+    MsChapV2 { chap_id: u8 },
 }
 
 /// PPP driver orchestrator. Owns LCP + IPCP sub-drivers and the
@@ -581,7 +604,10 @@ impl Ppp {
     }
 
     /// Apply a RADIUS verdict to the in-flight authentication
-    /// exchange (PAP or CHAP-MD5).
+    /// exchange (PAP or CHAP-MD5). MS-CHAPv2 verdicts must use
+    /// [`Ppp::on_mschap_result`] because they carry the
+    /// Authenticator-Response body that goes inside the CHAP
+    /// Success packet.
     pub fn on_auth_result(&mut self, verdict: AuthVerdict) -> PppStep {
         let Phase::AuthInFlight { method } = self.phase else {
             return PppStep::default();
@@ -614,6 +640,70 @@ impl Ppp {
                 // text per [RFC 1994] §4.3); cap to keep the frame
                 // small.
                 let trimmed = message.get(..message.len().min(255)).unwrap_or(&[]);
+                step.push_frame(encode_chap_terminal(
+                    chap::Code::Failure,
+                    chap_id,
+                    trimmed,
+                ));
+                self.tear_down_after_reject(&mut step);
+            }
+            (InFlightMethod::MsChapV2 { .. }, _) => {
+                // MS-CHAPv2 must use on_mschap_result. Caller bug —
+                // drop and let the LCP restart timer reap.
+            }
+        }
+        step
+    }
+
+    /// Apply a RADIUS verdict to an in-flight MS-CHAPv2 exchange.
+    ///
+    /// On Accept the driver emits a PPP CHAP `Success` packet whose
+    /// body is the `S=<40-hex>` Authenticator-Response from the
+    /// `MS-CHAP2-Success` VSA ([RFC 2759] §6 / RFC 2548 §2.3.3).
+    /// `auth_response` is the VSA body with its leading CHAP-Identifier
+    /// byte already stripped (see [`crate::auth::reply::decode_accept`]).
+    /// If the authenticator omitted the VSA, the Success body is
+    /// empty — the peer typically tears down with an "Authenticator
+    /// Response invalid" error in that case.
+    ///
+    /// On Reject the driver emits a CHAP `Failure` whose body is
+    /// the supplied `error_string` if any (typically lifted from the
+    /// `MS-CHAP-Error` VSA, RFC 2548 §2.1.2), otherwise a synthesised
+    /// `E=691 R=0 V=3 M=...` payload built from the reject message.
+    pub fn on_mschap_result(
+        &mut self,
+        verdict: AuthVerdict,
+        auth_response: Option<&[u8]>,
+        error_string: Option<&str>,
+    ) -> PppStep {
+        let Phase::AuthInFlight {
+            method: InFlightMethod::MsChapV2 { chap_id },
+        } = self.phase
+        else {
+            return PppStep::default();
+        };
+        let mut step = PppStep::default();
+        match verdict {
+            AuthVerdict::Accept { addrs } => {
+                let body = auth_response.unwrap_or(&[]);
+                let trimmed = body.get(..body.len().min(255)).unwrap_or(&[]);
+                step.push_frame(encode_chap_terminal(
+                    chap::Code::Success,
+                    chap_id,
+                    trimmed,
+                ));
+                self.advance_to_network(&mut step, addrs);
+            }
+            AuthVerdict::Reject { message } => {
+                let synth;
+                let body: &[u8] = if let Some(s) = error_string {
+                    s.as_bytes()
+                } else {
+                    let msg = String::from_utf8_lossy(&message);
+                    synth = format!("E=691 R=0 V=3 M={msg}");
+                    synth.as_bytes()
+                };
+                let trimmed = body.get(..body.len().min(255)).unwrap_or(&[]);
                 step.push_frame(encode_chap_terminal(
                     chap::Code::Failure,
                     chap_id,
@@ -691,27 +781,79 @@ impl Ppp {
         let Ok(resp) = chap::decode_challenge_response(info) else {
             return PppStep::default();
         };
-        // CHAP-MD5 response must be exactly 16 bytes ([RFC 1994] §4.1).
-        if resp.value.len() != 16 {
-            return PppStep::default();
-        }
-        let mut response = [0u8; 16];
-        response.copy_from_slice(resp.value);
-        let username = resp.name.to_vec();
-        let challenge = self.chap_challenge.clone();
-        self.phase = Phase::AuthInFlight {
-            method: InFlightMethod::Chap {
-                chap_id: resp.identifier,
-            },
-        };
-        PppStep {
-            event: Some(PppEvent::NeedChapAuth {
-                username,
-                chap_id: resp.identifier,
-                challenge,
-                response,
-            }),
-            ..PppStep::default()
+        match self.lcp.auth_method {
+            AuthMethod::ChapMd5 => {
+                // CHAP-MD5 response value is exactly 16 bytes
+                // ([RFC 1994] §4.1).
+                if resp.value.len() != 16 {
+                    return PppStep::default();
+                }
+                let mut response = [0u8; 16];
+                response.copy_from_slice(resp.value);
+                let username = resp.name.to_vec();
+                let challenge = self.chap_challenge.clone();
+                self.phase = Phase::AuthInFlight {
+                    method: InFlightMethod::Chap {
+                        chap_id: resp.identifier,
+                    },
+                };
+                PppStep {
+                    event: Some(PppEvent::NeedChapAuth {
+                        username,
+                        chap_id: resp.identifier,
+                        challenge,
+                        response,
+                    }),
+                    ..PppStep::default()
+                }
+            }
+            AuthMethod::MsChapV2 => {
+                // MS-CHAPv2 Response value is exactly 49 bytes
+                // ([RFC 2759] §6):
+                // Peer-Challenge[16] | Reserved[8] | NT-Response[24]
+                // | Flags[1].
+                if resp.value.len() != 49 {
+                    return PppStep::default();
+                }
+                if resp.value[16..24].iter().any(|&b| b != 0) {
+                    // Reserved field must be all zeros.
+                    return PppStep::default();
+                }
+                let mut peer_challenge = [0u8; 16];
+                peer_challenge.copy_from_slice(&resp.value[0..16]);
+                let mut nt_response = [0u8; 24];
+                nt_response.copy_from_slice(&resp.value[24..48]);
+                let flags = resp.value[48];
+                let mut authenticator_challenge = [0u8; 16];
+                if self.chap_challenge.len() != 16 {
+                    // Should not happen — we generate a 16-byte
+                    // challenge before sending it.
+                    return PppStep::default();
+                }
+                authenticator_challenge.copy_from_slice(&self.chap_challenge);
+                let username = resp.name.to_vec();
+                self.phase = Phase::AuthInFlight {
+                    method: InFlightMethod::MsChapV2 {
+                        chap_id: resp.identifier,
+                    },
+                };
+                PppStep {
+                    event: Some(PppEvent::NeedMsChapV2Auth {
+                        username,
+                        chap_id: resp.identifier,
+                        authenticator_challenge,
+                        peer_challenge,
+                        nt_response,
+                        flags,
+                    }),
+                    ..PppStep::default()
+                }
+            }
+            AuthMethod::Pap => {
+                // CHAP frame received during a PAP-only negotiation
+                // — ignore.
+                PppStep::default()
+            }
         }
     }
 
@@ -745,7 +887,9 @@ impl Ppp {
             // a Challenge ([RFC 1994] §4.1) immediately so the peer
             // can compute its response. Under PAP the peer drives
             // the exchange and we wait for its `Authenticate-Request`.
-            if self.lcp.auth_method == AuthMethod::ChapMd5 {
+            if self.lcp.auth_method == AuthMethod::ChapMd5
+                || self.lcp.auth_method == AuthMethod::MsChapV2
+            {
                 let challenge = generate_chap_challenge();
                 let chap_id = self.next_chap_id();
                 let frame = encode_chap_challenge(chap_id, &challenge);
