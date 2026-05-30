@@ -22,6 +22,7 @@ mod net;
 mod ppp;
 mod privdrop;
 mod session;
+mod shape;
 mod sstp;
 
 use std::io::{self, IsTerminal, Write};
