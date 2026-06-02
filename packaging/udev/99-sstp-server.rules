@@ -1,0 +1,20 @@
+# udev rules for sstp-server
+#
+# The kernel ships /dev/ppp and the in-tree sstp kmod ships
+# /dev/sstp as 0600 root:root, which means an unprivileged
+# service account cannot open them even with CAP_NET_ADMIN
+# retained across the privilege drop (the VFS DAC check runs
+# before the capability check). Hand the device files to the
+# `sstp-server` group so the systemd unit's dedicated service
+# user can open them.
+#
+# Group ownership only — these devices are still root-owned and
+# mode 0660; non-members of the group are unaffected.
+#
+# /dev/net/tun is intentionally not touched here. On Debian /
+# Ubuntu it ships 0666 root:root by default and is shared with
+# every other tunnelling daemon on the box; widening it further
+# is unnecessary and narrowing it would break unrelated services.
+
+KERNEL=="ppp",  MODE="0660", GROUP="sstp-server"
+KERNEL=="sstp", MODE="0660", GROUP="sstp-server"

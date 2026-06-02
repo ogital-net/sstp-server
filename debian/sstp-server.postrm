@@ -1,0 +1,38 @@
+#!/bin/sh
+# postrm script for sstp-server
+set -e
+
+USER=sstp-server
+GROUP=sstp-server
+
+case "$1" in
+    purge)
+        if getent passwd "$USER" >/dev/null; then
+            deluser --system --quiet "$USER" || true
+        fi
+        if getent group "$GROUP" >/dev/null; then
+            delgroup --system --quiet --only-if-empty "$GROUP" || true
+        fi
+        rm -rf /var/lib/sstp-server /etc/sstp-server
+
+        # The udev rule file under /lib/udev/rules.d is removed by
+        # dpkg as part of the package contents; reload so the
+        # group ownership on /dev/ppp and /dev/sstp reverts to the
+        # kernel default on the next device event.
+        if [ -d /run/udev ] && command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules || true
+        fi
+        ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

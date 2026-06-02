@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0
+#
+# Out-of-tree Kbuild for the SSTP channel driver.
+#
+# Build:
+#     make -C kmod KDIR=/lib/modules/$(uname -r)/build
+#
+# (KDIR defaults to that path; pass KDIR= explicitly when cross-building
+# or pointing at a Debian-style split header tree.)
+
+obj-m := sstp.o
+
+sstp-y := \
+	sstp_main.o   \
+	sstp_attach.o \
+	sstp_event.o  \
+	sstp_chan.o   \
+	sstp_demux.o
+
+# Pull the UAPI header from ../kernel-abi/ as <uapi/linux/sstp.h>
+# without needing it installed system-wide. The trailing slash matters.
+ccflags-y += -I$(src)/include
+
+# Build with `make DEBUG=1` to enable verbose pr_debug() / sstp_dbg()
+# output in dmesg. Forwarded by the wrapper Makefile so a top-level
+# `make DEBUG=1` Just Works. Without -DDEBUG, pr_debug() compiles to
+# a no-op (or is gated by CONFIG_DYNAMIC_DEBUG); production builds
+# carry zero overhead on the per-packet path.
+ifeq ($(DEBUG),1)
+ccflags-y += -DDEBUG
+endif

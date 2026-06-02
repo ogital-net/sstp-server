@@ -1,0 +1,196 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------
+  # Sanity-check: tag must match debian/changelog version.
+  # The package is `3.0 (native)`, so debian/changelog is the
+  # canonical source of the upstream version — a mismatch here
+  # produces .deb artifacts whose filenames don't agree with the
+  # GitHub release.
+  # ---------------------------------------------------------------
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -eu
+          tag="${GITHUB_REF#refs/tags/v}"
+          changelog_ver=$(dpkg-parsechangelog -SVersion -l debian/changelog)
+          cargo_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "tag=$tag changelog=$changelog_ver cargo=$cargo_ver"
+          if [ "$tag" != "$changelog_ver" ] || [ "$tag" != "$cargo_ver" ]; then
+            echo "::error::tag/changelog/Cargo.toml version mismatch" >&2
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------
+  # Source tarball (git archive). Reproducible, no build artifacts.
+  # ---------------------------------------------------------------
+  source-tarball:
+    runs-on: ubuntu-latest
+    needs: verify-version
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build source tarball
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          set -eu
+          git archive \
+            --format=tar.gz \
+            --prefix="sstp-server-${VERSION}/" \
+            -o "sstp-server-${VERSION}.tar.gz" \
+            HEAD
+          sha256sum "sstp-server-${VERSION}.tar.gz" \
+            > "sstp-server-${VERSION}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-tarball
+          path: |
+            sstp-server-*.tar.gz
+            sstp-server-*.tar.gz.sha256
+
+  # ---------------------------------------------------------------
+  # .deb builds for the Debian/Ubuntu releases we expect operators
+  # to deploy on. We build inside the target distro's container so
+  # the resulting .deb links against that release's libc / OpenSSL.
+  #
+  # rustc is installed via rustup rather than apt: only trixie
+  # ships rustc >= 1.85, so we'd otherwise need a per-distro
+  # dependency tweak. `dpkg-buildpackage -d` skips the
+  # Build-Depends check that would reject the rustup toolchain.
+  # ---------------------------------------------------------------
+  deb:
+    runs-on: ubuntu-latest
+    needs: verify-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            release: bookworm
+            tag: debian-12
+          - distro: debian
+            release: trixie
+            tag: debian-13
+          - distro: ubuntu
+            release: noble
+            tag: ubuntu-24.04
+    container:
+      image: ${{ matrix.distro }}:${{ matrix.release }}
+    steps:
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eu
+          apt-get update
+          apt-get install -y --no-install-recommends \
+              build-essential \
+              ca-certificates \
+              cmake \
+              clang \
+              libclang-dev \
+              pkg-config \
+              perl \
+              git \
+              curl \
+              dpkg-dev \
+              debhelper \
+              dh-dkms \
+              devscripts \
+              fakeroot \
+              lintian
+
+      - name: Install rustup toolchain (>= 1.85)
+        run: |
+          set -eu
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain 1.85.0 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+
+      - name: Build .deb
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+          RELEASE_TAG: ${{ matrix.tag }}
+        run: |
+          set -eu
+          # Pin the toolchain for this shell.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustc --version
+          # `-d` skips Build-Depends check (rustc came from rustup,
+          # not apt). `-uc -us` skips signing; we sign in the
+          # release step instead.
+          # `-b` builds binary packages only — source packages are
+          # native and shipped as the git archive above.
+          dpkg-buildpackage -uc -us -b -d
+          mkdir -p out
+          # Artifacts land one directory above the source tree.
+          cp -v ../sstp-server_*.deb \
+                ../sstp-server-dkms_*.deb \
+                ../sstp-server_*.buildinfo \
+                ../sstp-server_*.changes \
+                out/
+          # Tag filenames with the distro so the release page is
+          # unambiguous. dpkg-buildpackage doesn't embed the
+          # release name; we do it ourselves.
+          cd out
+          for f in sstp-server_*.deb sstp-server-dkms_*.deb; do
+              base="${f%.deb}"
+              mv "$f" "${base}~${RELEASE_TAG}.deb"
+          done
+          sha256sum *.deb > "SHA256SUMS-${RELEASE_TAG}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.tag }}
+          path: out/*
+
+  # ---------------------------------------------------------------
+  # Publish: collect every artifact and attach to the GitHub
+  # release for the pushed tag. softprops/action-gh-release
+  # creates the release if it doesn't exist yet.
+  # ---------------------------------------------------------------
+  publish:
+    runs-on: ubuntu-latest
+    needs: [verify-version, source-tarball, deb]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifact tree
+        run: |
+          set -eu
+          mkdir -p release
+          find artifacts -type f \
+              \( -name '*.tar.gz' -o -name '*.deb' \
+                 -o -name '*.sha256' -o -name 'SHA256SUMS*.txt' \) \
+              -exec cp -v {} release/ \;
+          ls -la release/
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: release/*

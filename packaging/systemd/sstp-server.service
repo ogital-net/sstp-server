@@ -1,0 +1,72 @@
+[Unit]
+Description=SSTP (Secure Socket Tunneling Protocol) server
+Documentation=https://github.com/ogital-net/sstp-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+EnvironmentFile=-/etc/sstp-server/sstp-server.env
+# OPTS comes from the environment file. SSTP_RADIUS_SECRET (and
+# friends) are loaded from the same file. Keep secrets out of
+# the unit and out of `ps`.
+#
+# Sweep stale per-session MSS-clamp tables left by an abnormal
+# exit (SIGKILL, panic-abort) of a previous run. Normal teardown
+# removes them via Drop; this catches what Drop didn't get to.
+# Best-effort: missing `nft` or no stale tables both succeed.
+ExecStartPre=/bin/sh -c 'command -v nft >/dev/null 2>&1 || exit 0; nft list tables ip 2>/dev/null | grep -oE "sstp_mss_[A-Za-z0-9_]+" | while read t; do nft delete table ip "$t" 2>/dev/null || true; done'
+ExecStart=/usr/sbin/sstp-server $OPTS
+Restart=on-failure
+RestartSec=2s
+
+# Run as a dedicated unprivileged account. CAP_NET_BIND_SERVICE
+# lets the daemon bind :443; CAP_NET_ADMIN is required per
+# session for /dev/ppp PPPIOCNEWUNIT and for the netlink
+# RTM_NEWADDR / link-up sequence.
+User=sstp-server
+Group=sstp-server
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# Control socket lives under /run/sstp-server (created and
+# owned by systemd via RuntimeDirectory). Override the daemon's
+# default path via --control-socket in OPTS.
+RuntimeDirectory=sstp-server
+RuntimeDirectoryMode=0750
+StateDirectory=sstp-server
+StateDirectoryMode=0750
+# /var/log/sstp-server, owned by the service user. The default
+# OPTS in the env file points --log-file here. Rotated by
+# /etc/logrotate.d/sstp-server using copytruncate (the daemon's
+# non-blocking appender opens the file once and never reopens).
+LogsDirectory=sstp-server
+LogsDirectoryMode=0750
+
+# Hardening. The daemon reads cert/key from /etc/sstp-server,
+# writes its control socket to /run/sstp-server, and otherwise
+# only touches /dev/ppp + netlink.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+DeviceAllow=/dev/ppp rw
+DeviceAllow=/dev/sstp rw
+DeviceAllow=/dev/net/tun rw
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

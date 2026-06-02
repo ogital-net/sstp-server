@@ -1,0 +1,65 @@
+#!/bin/sh
+# postinst script for sstp-server
+set -e
+
+USER=sstp-server
+GROUP=sstp-server
+HOME_DIR=/var/lib/sstp-server
+ENV_FILE=/etc/sstp-server/sstp-server.env
+
+case "$1" in
+    configure)
+        # Create the system user/group the systemd unit runs as.
+        if ! getent group "$GROUP" >/dev/null; then
+            addgroup --system "$GROUP"
+        fi
+        if ! getent passwd "$USER" >/dev/null; then
+            adduser --system --ingroup "$GROUP" \
+                    --home "$HOME_DIR" --no-create-home \
+                    --gecos "SSTP server" --shell /usr/sbin/nologin \
+                    "$USER"
+        fi
+
+        # Lock down the env file: it may carry SSTP_RADIUS_SECRET.
+        if [ -f "$ENV_FILE" ]; then
+            chown root:"$GROUP" "$ENV_FILE"
+            chmod 0640 "$ENV_FILE"
+        fi
+
+        # Cert directory readable by the daemon group.
+        if [ -d /etc/sstp-server ]; then
+            chown root:"$GROUP" /etc/sstp-server
+            chmod 0750 /etc/sstp-server
+        fi
+
+        # State dir owned by the daemon.
+        if [ -d "$HOME_DIR" ]; then
+            chown "$USER":"$GROUP" "$HOME_DIR"
+            chmod 0750 "$HOME_DIR"
+        fi
+
+        # Apply the udev rule shipped at /lib/udev/rules.d/99-sstp-server.rules
+        # so /dev/ppp and /dev/sstp pick up GROUP=sstp-server. Without this
+        # the daemon cannot open them after privilege drop (the VFS DAC
+        # check runs before CAP_NET_ADMIN is consulted).
+        if [ -d /run/udev ] && command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules || true
+            # Trigger only on the device nodes we care about; missing
+            # nodes (e.g. ppp_generic / sstp not loaded yet) are fine.
+            udevadm trigger --action=change /dev/ppp 2>/dev/null || true
+            udevadm trigger --action=change /dev/sstp 2>/dev/null || true
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

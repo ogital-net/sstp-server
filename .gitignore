@@ -1,0 +1,12 @@
+/target
+
+# Out-of-tree kmod build artefacts
+kmod/*.o
+kmod/*.ko
+kmod/*.mod
+kmod/*.mod.c
+kmod/.*.cmd
+kmod/.*.o.d
+kmod/modules.order
+kmod/Module.symvers
+kmod/.module-common.o

@@ -1,0 +1,7 @@
+sstp-server (0.1.0) unstable; urgency=medium
+
+  * Initial packaging.
+    - sstp-server: userspace daemon, systemd unit, default env file.
+    - sstp-server-dkms: out-of-tree kernel module via DKMS.
+
+ -- Ogital <noreply@ogital.net>  Thu, 01 Jan 1970 00:00:00 +0000

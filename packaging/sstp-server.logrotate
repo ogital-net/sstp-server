@@ -1,0 +1,15 @@
+/var/log/sstp-server/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    # The daemon uses tracing_appender's non-blocking writer, which
+    # opens the log file once at startup and never reopens it. Use
+    # copytruncate so rotation does not require a daemon restart or
+    # SIGHUP.
+    copytruncate
+    su sstp-server sstp-server
+    create 0640 sstp-server sstp-server
+}

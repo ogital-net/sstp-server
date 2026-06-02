@@ -1,0 +1,77 @@
+[package]
+name = "sstp-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "BSD-2-Clause"
+description = "High-performance Linux SSTP (MS-SSTP) server"
+repository = "https://github.com/ogital-net/sstp-server"
+keywords = ["sstp", "vpn", "ppp", "radius"]
+categories = ["network-programming"]
+
+[features]
+default = ["cli"]
+# Builds the `sstp-server-cli` interactive admin REPL. The server
+# binary itself does not depend on these crates.
+cli = ["dep:rustyline", "dep:command-trie", "dep:nu-ansi-term"]
+
+[[bin]]
+name = "sstp-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "sstp-server-cli"
+path = "src/bin/sstp_server_cli.rs"
+required-features = ["cli"]
+
+[dependencies]
+aws-lc-sys = { version = "0.41", features = ["ssl"] }
+command-trie = { version = "1", optional = true }
+dotenvy = "0.15"
+fast-md5 = "1"
+getopt-iter = "1"
+libc = "0.2"
+# Already a transitive dep via tracing-subscriber's "ansi" feature; pulled
+# in directly here so the CLI can colorize output without expanding the
+# build graph.
+nu-ansi-term = { version = "0.50", optional = true }
+rustyline = { version = "18", optional = true }
+socket2 = { version = "0.6", features = ["all"] }
+radius-tokio = { git = "https://github.com/ogital-net/radius-tokio", branch = "client", default-features = false, features = ["dict-rfc", "dict-microsoft", "client", "fast-md5"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi", "fmt"] }
+
+[build-dependencies]
+vergen-git2 = { version = "9", default-features = false }
+
+[dev-dependencies]
+libc = "0.2"
+tokio = { version = "1", features = ["process", "test-util"] }
+# Pull in the server-side surface for the E2E integration test's dummy
+# RADIUS authenticator. Feature unification with the [dependencies] entry
+# means the binary build does *not* gain the `server` feature; only test
+# / example / bench compilations do.
+radius-tokio = { git = "https://github.com/ogital-net/radius-tokio", branch = "client", default-features = false, features = ["dict-rfc", "dict-microsoft", "server", "radsec", "fast-md5"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1

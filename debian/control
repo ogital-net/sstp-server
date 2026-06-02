@@ -1,0 +1,53 @@
+Source: sstp-server
+Section: net
+Priority: optional
+Maintainer: Ogital <noreply@ogital.net>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.85),
+               pkg-config,
+               cmake,
+               clang,
+               libclang-dev,
+               dh-dkms
+Standards-Version: 4.6.2
+Homepage: https://github.com/ogital-net/sstp-server
+Rules-Requires-Root: no
+
+Package: sstp-server
+Architecture: linux-any
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser, udev
+Recommends: sstp-server-dkms (= ${source:Version})
+Suggests: freeradius
+Description: Microsoft SSTP VPN server (userspace daemon)
+ sstp-server is a high-performance Linux SSTP (Secure Socket Tunneling
+ Protocol, [MS-SSTP]) server. It terminates SSTP/TLS from Windows clients,
+ runs the PPP control plane in-process, and forwards IP through the Linux
+ kernel via /dev/ppp.
+ .
+ Authentication is delegated to RADIUS (PAP, CHAP, MS-CHAPv2, EAP). IP
+ address assignment is RADIUS-driven (Framed-IP-Address, Framed-Route,
+ MS-Primary-DNS-Server, ...).
+ .
+ This package contains the userspace daemon and a systemd service unit.
+ Also included is sstp-server-cli, an interactive admin REPL that
+ connects to the daemon's control socket (see sstp-server(8) for the
+ supported commands: `show info`, `show stat`, `show sess`, `disable
+ session`, `shutdown`).
+ .
+ For the optional in-kernel fast path (kTLS + ppp_channel), install the
+ companion sstp-server-dkms package.
+
+Package: sstp-server-dkms
+Architecture: all
+Depends: ${misc:Depends}, dkms (>= 2.1.0.0)
+Recommends: linux-headers-generic | linux-headers-amd64 | linux-headers-arm64
+Description: SSTP kernel module (DKMS sources)
+ In-tree DKMS sources for the sstp kernel module used by sstp-server's
+ kernel fast path. Once loaded, the module registers a ppp_channel
+ against an SSTP-attached, kTLS-equipped TCP socket so the steady-state
+ data path (kTLS decrypt -> SSTP demux -> ppp_input) runs entirely in
+ kernel context.
+ .
+ Requires kernel 6.12 or newer with CONFIG_PPP=m and matching
+ linux-headers installed.

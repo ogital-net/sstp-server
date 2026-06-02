@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+# dh_dkms injects its `dkms add/build/install` snippet at
+# #DEBHELPER#; once that has run the module is registered and
+# (under AUTOINSTALL=yes) built against the running kernel. We
+# follow up with a best-effort modprobe so the kmod is live
+# without requiring a reboot. Failure is non-fatal: in a
+# container, build chroot, or on a host where the running
+# kernel headers aren't present, the operator can still load
+# the module after fixing the environment.
+
+#DEBHELPER#
+
+case "$1" in
+    configure)
+        if [ -d /run/systemd/system ] && [ -x /sbin/modprobe ] || command -v modprobe >/dev/null 2>&1; then
+            modprobe sstp 2>/dev/null || true
+        fi
+        ;;
+esac
+
+exit 0

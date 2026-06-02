@@ -1,0 +1,61 @@
+#!/usr/bin/make -f
+# debian/rules for sstp-server.
+#
+# Userspace builds via cargo; the kmod ships as DKMS sources
+# (no in-build kernel compile, since the build host's kernel is
+# unrelated to the install target's kernel).
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# Cargo writes to $HOME/.cargo by default. Redirect into the
+# build tree so sbuild / pbuilder don't punish us with network
+# fetches inside an HTTP-disabled chroot — and so the package
+# stays reproducible under DEB_BUILD_OPTIONS=offline.
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+
+# Honour parallel=N from DEB_BUILD_OPTIONS.
+NJOBS := $(shell echo $${DEB_BUILD_OPTIONS} | sed -n 's/.*parallel=\([0-9]*\).*/\1/p')
+ifeq ($(NJOBS),)
+NJOBS := 1
+endif
+
+# Source tree path that ships into /usr/src/sstp-<version>/ for
+# DKMS. We use the upstream version verbatim (matches Cargo.toml
+# `version` and dh_dkms's @VERSION@ substitution).
+KMOD_VERSION := $(shell dpkg-parsechangelog -SVersion | sed 's/-.*//')
+
+%:
+	dh $@ --with dkms
+
+override_dh_auto_configure:
+	# nothing to configure; cargo does its own dependency
+	# resolution on first build.
+
+override_dh_auto_build:
+	cargo build --release --bin sstp-server --bin sstp-server-cli -j $(NJOBS)
+
+override_dh_auto_test:
+	# The bulk of the test suite needs root, /dev/ppp, and
+	# /dev/net/tun, none of which are available in a build
+	# chroot. Skip silently; CI runs `cargo test` separately.
+
+override_dh_auto_install:
+	# Userspace daemon -> debian/sstp-server/.
+	$(MAKE) install-bin install-systemd install-config install-docs install-certbot-hook install-udev \
+	    DESTDIR=$(CURDIR)/debian/sstp-server \
+	    PREFIX=/usr SYSCONFDIR=/etc UNITDIR=/lib/systemd/system UDEVDIR=/lib/udev/rules.d
+	# Kmod DKMS sources -> debian/sstp-server-dkms/usr/src/sstp-<ver>/.
+	$(MAKE) install-kmod-src \
+	    DESTDIR=$(CURDIR)/debian/sstp-server-dkms \
+	    PREFIX=/usr KMOD_VERSION=$(KMOD_VERSION)
+
+override_dh_auto_clean:
+	# `cargo clean` needs the registry; tolerate offline.
+	cargo clean || rm -rf target
+	rm -rf debian/cargo-home
+
+override_dh_dkms:
+	dh_dkms -V $(KMOD_VERSION)
+
+override_dh_installsystemd:
+	dh_installsystemd --name=sstp-server
