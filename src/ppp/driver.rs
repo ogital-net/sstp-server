@@ -635,10 +635,33 @@ impl Ppp {
             return PppStep::default();
         };
         match (self.phase, ProtocolId::from_u16(frame.protocol)) {
+            // LCP is accepted in any phase ([RFC 1661] §3.2–3.6).
             (_, Some(ProtocolId::Lcp)) => self.handle_lcp(frame.info),
-            (Phase::AuthPending, Some(ProtocolId::Pap)) => self.handle_pap(frame.info),
-            (Phase::AuthPending, Some(ProtocolId::Chap)) => self.handle_chap(frame.info),
+
+            // Auth protocols: accepted in AuthPending (first attempt)
+            // and AuthInFlight (retransmit while awaiting RADIUS).
+            // Silently discarded in Network (auth already done — a
+            // late retransmit) per RFC 1661 §5.7 note: Protocol-Reject
+            // signals "unsupported" which is incorrect for a protocol
+            // we completed. In Establish we discard (LCP not open yet).
+            (Phase::AuthPending | Phase::AuthInFlight { .. }, Some(ProtocolId::Pap)) => {
+                self.handle_pap(frame.info)
+            }
+            (Phase::AuthPending | Phase::AuthInFlight { .. }, Some(ProtocolId::Chap)) => {
+                self.handle_chap(frame.info)
+            }
+            (_, Some(ProtocolId::Pap | ProtocolId::Chap)) => {
+                // Late auth retransmit after Network, or before LCP
+                // opens — silently discard ([RFC 1661] §3.3 / §3.4).
+                PppStep::default()
+            }
+
+            // IPCP: accepted in Network phase. During auth phases,
+            // silently discard per [RFC 1661] §3.3: "All other packets
+            // received during this phase MUST be silently discarded."
             (Phase::Network, Some(ProtocolId::Ipcp)) => self.handle_ipcp(frame.info),
+            (_, Some(ProtocolId::Ipcp)) => PppStep::default(),
+
             // Anything else: send an LCP Protocol-Reject if LCP is
             // in the Opened state ([RFC 1661] §5.7). The common
             // case is a Windows client probing CCP (0x80FD) for
