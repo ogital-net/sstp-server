@@ -169,9 +169,11 @@ pub struct MsChapOutcome {
     /// 32-byte SSTP Crypto Binding HLAK ([MS-SSTP] §3.2.5.2.2) when
     /// the authenticator returned both `MS-MPPE-Send-Key` and
     /// `MS-MPPE-Recv-Key` in their RFC 3079 16-byte form. Layout is
-    /// `Send-Key (16) || Recv-Key (16)`. `None` when either key was
-    /// absent or had an unexpected length — the session falls back
-    /// to `ServerBypassHLAuth` (32 zero octets) in that case.
+    /// `Recv-Key (16) || Send-Key (16)` (= MasterReceiveKey |
+    /// MasterSendKey per the spec's server-side definition). `None`
+    /// when either key was absent or had an unexpected length — the
+    /// session falls back to `ServerBypassHLAuth` (32 zero octets)
+    /// in that case.
     pub hlak: Option<[u8; 32]>,
 }
 
@@ -197,13 +199,17 @@ impl MsChapOutcome {
 /// (RFC 3079 + [MS-SSTP] §3.2.5.2.2). Returns `None` when either
 /// key is missing or not exactly 16 bytes — callers fall back to
 /// the zero-HLAK `ServerBypassHLAuth` path.
+///
+/// Per §3.2.5.2.2: Server HLAK = MasterReceiveKey | MasterSendKey.
+/// In RADIUS terminology (RFC 2548): MasterReceiveKey = MS-MPPE-Recv-Key,
+/// MasterSendKey = MS-MPPE-Send-Key.
 fn hlak_from_mppe(accept: &AuthAccept) -> Option<[u8; 32]> {
     if accept.mppe_send_key.len() != 16 || accept.mppe_recv_key.len() != 16 {
         return None;
     }
     let mut hlak = [0u8; 32];
-    hlak[..16].copy_from_slice(&accept.mppe_send_key);
-    hlak[16..].copy_from_slice(&accept.mppe_recv_key);
+    hlak[..16].copy_from_slice(&accept.mppe_recv_key); // MasterReceiveKey
+    hlak[16..].copy_from_slice(&accept.mppe_send_key); // MasterSendKey
     Some(hlak)
 }
 
@@ -740,11 +746,13 @@ mod tests {
     }
 
     #[test]
-    fn hlak_from_mppe_concatenates_send_then_recv() {
+    fn hlak_from_mppe_concatenates_recv_then_send() {
         let mut a = empty_accept();
-        a.mppe_send_key = (0u8..16).collect();
-        a.mppe_recv_key = (16u8..32).collect();
+        a.mppe_send_key = (16u8..32).collect();
+        a.mppe_recv_key = (0u8..16).collect();
         let hlak = hlak_from_mppe(&a).expect("both keys present");
+        // Server HLAK = MasterReceiveKey | MasterSendKey
+        //             = MS-MPPE-Recv-Key | MS-MPPE-Send-Key
         let expected: [u8; 32] = std::array::from_fn(|i| i as u8);
         assert_eq!(hlak, expected);
     }
