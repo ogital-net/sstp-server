@@ -12,7 +12,7 @@
 //! * Hello timer — §3.1.2.3. Negotiation timer — §3.3.2.1. Abort/Disc
 //!   timers — §3.1.2.1, §3.1.2.2.
 
-// Several FSM hooks (`on_inner_auth_completed`, `set_server_cert_hash`,
+// Several FSM hooks (`on_inner_auth_completed`,
 // `on_hello_timeout_no_response`, `state` accessor, `Abrupt` reason)
 // are spec-driven entry points that no caller exercises today —
 // inner-method auth completion belongs to non-PAP futures, the cert
@@ -167,6 +167,9 @@ impl AbortReason {
 #[derive(Debug)]
 pub struct StateMachine {
     state: State,
+    /// SHA-1 of the leaf TLS certificate's DER, for clients that
+    /// select SHA-1 in the Crypto Binding (e.g. RouterOS 7).
+    server_cert_hash_sha1: [u8; 20],
     /// SHA-256 of the leaf TLS certificate's DER, snapshotted from the
     /// [`SslContext`](crate::crypto::tls::SslContext) at session
     /// construction. Bound into the per-connection [`ServerBindingState`]
@@ -183,13 +186,14 @@ impl StateMachine {
     /// `Server_Call_Disconnected`; the driving task calls
     /// [`StateMachine::on_https_accepted`] once TLS finishes.
     ///
-    /// `cert_hash_sha256` is the SHA-256 of the leaf TLS certificate
-    /// DER ([MS-SSTP] §2.2.7); the FSM places it into the binding
-    /// state when `Call-Connect-Request` arrives so the subsequent
-    /// `Call-Connected` Crypto Binding can be verified.
-    pub fn new(cert_hash_sha256: [u8; 32]) -> Self {
+    /// `cert_hash_sha1` is the SHA-1 and `cert_hash_sha256` is the
+    /// SHA-256 of the leaf TLS certificate DER ([MS-SSTP] §2.2.7);
+    /// the FSM places the appropriate one into the binding state when
+    /// `Call-Connect-Request` arrives, based on the client's selection.
+    pub fn new(cert_hash_sha1: [u8; 20], cert_hash_sha256: [u8; 32]) -> Self {
         Self {
             state: State::ServerCallDisconnected,
+            server_cert_hash_sha1: cert_hash_sha1,
             server_cert_hash_sha256: cert_hash_sha256,
             binding: None,
         }
@@ -336,21 +340,24 @@ impl StateMachine {
                 ..StepOut::new()
             };
         }
-        // Build server nonce + accept. We default to advertising SHA256
-        // only — the spec lets the server pick its supported set.
+        // Build server nonce + accept. Advertise both SHA-1 and SHA-256
+        // so clients that only support SHA-1 (e.g. RouterOS 7) can
+        // negotiate successfully ([MS-SSTP] §2.2.5).
         let mut nonce = [0u8; 32];
         crate::crypto::rand::fill_bytes(slice_to_uninit_mut(&mut nonce));
-        let hash_bitmask = super::attr::CERT_HASH_PROTOCOL_SHA256;
+        let hash_bitmask =
+            super::attr::CERT_HASH_PROTOCOL_SHA1 | super::attr::CERT_HASH_PROTOCOL_SHA256;
         let n = encode_call_connect_ack(tx, hash_bitmask, &nonce);
         debug_assert_eq!(n, CALL_CONNECT_ACK_LEN);
-        // Stash binding state for Call Connected verification. The
-        // leaf cert hash was supplied at FSM construction
-        // ([`StateMachine::new`]); the binding's hash protocol field
-        // commits to SHA-256 because that's the only protocol we
-        // advertise above.
+        // Stash binding state for Call Connected verification. Both
+        // cert hashes (SHA-1 and SHA-256) were supplied at FSM
+        // construction ([`StateMachine::new`]); the verify path in
+        // `binding::verify` selects the correct hash based on
+        // whichever protocol the client chose in its Call Connected.
         self.binding = Some(ServerBindingState {
             server_nonce: nonce,
-            server_cert_hash: self.server_cert_hash_sha256.to_vec(),
+            server_cert_hash_sha1: self.server_cert_hash_sha1,
+            server_cert_hash_sha256: self.server_cert_hash_sha256,
             server_hash_protocol_supported: hash_bitmask,
             hlak: None,
         });
@@ -364,16 +371,6 @@ impl StateMachine {
             timer_start: None,
             notify: Some(NotifyHigher::StartPpp),
             terminate: Terminate::None,
-        }
-    }
-
-    /// Inject the server certificate hash + advertised hash protocol
-    /// set into the in-flight binding state. The driving task calls
-    /// this after `on_call_connect_request` (or before, if the cert
-    /// hash is known at construction time).
-    pub fn set_server_cert_hash(&mut self, cert_hash: Vec<u8>) {
-        if let Some(b) = self.binding.as_mut() {
-            b.server_cert_hash = cert_hash;
         }
     }
 
@@ -613,7 +610,7 @@ impl StateMachine {
 
 impl Default for StateMachine {
     fn default() -> Self {
-        Self::new([0u8; 32])
+        Self::new([0u8; 20], [0u8; 32])
     }
 }
 
@@ -649,12 +646,14 @@ fn _silence_msg_imports() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sstp::attr::{CERT_HASH_PROTOCOL_SHA256, SSTP_ENCAPSULATED_PROTOCOL_PPP};
+    use crate::sstp::attr::{
+        CERT_HASH_PROTOCOL_SHA1, CERT_HASH_PROTOCOL_SHA256, SSTP_ENCAPSULATED_PROTOCOL_PPP,
+    };
     use crate::sstp::frame::Packet;
     use crate::sstp::msg::parse_control;
 
     fn fresh_post_handshake() -> StateMachine {
-        let mut sm = StateMachine::new([0u8; 32]);
+        let mut sm = StateMachine::new([0u8; 20], [0u8; 32]);
         let out = sm.on_https_accepted();
         assert_eq!(sm.state(), State::ServerConnectRequestPending);
         assert_eq!(
@@ -798,8 +797,8 @@ mod tests {
             },
             &mut tx,
         );
-        // Inject the "real" server cert hash.
-        sm.set_server_cert_hash(vec![0x11u8; 32]);
+        // Override the binding's cert hash to simulate a mismatch.
+        sm.binding.as_mut().unwrap().server_cert_hash_sha256 = [0x11u8; 32];
         // Build a Call Connected with a *wrong* cert hash.
         let mut buf = [0u8; CALL_CONNECTED_LEN_LOCAL];
         crate::sstp::msg::encode_call_connected_pre_mac(
@@ -830,7 +829,8 @@ mod tests {
         use crate::sstp::msg::{encode_call_connected_pre_mac, install_compound_mac};
 
         let cert_hash = [0xabu8; 32];
-        let mut sm = StateMachine::new(cert_hash);
+        let cert_hash_sha1 = [0xabu8; 20];
+        let mut sm = StateMachine::new(cert_hash_sha1, cert_hash);
         let _ = sm.on_https_accepted();
         let mut tx = [0u8; 128];
         let _ = sm.on_message(
@@ -1050,8 +1050,9 @@ mod tests {
     }
 
     #[test]
-    fn set_server_cert_hash_updates_binding() {
-        let mut sm = fresh_post_handshake();
+    fn binding_stores_both_cert_hashes() {
+        let mut sm = StateMachine::new([0x11u8; 20], [0x22u8; 32]);
+        let _ = sm.on_https_accepted();
         let mut tx = [0u8; 128];
         let _ = sm.on_message(
             ControlMessage::CallConnectRequest {
@@ -1059,10 +1060,12 @@ mod tests {
             },
             &mut tx,
         );
-        sm.set_server_cert_hash(vec![0x77u8; 32]);
+        let b = sm.binding.as_ref().unwrap();
+        assert_eq!(b.server_cert_hash_sha1, [0x11u8; 20]);
+        assert_eq!(b.server_cert_hash_sha256, [0x22u8; 32]);
         assert_eq!(
-            sm.binding.as_ref().unwrap().server_cert_hash,
-            vec![0x77u8; 32]
+            b.server_hash_protocol_supported,
+            CERT_HASH_PROTOCOL_SHA1 | CERT_HASH_PROTOCOL_SHA256
         );
     }
 

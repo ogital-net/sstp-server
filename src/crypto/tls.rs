@@ -20,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use super::ffi::{Ssl, SslCtx};
-use super::hash::Sha256;
+use super::hash::{Sha1, Sha256};
 
 #[derive(Debug, Error)]
 pub enum TlsError {
@@ -40,6 +40,10 @@ pub enum TlsError {
 #[derive(Clone)]
 pub struct SslContext {
     inner: SslCtx,
+    /// SHA-1 of the leaf certificate's DER encoding. Required for
+    /// clients (e.g. RouterOS 7) that select SHA-1 in the SSTP Crypto
+    /// Binding attribute ([MS-SSTP] §2.2.7 / §3.2.5.2).
+    cert_hash_sha1: [u8; 20],
     /// SHA-256 of the leaf certificate's DER encoding. Used as the
     /// server cert hash carried in the SSTP Crypto Binding attribute
     /// ([MS-SSTP] §2.2.7 / §3.2.5.2). Computed once at context build
@@ -206,15 +210,28 @@ impl SslContext {
         // SAFETY: ctx valid; `alpn_select_cb` has the signature aws-lc
         // expects; `arg` is unused by the callback.
         unsafe {
-            aws::SSL_CTX_set_alpn_select_cb(ctx.as_ptr(), Some(alpn_select_cb), std::ptr::null_mut());
+            aws::SSL_CTX_set_alpn_select_cb(
+                ctx.as_ptr(),
+                Some(alpn_select_cb),
+                std::ptr::null_mut(),
+            );
         }
 
         let cert_hash_sha256 = leaf_cert_hash_sha256(&ctx)?;
+        let cert_hash_sha1 = leaf_cert_hash_sha1(&ctx)?;
 
         Ok(Self {
             inner: ctx,
+            cert_hash_sha1,
             cert_hash_sha256,
         })
+    }
+
+    /// SHA-1 of the leaf certificate's DER encoding, for clients that
+    /// select SHA-1 in the SSTP Crypto Binding ([MS-SSTP] §2.2.7).
+    #[must_use]
+    pub fn cert_hash_sha1(&self) -> [u8; 20] {
+        self.cert_hash_sha1
     }
 
     /// SHA-256 of the leaf certificate's DER encoding, the value the
@@ -290,7 +307,9 @@ unsafe extern "C" fn alpn_select_cb(
             ALPN_HTTP_1_1.as_ptr(),
             // ALPN_HTTP_1_1.len() == 9, fits in c_uint trivially.
             #[allow(clippy::cast_possible_truncation)]
-            { ALPN_HTTP_1_1.len() as std::os::raw::c_uint },
+            {
+                ALPN_HTTP_1_1.len() as std::os::raw::c_uint
+            },
         )
     };
     if rc == aws::OPENSSL_NPN_NEGOTIATED {
@@ -310,6 +329,20 @@ unsafe extern "C" fn alpn_select_cb(
 /// already-loaded `SSL_CTX`. Used to populate
 /// [`SslContext::cert_hash_sha256`].
 fn leaf_cert_hash_sha256(ctx: &SslCtx) -> Result<[u8; 32], TlsError> {
+    let der = leaf_cert_der(ctx)?;
+    Ok(Sha256::digest(&der))
+}
+
+/// Compute SHA-1 of the leaf certificate's DER encoding for an
+/// already-loaded `SSL_CTX`. Required for clients (e.g. RouterOS 7)
+/// that select SHA-1 in the SSTP Crypto Binding attribute.
+fn leaf_cert_hash_sha1(ctx: &SslCtx) -> Result<[u8; 20], TlsError> {
+    let der = leaf_cert_der(ctx)?;
+    Ok(Sha1::digest(&der))
+}
+
+/// DER-encode the leaf certificate from an already-loaded `SSL_CTX`.
+fn leaf_cert_der(ctx: &SslCtx) -> Result<Vec<u8>, TlsError> {
     // SAFETY: ctx is a valid SSL_CTX with a cert loaded; the returned
     // pointer is borrowed (no _free required) per AWS-LC docs.
     let x509 = unsafe { aws::SSL_CTX_get0_certificate(ctx.as_ptr()) };
@@ -342,7 +375,7 @@ fn leaf_cert_hash_sha256(ctx: &SslCtx) -> Result<[u8; 32], TlsError> {
             "i2d_X509 wrote {written} bytes, expected {len}"
         )));
     }
-    Ok(Sha256::digest(&der))
+    Ok(der)
 }
 
 fn path_to_cstring(p: &Path) -> Result<std::ffi::CString, TlsError> {
@@ -608,10 +641,7 @@ impl TlsStream {
                 return ktls::install_chacha20_poly1305(self.tcp_fd(), tx, rx)
                     .map_err(|e| TlsError::Init(format!("kTLS setsockopt: {e}")));
             }
-            (
-                "TLSv1.2",
-                "ECDHE-RSA-CHACHA20-POLY1305" | "ECDHE-ECDSA-CHACHA20-POLY1305",
-            ) => {
+            ("TLSv1.2", "ECDHE-RSA-CHACHA20-POLY1305" | "ECDHE-ECDSA-CHACHA20-POLY1305") => {
                 let (tx, rx) = self.derive_tls12_chacha20_poly1305()?;
                 return ktls::install_chacha20_poly1305(self.tcp_fd(), tx, rx)
                     .map_err(|e| TlsError::Init(format!("kTLS setsockopt: {e}")));

@@ -615,9 +615,10 @@ mod tests {
     }
 
     fn find_attr(attrs: &[(u16, Vec<u8>)], typ: u16) -> &[u8] {
-        attrs
-            .iter()
-            .find(|(t, _)| *t == typ).map_or_else(|| panic!("attribute type {typ} not found"), |(_, p)| p.as_slice())
+        attrs.iter().find(|(t, _)| *t == typ).map_or_else(
+            || panic!("attribute type {typ} not found"),
+            |(_, p)| p.as_slice(),
+        )
     }
 
     // -----------------------------------------------------------------

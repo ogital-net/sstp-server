@@ -343,8 +343,16 @@ fn render_sess_one(state: &ControlState, id_str: &str) -> String {
         "correlation_id: {}",
         i.correlation_id.as_deref().unwrap_or("-")
     );
-    let _ = writeln!(out, "rate_egress: {}", format_rate(i.shaping.as_ref().and_then(|s| s.egress.as_ref())));
-    let _ = writeln!(out, "rate_ingress: {}", format_rate(i.shaping.as_ref().and_then(|s| s.ingress.as_ref())));
+    let _ = writeln!(
+        out,
+        "rate_egress: {}",
+        format_rate(i.shaping.as_ref().and_then(|s| s.egress.as_ref()))
+    );
+    let _ = writeln!(
+        out,
+        "rate_ingress: {}",
+        format_rate(i.shaping.as_ref().and_then(|s| s.ingress.as_ref()))
+    );
     out.pop();
     out
 }
@@ -513,9 +521,7 @@ mod tests {
     fn rekey_session_unknown_id_errors() {
         let (state, _rx) = test_state();
         assert!(dispatch("rekey session 999999", &state).starts_with("Error: no such session"));
-        assert!(
-            dispatch("rekey session notanid", &state).starts_with("Error: invalid session id")
-        );
+        assert!(dispatch("rekey session notanid", &state).starts_with("Error: invalid session id"));
         assert!(dispatch("rekey session", &state).starts_with("Error: usage:"));
     }
 
@@ -548,12 +554,7 @@ mod tests {
         let out = dispatch(&format!("rekey session {id} request"), &state);
         assert!(out.contains("update_requested"));
         let cmd = session_rx.recv().await.expect("rekey delivered");
-        assert!(matches!(
-            cmd,
-            ControlCommand::Rekey {
-                request_peer: true
-            }
-        ));
+        assert!(matches!(cmd, ControlCommand::Rekey { request_peer: true }));
     }
 
     #[test]

@@ -36,8 +36,10 @@ pub enum BindingOutcome {
 pub struct ServerBindingState {
     /// Nonce the server sent in its Call Connect Ack.
     pub server_nonce: [u8; 32],
-    /// SHA1 (20) or SHA256 (32) hash of the server certificate.
-    pub server_cert_hash: Vec<u8>,
+    /// SHA-1 hash of the server certificate's DER encoding.
+    pub server_cert_hash_sha1: [u8; 20],
+    /// SHA-256 hash of the server certificate's DER encoding.
+    pub server_cert_hash_sha256: [u8; 32],
     /// Bitmask of hash protocols the server advertised.
     pub server_hash_protocol_supported: u8,
     /// Higher-Layer Authentication Key handed up by PPP, or `None`
@@ -69,12 +71,13 @@ pub fn verify(
     if binding.nonce != state.server_nonce {
         return BindingOutcome::ValueNotSupported;
     }
-    if state.server_cert_hash.len() != hash_len
-        || !const_time_eq(
-            &binding.cert_hash_block[..hash_len],
-            state.server_cert_hash.as_slice(),
-        )
-    {
+    // Select the stored cert hash matching the client's chosen protocol.
+    let server_cert_hash: &[u8] = match binding.hash_protocol {
+        CERT_HASH_PROTOCOL_SHA1 => &state.server_cert_hash_sha1,
+        CERT_HASH_PROTOCOL_SHA256 => &state.server_cert_hash_sha256,
+        _ => unreachable!("filtered above"),
+    };
+    if !const_time_eq(&binding.cert_hash_block[..hash_len], server_cert_hash) {
         return BindingOutcome::ValueNotSupported;
     }
 
@@ -108,10 +111,21 @@ mod tests {
     use super::*;
     use crate::sstp::attr::CryptoBinding;
 
-    fn make_state(nonce: [u8; 32], hash: &[u8], advertised: u8) -> ServerBindingState {
+    fn make_state_sha256(nonce: [u8; 32], hash: &[u8; 32], advertised: u8) -> ServerBindingState {
         ServerBindingState {
             server_nonce: nonce,
-            server_cert_hash: hash.to_vec(),
+            server_cert_hash_sha1: [0u8; 20],
+            server_cert_hash_sha256: *hash,
+            server_hash_protocol_supported: advertised,
+            hlak: Some([0u8; 32]),
+        }
+    }
+
+    fn make_state_sha1(nonce: [u8; 32], hash: &[u8; 20], advertised: u8) -> ServerBindingState {
+        ServerBindingState {
+            server_nonce: nonce,
+            server_cert_hash_sha1: *hash,
+            server_cert_hash_sha256: [0u8; 32],
             server_hash_protocol_supported: advertised,
             hlak: Some([0u8; 32]),
         }
@@ -147,7 +161,7 @@ mod tests {
     fn accepts_matching_sha256_with_correct_mac() {
         let nonce = [0xaa; 32];
         let cert = [0x11u8; 32];
-        let state = make_state(nonce, &cert, CERT_HASH_PROTOCOL_SHA256);
+        let state = make_state_sha256(nonce, &cert, CERT_HASH_PROTOCOL_SHA256);
         let packet = [0u8; 112];
         let mac = expected_mac_sha256(&state.hlak.unwrap(), &packet);
 
@@ -168,7 +182,7 @@ mod tests {
     fn accepts_matching_sha1_with_correct_mac() {
         let nonce = [0xaa; 32];
         let cert = [0x22u8; 20];
-        let state = make_state(nonce, &cert, CERT_HASH_PROTOCOL_SHA1);
+        let state = make_state_sha1(nonce, &cert, CERT_HASH_PROTOCOL_SHA1);
         let packet = [0xffu8; 112];
         let mac = expected_mac_sha1(&state.hlak.unwrap(), &packet);
 
@@ -189,7 +203,7 @@ mod tests {
     fn rejects_bad_mac() {
         let nonce = [0xaa; 32];
         let cert = [0x11u8; 32];
-        let state = make_state(nonce, &cert, CERT_HASH_PROTOCOL_SHA256);
+        let state = make_state_sha256(nonce, &cert, CERT_HASH_PROTOCOL_SHA256);
         let packet = [0u8; 112];
 
         let mut cb_buf = [0u8; 32];
@@ -210,7 +224,7 @@ mod tests {
     #[test]
     fn rejects_nonce_mismatch() {
         let cert = [0x11u8; 32];
-        let state = make_state([0xaa; 32], &cert, CERT_HASH_PROTOCOL_SHA256);
+        let state = make_state_sha256([0xaa; 32], &cert, CERT_HASH_PROTOCOL_SHA256);
         let mut cb_buf = [0u8; 32];
         let mut mac_buf = [0u8; 32];
         let cb = make_binding(
@@ -225,14 +239,15 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_hash_protocol() {
-        let cert = [0x11u8; 20];
-        let state = make_state([0xaa; 32], &cert, CERT_HASH_PROTOCOL_SHA256);
+        let cert_sha1 = [0x11u8; 20];
+        // Server only advertised SHA256 — client picks SHA1 → rejected.
+        let state = make_state_sha1([0xaa; 32], &cert_sha1, CERT_HASH_PROTOCOL_SHA256);
         let mut cb_buf = [0u8; 32];
         let mut mac_buf = [0u8; 32];
         let cb = make_binding(
             CERT_HASH_PROTOCOL_SHA1,
             [0xaa; 32],
-            &cert,
+            &cert_sha1,
             &mut cb_buf,
             &mut mac_buf,
         );
@@ -243,7 +258,7 @@ mod tests {
     #[test]
     fn rejects_cert_hash_mismatch() {
         let nonce = [0xaa; 32];
-        let state = make_state(nonce, &[0x11u8; 32], CERT_HASH_PROTOCOL_SHA256);
+        let state = make_state_sha256(nonce, &[0x11u8; 32], CERT_HASH_PROTOCOL_SHA256);
         let mut cb_buf = [0u8; 32];
         let mut mac_buf = [0u8; 32];
         let bad = [0x22u8; 32];

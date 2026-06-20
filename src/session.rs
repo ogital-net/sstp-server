@@ -107,7 +107,9 @@ pub enum ControlCommand {
     /// posture). The bool is `update_requested`: when true the peer
     /// must respond with its own `KeyUpdate`, which exercises the
     /// receive-side rekey path.
-    Rekey { request_peer: bool },
+    Rekey {
+        request_peer: bool,
+    },
 }
 
 /// Cloneable, `Send` handle to a session living on some I/O worker.
@@ -314,8 +316,9 @@ pub async fn run(
         id,
     };
 
-    // Snapshot the server cert hash before consuming the TLS context
-    // — we hand it to the SSTP FSM once Call Connect Request lands.
+    // Snapshot the server cert hashes before consuming the TLS context
+    // — we hand them to the SSTP FSM once Call Connect Request lands.
+    let cert_hash_sha1 = tls_ctx.cert_hash_sha1();
     let cert_hash = tls_ctx.cert_hash_sha256();
 
     // Phase 1: TLS handshake. Failures here are common in practice
@@ -415,6 +418,7 @@ pub async fn run(
         drain_rx,
         auth_bridge,
         acct_bridge,
+        cert_hash_sha1,
         cert_hash,
         local_ip,
         auth_method,
@@ -447,6 +451,7 @@ async fn drive_sstp(
     mut drain_rx: broadcast::Receiver<()>,
     auth_bridge: AuthBridge,
     acct_bridge: Option<AcctBridge>,
+    cert_hash_sha1: [u8; 20],
     cert_hash: [u8; 32],
     local_ip: Ipv4Addr,
     auth_method: AuthMethod,
@@ -475,7 +480,7 @@ async fn drive_sstp(
     // `write(2)` on the TCP fd with the kernel doing AEAD.
     let mut tx = TxStream::new(tls);
 
-    let mut ssm = StateMachine::new(cert_hash);
+    let mut ssm = StateMachine::new(cert_hash_sha1, cert_hash);
     let mut tx_buf = [0u8; SSTP_MAX_PACKET_LEN];
     let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 4096];
@@ -594,7 +599,7 @@ async fn drive_sstp(
         &mut acct_state,
         mss_clamp_enabled,
         &mut mss_clamp,
-    &info,
+        &info,
     )
     .await
     {
@@ -801,7 +806,7 @@ async fn drive_sstp(
                     &mut acct_state,
                     mss_clamp_enabled,
                     &mut mss_clamp,
-                &info,
+                    &info,
                 )
                 .await
                 {
@@ -832,7 +837,7 @@ async fn drive_sstp(
                     &mut acct_state,
                     mss_clamp_enabled,
                     &mut mss_clamp,
-                &info,
+                    &info,
                 )
                 .await
                 {
@@ -934,7 +939,7 @@ async fn drive_sstp(
                     &mut acct_state,
                     mss_clamp_enabled,
                     &mut mss_clamp,
-                &info,
+                    &info,
                 )
                 .await
                 {
@@ -967,7 +972,7 @@ async fn drive_sstp(
                         &mut acct_state,
                         mss_clamp_enabled,
                         &mut mss_clamp,
-                    &info,
+                        &info,
                     )
                     .await
                     {
@@ -1080,7 +1085,7 @@ async fn drive_sstp(
                                 &mut acct_state,
                                 mss_clamp_enabled,
                                 &mut mss_clamp,
-                            &info,
+                                &info,
                             )
                             .await
                             {
@@ -1205,7 +1210,7 @@ async fn drive_sstp(
                                 &mut acct_state,
                                 mss_clamp_enabled,
                                 &mut mss_clamp,
-                            &info,
+                                &info,
                             )
                             .await
                             {
@@ -1290,7 +1295,7 @@ async fn drive_sstp(
                                     &mut acct_state,
                                     mss_clamp_enabled,
                                     &mut mss_clamp,
-                                &info,
+                                    &info,
                                 )
                                 .await
                                 {
@@ -1341,7 +1346,7 @@ async fn drive_sstp(
                                         &mut acct_state,
                                         mss_clamp_enabled,
                                         &mut mss_clamp,
-                                    &info,
+                                        &info,
                                     )
                                     .await
                                     {

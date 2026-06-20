@@ -305,7 +305,10 @@ mod tests {
 
     #[test]
     fn content_type_decode_covers_iana_values() {
-        assert_eq!(TlsContentType::from_u8(20), TlsContentType::ChangeCipherSpec);
+        assert_eq!(
+            TlsContentType::from_u8(20),
+            TlsContentType::ChangeCipherSpec
+        );
         assert_eq!(TlsContentType::from_u8(21), TlsContentType::Alert);
         assert_eq!(TlsContentType::from_u8(22), TlsContentType::Handshake);
         assert_eq!(TlsContentType::from_u8(23), TlsContentType::ApplicationData);
@@ -439,10 +442,7 @@ mod tests {
     #[test]
     fn new_session_ticket_is_ignored_and_resets_to_idle() {
         let mut s = RekeyState::AwaitingRecord;
-        assert_eq!(
-            decide(&mut s, RekeyEvent::NewSessionTicket),
-            Action::Ignore
-        );
+        assert_eq!(decide(&mut s, RekeyEvent::NewSessionTicket), Action::Ignore);
         assert_eq!(s, RekeyState::Idle);
     }
 

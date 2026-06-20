@@ -183,15 +183,23 @@ struct Args {
 }
 
 fn print_usage(prog: &str) {
-    let color = io::stderr().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-    let bold = if color { Style::new().bold() } else { Style::new() };
+    let color =
+        io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    let bold = if color {
+        Style::new().bold()
+    } else {
+        Style::new()
+    };
     let opt = if color {
         Color::Cyan.into()
     } else {
         Style::new()
     };
-    let dim = if color { Style::new().dimmed() } else { Style::new() };
+    let dim = if color {
+        Style::new().dimmed()
+    } else {
+        Style::new()
+    };
 
     let mut out = io::stderr().lock();
     let _ = writeln!(
@@ -370,7 +378,10 @@ fn run_repl(socket: &Path, color: bool) -> Result<(), Box<dyn std::error::Error>
     }
 
     let banner_path = if color {
-        Style::new().bold().paint(socket.display().to_string()).to_string()
+        Style::new()
+            .bold()
+            .paint(socket.display().to_string())
+            .to_string()
     } else {
         socket.display().to_string()
     };

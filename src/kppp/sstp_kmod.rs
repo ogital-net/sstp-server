@@ -476,9 +476,8 @@ impl KmodSession {
     /// [`SSTP_CONTROL_MAX`] minus the 4-byte header. Any other
     /// error tears the session down on the kernel side.
     pub fn send_control(&self, body: &[u8]) -> io::Result<()> {
-        let len = u32::try_from(body.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "control body too large")
-        })?;
+        let len = u32::try_from(body.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "control body too large"))?;
         let req = SstpSendControlRaw {
             buf_len: len,
             reserved: 0,
@@ -519,9 +518,8 @@ impl KmodSession {
     }
 
     fn rekey(&self, ioc: libc::c_ulong, cipher_type: u32, crypto_info: &[u8]) -> io::Result<()> {
-        let info_len = u32::try_from(crypto_info.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "crypto_info too large")
-        })?;
+        let info_len = u32::try_from(crypto_info.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "crypto_info too large"))?;
         let req = SstpRekeyRaw {
             cipher_type,
             info_len,
@@ -531,9 +529,7 @@ impl KmodSession {
         // is `_IOW(...)` of `sizeof(SstpRekeyRaw)`; the kernel reads
         // `req` and dereferences `req.crypto_info` for `info_len`
         // bytes synchronously. Both buffers outlive the call.
-        let rc = unsafe {
-            libc::ioctl(self.session_fd.as_raw_fd(), ioc, &raw const req)
-        };
+        let rc = unsafe { libc::ioctl(self.session_fd.as_raw_fd(), ioc, &raw const req) };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }

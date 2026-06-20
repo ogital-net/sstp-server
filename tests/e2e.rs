@@ -302,8 +302,7 @@ async fn sstpc_pap_login() {
     // generous window — pppd is slow to start under load. Use
     // `collect_logs_until` (not `wait_for_log`) so we also retain
     // the kmod-fallback line that arrives moments before attach.
-    let pre_attach_logs =
-        server.collect_logs_until("data path ready", Duration::from_secs(15));
+    let pre_attach_logs = server.collect_logs_until("data path ready", Duration::from_secs(15));
 
     let Some(attach_line) = pre_attach_logs.as_ref().and_then(|v| v.last()).cloned() else {
         // Reap before panicking so we don't leak the child.
@@ -928,8 +927,7 @@ async fn sstpc_mtu_netfilter_shaping() {
     });
     let mut child = sstpc.await.expect("sstpc spawn join");
 
-    let pre_attach_logs =
-        server.collect_logs_until("data path ready", Duration::from_secs(20));
+    let pre_attach_logs = server.collect_logs_until("data path ready", Duration::from_secs(20));
     let Some(attach_line) = pre_attach_logs.as_ref().and_then(|v| v.last()).cloned() else {
         let _ = child.kill();
         let out = child.wait_with_output().expect("reap sstpc");
