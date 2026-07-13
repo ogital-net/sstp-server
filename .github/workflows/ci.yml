@@ -59,14 +59,14 @@ jobs:
       - run: cargo test --all-features --locked
 
   msrv:
-    name: msrv (1.85)
+    name: msrv (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # Must match `rust-version` in Cargo.toml. A build-only check is
       # enough to catch accidental use of newer language / std features;
       # behavioural coverage is the stable `test` job's responsibility.
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --all-features --locked
 

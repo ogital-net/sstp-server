@@ -2,12 +2,17 @@
 name = "sstp-server"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "BSD-2-Clause"
 description = "High-performance Linux SSTP (MS-SSTP) server"
 repository = "https://github.com/ogital-net/sstp-server"
 keywords = ["sstp", "vpn", "ppp", "radius"]
 categories = ["network-programming"]
+# This repo is a daemon, not a library — there is no crate API surface to
+# publish (see CLAUDE.md "Non-goals"). Marking it unpublishable also lets
+# cargo-deny's `allow-wildcard-paths` exempt our git `radius-tokio`
+# dependency, which crates.io would reject on a published crate anyway.
+publish = false
 
 [features]
 default = ["cli"]
@@ -25,7 +30,7 @@ path = "src/bin/sstp_server_cli.rs"
 required-features = ["cli"]
 
 [dependencies]
-aws-lc-sys = { version = "0.41", features = ["ssl"] }
+aws-lc-sys = { version = ">=0.41, <2", features = ["ssl"] }
 command-trie = { version = "1", optional = true }
 dotenvy = "0.15"
 fast-md5 = "1"
@@ -35,7 +40,7 @@ libc = "0.2"
 # in directly here so the CLI can colorize output without expanding the
 # build graph.
 nu-ansi-term = { version = "0.50", optional = true }
-rustyline = { version = "18", optional = true }
+rustyline = { version = "18", optional = true, default-features = false, features = ["with-dirs", "with-file-history"] }
 socket2 = { version = "0.6", features = ["all"] }
 radius-tokio = { git = "https://github.com/ogital-net/radius-tokio", branch = "client", default-features = false, features = ["dict-rfc", "dict-microsoft", "client", "fast-md5"] }
 thiserror = "2"

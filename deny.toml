@@ -25,6 +25,13 @@ unused-allowed-license = "warn"
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# A git dependency carries no version requirement, so cargo-deny counts
+# it as a wildcard. `radius-tokio` is our own sister crate pulled in via
+# git (branch = "client") until it publishes to crates.io. Exempt git /
+# path deps: this only applies to private crates (`publish = false` in
+# Cargo.toml) and to dev-dependencies, so a real `foo = "*"` from a
+# published dependency is still denied.
+allow-wildcard-paths = true
 
 # ── Advisories ───────────────────────────────────────────────────────
 [advisories]
@@ -37,3 +44,13 @@ ignore = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Require at least a branch specifier for git sources (no bare
+# master-tracking) so `cargo update` behaviour is predictable.
+required-git-spec = "branch"
+
+# Trust every repo under our own GitHub org. `radius-tokio` (and its
+# `radius-tokio-dict` / `-codegen` members) is pulled in via
+# git+https://github.com/ogital-net/radius-tokio until it publishes to
+# crates.io; allowing the org avoids re-listing each member crate.
+[sources.allow-org]
+github = ["ogital-net"]
