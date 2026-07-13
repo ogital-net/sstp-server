@@ -38,7 +38,7 @@ getopt-iter = "1"
 # JSON-RPC 2.0 over the control socket. server + newline for the daemon;
 # client + uds for the CLI. Feature unification merges them — the daemon
 # binary just doesn't use the client types.
-jasonrpc = { version = "0.4", features = ["server", "newline", "tokio", "client", "uds"] }
+jasonrpc = { version = "0.5", features = ["server", "newline", "tokio", "client", "uds"] }
 libc = "0.2"
 # Already a transitive dep via tracing-subscriber's "ansi" feature; pulled
 # in directly here so the CLI can colorize output without expanding the

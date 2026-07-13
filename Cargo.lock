@@ -467,9 +467,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jasonrpc"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958cc9492a1d33876f9eccfcb42531a7f77880d7f4940406d41bc9b93f21f126"
+checksum = "dbeba39ea5feab60fde5d5bbd57f97b99044d10d40a5b614890654ba5b1f989b"
 dependencies = [
  "memchr",
  "serde",
