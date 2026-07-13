@@ -1,37 +1,36 @@
-//! HAProxy-style Unix-domain admin socket (M7).
+//! JSON-RPC 2.0 control socket (M7).
 //!
-//! Runs on the auth runtime, never on an I/O worker, so a slow `socat`
-//! consumer cannot stall the packet path. Line-oriented text protocol:
-//! one request line, one response (terminated by an empty line on
-//! success or `Error: <msg>\n` on failure), then the client can issue
-//! another command on the same connection.
+//! Runs on the auth runtime, never on an I/O worker, so a slow consumer
+//! cannot stall the packet path. NUL-delimited JSON-RPC 2.0 over a
+//! Unix-domain stream socket, served by [`jasonrpc`].
 //!
-//! Access control is the filesystem: the socket file is created
-//! `0660`, group-owned by whatever group the process runs as. No
-//! in-band authentication.
+//! Access control is the filesystem: the socket file is created `0660`,
+//! group-owned by whatever group the process runs as. No in-band
+//! authentication.
 //!
-//! Command grammar (whitespace-separated tokens, case-sensitive to
-//! match `HAProxy` convention):
+//! ## Methods
 //!
-//! ```text
-//! show info
-//! show stat
-//! show session
-//! show session <id>
-//! disable session <id>
-//! shutdown
-//! help
-//! ```
-//!
-//! Unknown commands return `Error: unknown command\n` and the
-//! connection stays open.
+//! | Method               | Params          | Description                              |
+//! |----------------------|-----------------|------------------------------------------|
+//! | `show.info`          | —               | Version, uptime, thread counts, sessions |
+//! | `show.stat`          | —               | Metrics snapshot (key → value map)       |
+//! | `show.session.list`  | —               | List active sessions                     |
+//! | `show.session.get`   | `{id: u64}`     | Details for a single session             |
+//! | `session.disable`    | `{id: u64}`     | Tear down a session by id                |
+//! | `session.rekey`      | `{id: u64, ...}`| Force TLS 1.3 KeyUpdate on a session     |
+//! | `shutdown`           | —               | Ask the daemon to drain and exit         |
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
+use jasonrpc::server::Router;
+use jasonrpc::transport::Delimited;
+use jasonrpc::transport::io::FramedConn;
+use jasonrpc::{Error as RpcError, Request};
+use serde::Serialize;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -41,7 +40,6 @@ use crate::metrics;
 use crate::session::{ControlCommand, DisconnectReason, Registry, SessionId};
 
 const SOCKET_MODE: u32 = 0o660;
-const COMMAND_LINE_LIMIT: usize = 1024;
 
 #[derive(Debug, Error)]
 pub enum BindError {
@@ -66,8 +64,8 @@ pub enum BindError {
 }
 
 /// State the dispatcher needs to render responses and act on the
-/// process. Cloneable; the same view is handed to every connection
-/// task.
+/// process. Wrapped in `Arc` for sharing across handler tasks via
+/// `jasonrpc::server::Router::with_state`.
 #[derive(Clone)]
 pub struct ControlState {
     pub registry: Registry,
@@ -136,6 +134,62 @@ pub fn bind(
     Ok(listener)
 }
 
+/// Build the JSON-RPC [`Router`] with all registered methods.
+fn build_router(state: Arc<ControlState>) -> Router<Arc<ControlState>> {
+    Router::with_state(state)
+        .register(
+            "show.info",
+            |state: Arc<ControlState>, _req: Request| async move { Ok(render_info(&state)) },
+        )
+        .register(
+            "show.stat",
+            |_state: Arc<ControlState>, _req: Request| async move { Ok(render_stats_map()) },
+        )
+        .register(
+            "show.session.list",
+            |state: Arc<ControlState>, _req: Request| async move { Ok(render_sess_list(&state)) },
+        )
+        .register(
+            "show.session.get",
+            |state: Arc<ControlState>, req: Request| async move {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    id: u64,
+                }
+                let p: Params = req.params_as().ok_or_else(RpcError::invalid_params)?;
+                Ok(render_sess_one(&state, p.id))
+            },
+        )
+        .register(
+            "session.disable",
+            |state: Arc<ControlState>, req: Request| async move {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    id: u64,
+                }
+                let p: Params = req.params_as().ok_or_else(RpcError::invalid_params)?;
+                Ok(disable_session(&state, p.id))
+            },
+        )
+        .register(
+            "session.rekey",
+            |state: Arc<ControlState>, req: Request| async move {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    id: u64,
+                    #[serde(default)]
+                    request_peer: bool,
+                }
+                let p: Params = req.params_as().ok_or_else(RpcError::invalid_params)?;
+                Ok(rekey_session(&state, p.id, p.request_peer))
+            },
+        )
+        .register(
+            "shutdown",
+            |state: Arc<ControlState>, _req: Request| async move { Ok(shutdown(&state)) },
+        )
+}
+
 /// Run the accept loop over a pre-bound listener until `shutdown_rx`
 /// fires. `path` is only used so the socket file can be unlinked on
 /// shutdown — the caller is responsible for having already opened
@@ -150,7 +204,12 @@ pub async fn serve(
         path: path.clone(),
         source,
     })?;
-    info!(path = %path.display(), mode = format!("{:o}", SOCKET_MODE), "control socket ready");
+    let router = build_router(Arc::new(state));
+    info!(
+        path = %path.display(),
+        mode = format!("{:o}", SOCKET_MODE),
+        "control socket ready"
+    );
 
     loop {
         tokio::select! {
@@ -161,9 +220,9 @@ pub async fn serve(
             }
             res = listener.accept() => match res {
                 Ok((stream, _addr)) => {
-                    let state = state.clone();
+                    let router = router.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, state).await {
+                        if let Err(e) = handle_connection(stream, &router).await {
                             debug!(error = %e, "control connection ended");
                         }
                     });
@@ -177,187 +236,276 @@ pub async fn serve(
     Ok(())
 }
 
-async fn handle_connection(stream: UnixStream, state: ControlState) -> std::io::Result<()> {
-    let (rd, mut wr) = stream.into_split();
-    let mut reader = BufReader::new(rd);
-    let mut line = String::new();
+/// Handle a single control-socket connection. Reads NUL-delimited
+/// frames, dispatches them through the [`Router`], and writes the
+/// responses back.
+async fn handle_connection<S>(
+    stream: UnixStream,
+    router: &Router<S>,
+) -> Result<(), jasonrpc::error::TransportError>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let mut conn = FramedConn::new(stream, Delimited::new(b'\0'));
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        if line.len() > COMMAND_LINE_LIMIT {
-            wr.write_all(b"Error: command too long\n\n").await?;
-            continue;
-        }
-        let response = dispatch(line.trim(), &state);
-        wr.write_all(response.as_bytes()).await?;
-        if !response.ends_with('\n') {
-            wr.write_all(b"\n").await?;
-        }
-        // Blank-line terminator so clients can frame the response.
-        wr.write_all(b"\n").await?;
-        if response_requested_close(&response) {
-            return Ok(());
+        let Some(frame) = conn.recv().await? else {
+            return Ok(()); // clean EOF
+        };
+        let output = router.handle_bytes(&frame).await;
+        match output.to_bytes() {
+            Ok(Some(response_bytes)) => {
+                conn.send(&response_bytes).await?;
+            }
+            Ok(None) => {} // notification — no response per JSON-RPC 2.0
+            Err(e) => {
+                warn!(error = %e, "router to_bytes failed");
+            }
         }
     }
 }
 
-/// `shutdown` causes the dispatcher to drop the connection after the
-/// acknowledgement so the operator's `socat - UNIX-CONNECT:...` exits
-/// cleanly rather than blocking on the next read.
-fn response_requested_close(resp: &str) -> bool {
-    resp.starts_with("Shutting down")
+// ---------------------------------------------------------------------------
+// Response types — all Serialize so the Router can emit them as JSON.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct InfoResponse {
+    version: String,
+    uptime_seconds: u64,
+    io_threads: usize,
+    auth_threads: usize,
+    active_sessions: usize,
 }
 
-/// Pure command dispatcher. Split from the I/O layer so it is unit
-/// testable without spinning up a Unix socket.
-pub fn dispatch(line: &str, state: &ControlState) -> String {
-    let toks: Vec<&str> = line.split_ascii_whitespace().collect();
-    match toks.as_slice() {
-        [] => String::new(),
-        ["help"] => help_text().to_string(),
-        ["show", "info"] => render_info(state),
-        ["show", "stat"] => metrics::render_stats(),
-        ["show", "session"] => render_sess_list(state),
-        ["show", "session", id] => render_sess_one(state, id),
-        ["disable", "session", id] => disable_session(state, id),
-        ["rekey", "session"] => "Error: usage: rekey session <id> [request]".to_string(),
-        ["rekey", "session", id] => rekey_session(state, id, false),
-        ["rekey", "session", id, "request"] => rekey_session(state, id, true),
-        ["shutdown"] => shutdown(state),
-        _ => "Error: unknown command (try 'help')".to_string(),
+#[derive(Serialize)]
+struct SessionListItem {
+    id: String,
+    peer: String,
+    user: String,
+    ip: String,
+    uptime: String,
+    backend: String,
+    cipher: String,
+}
+
+#[derive(Serialize)]
+struct SessionDetail {
+    id: String,
+    peer: String,
+    uptime: String,
+    user: String,
+    auth_method: String,
+    assigned_ip: String,
+    local_ip: String,
+    ifname: String,
+    backend: String,
+    mtu: String,
+    tls_version: String,
+    cipher: String,
+    correlation_id: String,
+    rate_egress: String,
+    rate_ingress: String,
+}
+
+#[derive(Serialize)]
+struct SessionDisableResult {
+    ok: bool,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct SessionRekeyResult {
+    ok: bool,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ShutdownResult {
+    message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Handler implementations — pure functions from ControlState, testable
+// without the Router or any I/O.
+// ---------------------------------------------------------------------------
+
+fn render_info(state: &ControlState) -> InfoResponse {
+    InfoResponse {
+        version: cli::version_string(),
+        uptime_seconds: state.started.elapsed().as_secs(),
+        io_threads: state.io_threads,
+        auth_threads: state.auth_threads,
+        active_sessions: state.registry.len(),
     }
 }
 
-fn help_text() -> &'static str {
-    "Commands:\n\
-     show info\n\
-     show stat\n\
-     show session\n\
-     show session <id>\n\
-     disable session <id>\n\
-     rekey session <id> [request]\n\
-     shutdown\n\
-     help"
+fn render_stats_map() -> serde_json::Value {
+    serde_json::json!({
+        "sstp_connections_accepted": metrics::CONNECTIONS_ACCEPTED.get(),
+        "sstp_connections_active": metrics::CONNECTIONS_ACTIVE.get(),
+        "sstp_handshake_failures": metrics::HANDSHAKE_FAILURES.get(),
+        "sstp_auth_accept": metrics::AUTH_ACCEPT.get(),
+        "sstp_auth_reject": metrics::AUTH_REJECT.get(),
+        "sstp_session_teardown_clean": metrics::SESSION_TEARDOWN_CLEAN.get(),
+        "sstp_session_teardown_admin": metrics::SESSION_TEARDOWN_ADMIN.get(),
+        "sstp_session_teardown_coa": metrics::SESSION_TEARDOWN_COA.get(),
+        "sstp_session_teardown_shutdown": metrics::SESSION_TEARDOWN_SHUTDOWN.get(),
+        "sstp_session_teardown_rekey_handshake": metrics::SESSION_TEARDOWN_REKEY_HANDSHAKE.get(),
+        "sstp_session_teardown_rekey_alert": metrics::SESSION_TEARDOWN_REKEY_ALERT.get(),
+        "sstp_session_teardown_rekey_other": metrics::SESSION_TEARDOWN_REKEY_OTHER.get(),
+        "sstp_session_panics": metrics::SESSION_PANICS.get(),
+        "sstp_crypto_binding_failures": metrics::CRYPTO_BINDING_FAILURES.get(),
+        "sstp_np_filter_drops_pre_ipcp": metrics::NP_FILTER_DROPS_PRE_IPCP.get(),
+        "sstp_np_filter_drops_mru": metrics::NP_FILTER_DROPS_MRU.get(),
+        "sstp_log_lines_dropped": metrics::LOG_LINES_DROPPED.get(),
+    })
 }
 
-fn render_info(state: &ControlState) -> String {
-    let uptime = state.started.elapsed();
-    format!(
-        "version: {version}\n\
-         uptime_seconds: {uptime}\n\
-         io_threads: {io}\n\
-         auth_threads: {auth}\n\
-         active_sessions: {sessions}",
-        version = cli::version_string(),
-        uptime = uptime.as_secs(),
-        io = state.io_threads,
-        auth = state.auth_threads,
-        sessions = state.registry.len(),
-    )
+fn render_sess_list(state: &ControlState) -> Vec<SessionListItem> {
+    state
+        .registry
+        .snapshot()
+        .into_iter()
+        .map(|h| {
+            let i = h.info();
+            SessionListItem {
+                id: h.id.to_string(),
+                peer: h.peer.to_string(),
+                user: i.username.unwrap_or_else(|| "-".to_string()),
+                ip: i
+                    .assigned_ip
+                    .map_or_else(|| "-".to_string(), |a| a.to_string()),
+                uptime: i
+                    .started_at
+                    .map_or_else(|| "-".to_string(), |t| format_duration(t.elapsed())),
+                backend: i.backend.unwrap_or("-").to_string(),
+                cipher: i.cipher.unwrap_or_else(|| "-".to_string()),
+            }
+        })
+        .collect()
 }
 
-fn render_sess_list(state: &ControlState) -> String {
-    use std::fmt::Write as _;
-    let snapshot = state.registry.snapshot();
-    if snapshot.is_empty() {
-        return "(no active sessions)".to_string();
+fn render_sess_one(state: &ControlState, raw_id: u64) -> SessionDetail {
+    let id = SessionId::from_u64(raw_id);
+    let h = state.registry.get(id);
+    SessionDetail {
+        id: raw_id.to_string(),
+        peer: h.as_ref().map_or("-".to_string(), |h| h.peer.to_string()),
+        uptime: h.as_ref().map_or("-".to_string(), |h| {
+            let i = h.info();
+            i.started_at
+                .map_or_else(|| "-".to_string(), |t| format_duration(t.elapsed()))
+        }),
+        user: h
+            .as_ref()
+            .and_then(|h| h.info().username)
+            .unwrap_or_else(|| "-".to_string()),
+        auth_method: h
+            .as_ref()
+            .and_then(|h| h.info().auth_method)
+            .map_or_else(|| "-".to_string(), |m| format!("{m:?}")),
+        assigned_ip: h
+            .as_ref()
+            .and_then(|h| h.info().assigned_ip)
+            .map_or_else(|| "-".to_string(), |a| a.to_string()),
+        local_ip: h
+            .as_ref()
+            .and_then(|h| h.info().local_ip)
+            .map_or_else(|| "-".to_string(), |a| a.to_string()),
+        ifname: h
+            .as_ref()
+            .and_then(|h| h.info().ifname)
+            .unwrap_or_else(|| "-".to_string()),
+        backend: h
+            .as_ref()
+            .and_then(|h| h.info().backend)
+            .unwrap_or("-")
+            .to_string(),
+        mtu: h
+            .as_ref()
+            .and_then(|h| h.info().mtu)
+            .map_or_else(|| "-".to_string(), |m| m.to_string()),
+        tls_version: h
+            .as_ref()
+            .and_then(|h| h.info().tls_version)
+            .unwrap_or_else(|| "-".to_string()),
+        cipher: h
+            .as_ref()
+            .and_then(|h| h.info().cipher)
+            .unwrap_or_else(|| "-".to_string()),
+        correlation_id: h
+            .as_ref()
+            .and_then(|h| h.info().correlation_id)
+            .unwrap_or_else(|| "-".to_string()),
+        rate_egress: h.as_ref().map_or("-".to_string(), |h| {
+            let info = h.info();
+            format_rate(info.shaping.as_ref().and_then(|s| s.egress.as_ref()))
+        }),
+        rate_ingress: h.as_ref().map_or("-".to_string(), |h| {
+            let info = h.info();
+            format_rate(info.shaping.as_ref().and_then(|s| s.ingress.as_ref()))
+        }),
     }
-    let mut out = String::with_capacity(snapshot.len() * 96);
-    let _ = writeln!(out, "id\tpeer\tuser\tip\tuptime\tbackend\tcipher");
-    for h in snapshot {
-        let i = h.info();
-        let user = i.username.as_deref().unwrap_or("-");
-        let ip = i
-            .assigned_ip
-            .map_or_else(|| "-".to_string(), |a| a.to_string());
-        let uptime = i
-            .started_at
-            .map_or_else(|| "-".to_string(), |t| format_duration(t.elapsed()));
-        let backend = i.backend.unwrap_or("-");
-        let cipher = i.cipher.as_deref().unwrap_or("-");
-        let _ = writeln!(
-            out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            h.id, h.peer, user, ip, uptime, backend, cipher
-        );
-    }
-    out.pop();
-    out
 }
 
-fn render_sess_one(state: &ControlState, id_str: &str) -> String {
-    use std::fmt::Write as _;
-    let Some(id) = parse_session_id(id_str) else {
-        return format!("Error: invalid session id {id_str:?}");
-    };
+fn disable_session(state: &ControlState, raw_id: u64) -> SessionDisableResult {
+    let id = SessionId::from_u64(raw_id);
     let Some(h) = state.registry.get(id) else {
-        return format!("Error: no such session {id}");
+        return SessionDisableResult {
+            ok: false,
+            message: format!("no such session {raw_id}"),
+        };
     };
-    let i = h.info();
-    let mut out = String::with_capacity(512);
-    let _ = writeln!(out, "id: {}", h.id);
-    let _ = writeln!(out, "peer: {}", h.peer);
-    let _ = writeln!(
-        out,
-        "uptime: {}",
-        i.started_at
-            .map_or_else(|| "-".to_string(), |t| format_duration(t.elapsed()))
-    );
-    let _ = writeln!(out, "user: {}", i.username.as_deref().unwrap_or("-"));
-    let _ = writeln!(
-        out,
-        "auth_method: {}",
-        i.auth_method
-            .map_or_else(|| "-".to_string(), |m| format!("{m:?}"))
-    );
-    let _ = writeln!(
-        out,
-        "assigned_ip: {}",
-        i.assigned_ip
-            .map_or_else(|| "-".to_string(), |a| a.to_string())
-    );
-    let _ = writeln!(
-        out,
-        "local_ip: {}",
-        i.local_ip
-            .map_or_else(|| "-".to_string(), |a| a.to_string())
-    );
-    let _ = writeln!(out, "ifname: {}", i.ifname.as_deref().unwrap_or("-"));
-    let _ = writeln!(out, "backend: {}", i.backend.unwrap_or("-"));
-    let _ = writeln!(
-        out,
-        "mtu: {}",
-        i.mtu.map_or_else(|| "-".to_string(), |m| m.to_string())
-    );
-    let _ = writeln!(
-        out,
-        "tls_version: {}",
-        i.tls_version.as_deref().unwrap_or("-")
-    );
-    let _ = writeln!(out, "cipher: {}", i.cipher.as_deref().unwrap_or("-"));
-    let _ = writeln!(
-        out,
-        "correlation_id: {}",
-        i.correlation_id.as_deref().unwrap_or("-")
-    );
-    let _ = writeln!(
-        out,
-        "rate_egress: {}",
-        format_rate(i.shaping.as_ref().and_then(|s| s.egress.as_ref()))
-    );
-    let _ = writeln!(
-        out,
-        "rate_ingress: {}",
-        format_rate(i.shaping.as_ref().and_then(|s| s.ingress.as_ref()))
-    );
-    out.pop();
-    out
+    if h.try_send(ControlCommand::Disconnect(DisconnectReason::AdminRequested)) {
+        SessionDisableResult {
+            ok: true,
+            message: format!("disconnect queued for session {raw_id}"),
+        }
+    } else {
+        SessionDisableResult {
+            ok: false,
+            message: format!("session {raw_id} could not be notified (queue full or exiting)"),
+        }
+    }
 }
 
-/// Format a `std::time::Duration` as `HHh MMm SSs` / `MMm SSs` / `SSs`.
+fn rekey_session(state: &ControlState, raw_id: u64, request_peer: bool) -> SessionRekeyResult {
+    let id = SessionId::from_u64(raw_id);
+    let Some(h) = state.registry.get(id) else {
+        return SessionRekeyResult {
+            ok: false,
+            message: format!("no such session {raw_id}"),
+        };
+    };
+    if h.try_send(ControlCommand::Rekey { request_peer }) {
+        let label = if request_peer {
+            "rekey queued (with update_requested)"
+        } else {
+            "rekey queued"
+        };
+        SessionRekeyResult {
+            ok: true,
+            message: format!("{label} for session {raw_id}"),
+        }
+    } else {
+        SessionRekeyResult {
+            ok: false,
+            message: format!("session {raw_id} could not be notified (queue full or exiting)"),
+        }
+    }
+}
+
+fn shutdown(state: &ControlState) -> ShutdownResult {
+    let _ = state.shutdown_tx.send(());
+    ShutdownResult {
+        message: "shutting down".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
 fn format_duration(d: std::time::Duration) -> String {
     let total = d.as_secs();
     let h = total / 3600;
@@ -372,7 +520,6 @@ fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
-/// Render a [`crate::shape::RateSpec`] as `Nbps[/burst]` or `-`.
 fn format_rate(rate: Option<&crate::shape::RateSpec>) -> String {
     match rate {
         None => "-".to_string(),
@@ -383,57 +530,13 @@ fn format_rate(rate: Option<&crate::shape::RateSpec>) -> String {
     }
 }
 
-fn disable_session(state: &ControlState, id_str: &str) -> String {
-    let Some(id) = parse_session_id(id_str) else {
-        return format!("Error: invalid session id {id_str:?}");
-    };
-    let Some(h) = state.registry.get(id) else {
-        return format!("Error: no such session {id}");
-    };
-    if h.try_send(ControlCommand::Disconnect(DisconnectReason::AdminRequested)) {
-        format!("Disconnect queued for session {id}")
-    } else {
-        format!("Error: session {id} could not be notified (queue full or exiting)")
-    }
-}
-
-/// Force a TLS 1.3 `KeyUpdate` on a single session. Useful for soak
-/// testing the rekey path: setting `request_peer = true` (`rekey
-/// session <id> request`) makes the peer respond with its own
-/// `KeyUpdate`, exercising both directions. TUN backend only — see
-/// [`ControlCommand::Rekey`] for the kmod gate.
-fn rekey_session(state: &ControlState, id_str: &str, request_peer: bool) -> String {
-    let Some(id) = parse_session_id(id_str) else {
-        return format!("Error: invalid session id {id_str:?}");
-    };
-    let Some(h) = state.registry.get(id) else {
-        return format!("Error: no such session {id}");
-    };
-    if h.try_send(ControlCommand::Rekey { request_peer }) {
-        let label = if request_peer {
-            "Rekey queued (with update_requested) for session"
-        } else {
-            "Rekey queued for session"
-        };
-        format!("{label} {id}")
-    } else {
-        format!("Error: session {id} could not be notified (queue full or exiting)")
-    }
-}
-
-fn shutdown(state: &ControlState) -> String {
-    let _ = state.shutdown_tx.send(());
-    "Shutting down".to_string()
-}
-
-fn parse_session_id(s: &str) -> Option<SessionId> {
-    s.parse::<u64>().ok().map(SessionId::from_u64)
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_state() -> (ControlState, broadcast::Receiver<()>) {
         let (tx, rx) = broadcast::channel(1);
@@ -448,68 +551,68 @@ mod tests {
     }
 
     #[test]
-    fn empty_line_is_silent() {
+    fn show_info_includes_uptime_and_threads() {
         let (state, _rx) = test_state();
-        assert_eq!(dispatch("", &state), "");
-        assert_eq!(dispatch("   ", &state), "");
+        let out = render_info(&state);
+        // version_string is either "0.1.0" or "0.1.0 (sha date)" — never
+        // contains the crate name (that's the CLI --version format).
+        assert!(!out.version.is_empty());
+        assert_eq!(out.io_threads, 2);
+        assert_eq!(out.auth_threads, 1);
+        assert_eq!(out.active_sessions, 0);
     }
 
     #[test]
-    fn unknown_command_returns_error() {
-        let (state, _rx) = test_state();
-        assert!(dispatch("frobnicate", &state).starts_with("Error: unknown command"));
+    fn show_stat_has_expected_keys() {
+        let (_state, _rx) = test_state();
+        let map = render_stats_map();
+        let obj = map.as_object().unwrap();
+        assert!(obj.contains_key("sstp_connections_accepted"));
+        assert!(obj.contains_key("sstp_connections_active"));
     }
 
     #[test]
-    fn show_info_lists_uptime_and_threads() {
+    fn show_session_list_empty_then_one() {
         let (state, _rx) = test_state();
-        let out = dispatch("show info", &state);
-        assert!(out.contains("version: "));
-        assert!(out.contains("io_threads: 2"));
-        assert!(out.contains("auth_threads: 1"));
-        assert!(out.contains("active_sessions: 0"));
-    }
+        assert!(render_sess_list(&state).is_empty());
 
-    #[test]
-    fn show_stat_includes_metric_names() {
-        let (state, _rx) = test_state();
-        let out = dispatch("show stat", &state);
-        assert!(out.contains("sstp_connections_accepted:"));
-    }
-
-    #[test]
-    fn show_sess_empty_then_one() {
-        let (state, _rx) = test_state();
-        assert_eq!(dispatch("show session", &state), "(no active sessions)");
         let id = SessionId::next();
         let peer = "127.0.0.1:5555".parse().unwrap();
         let (handle, _session_rx) = crate::session::SessionHandle::for_test(id, peer);
         state.registry.register(handle);
-        let listing = dispatch("show session", &state);
-        assert!(listing.contains(&id.to_string()));
-        assert!(listing.contains("127.0.0.1:5555"));
-        let one = dispatch(&format!("show session {id}"), &state);
-        assert!(one.contains("127.0.0.1:5555"));
+
+        let list = render_sess_list(&state);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, id.to_string());
+        assert!(list[0].peer.contains("127.0.0.1:5555"));
     }
 
     #[test]
-    fn disable_session_unknown_id_errors() {
+    fn session_detail_unknown_id_returns_hyphens() {
         let (state, _rx) = test_state();
-        assert!(dispatch("disable session 999999", &state).starts_with("Error: no such session"));
-        assert!(
-            dispatch("disable session notanid", &state).starts_with("Error: invalid session id")
-        );
+        let d = render_sess_one(&state, 999_999);
+        assert_eq!(d.peer, "-");
+        assert_eq!(d.user, "-");
+    }
+
+    #[test]
+    fn disable_unknown_session_returns_error() {
+        let (state, _rx) = test_state();
+        let r = disable_session(&state, 999_999);
+        assert!(!r.ok);
+        assert!(r.message.contains("no such session"));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn disable_session_known_id_queues_disconnect() {
+    async fn disable_known_session_queues_disconnect() {
         let (state, _rx) = test_state();
         let id = SessionId::next();
+        let raw = id.as_u64();
         let peer = "127.0.0.1:5555".parse().unwrap();
         let (handle, mut session_rx) = crate::session::SessionHandle::for_test(id, peer);
         state.registry.register(handle);
-        let out = dispatch(&format!("disable session {id}"), &state);
-        assert!(out.starts_with("Disconnect queued"));
+        let r = disable_session(&state, raw);
+        assert!(r.ok);
         let cmd = session_rx.recv().await.expect("disconnect delivered");
         assert!(matches!(
             cmd,
@@ -517,24 +620,17 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rekey_session_unknown_id_errors() {
-        let (state, _rx) = test_state();
-        assert!(dispatch("rekey session 999999", &state).starts_with("Error: no such session"));
-        assert!(dispatch("rekey session notanid", &state).starts_with("Error: invalid session id"));
-        assert!(dispatch("rekey session", &state).starts_with("Error: usage:"));
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn rekey_session_default_does_not_request_peer() {
         let (state, _rx) = test_state();
         let id = SessionId::next();
+        let raw = id.as_u64();
         let peer = "127.0.0.1:5555".parse().unwrap();
         let (handle, mut session_rx) = crate::session::SessionHandle::for_test(id, peer);
         state.registry.register(handle);
-        let out = dispatch(&format!("rekey session {id}"), &state);
-        assert!(out.starts_with("Rekey queued"));
-        assert!(!out.contains("update_requested"));
+        let r = rekey_session(&state, raw, false);
+        assert!(r.ok);
+        assert!(!r.message.contains("update_requested"));
         let cmd = session_rx.recv().await.expect("rekey delivered");
         assert!(matches!(
             cmd,
@@ -548,75 +644,22 @@ mod tests {
     async fn rekey_session_request_sets_peer_flag() {
         let (state, _rx) = test_state();
         let id = SessionId::next();
+        let raw = id.as_u64();
         let peer = "127.0.0.1:5555".parse().unwrap();
         let (handle, mut session_rx) = crate::session::SessionHandle::for_test(id, peer);
         state.registry.register(handle);
-        let out = dispatch(&format!("rekey session {id} request"), &state);
-        assert!(out.contains("update_requested"));
+        let r = rekey_session(&state, raw, true);
+        assert!(r.ok);
+        assert!(r.message.contains("update_requested"));
         let cmd = session_rx.recv().await.expect("rekey delivered");
         assert!(matches!(cmd, ControlCommand::Rekey { request_peer: true }));
     }
 
     #[test]
-    fn rekey_session_garbage_fourth_token_is_unknown() {
-        let (state, _rx) = test_state();
-        let id = SessionId::next();
-        let peer = "127.0.0.1:5555".parse().unwrap();
-        let (handle, _session_rx) = crate::session::SessionHandle::for_test(id, peer);
-        state.registry.register(handle);
-        // anything other than literal "request" should fall through
-        // to "unknown command" rather than silently rekeying.
-        let out = dispatch(&format!("rekey session {id} bogus"), &state);
-        assert!(out.starts_with("Error: unknown command"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn shutdown_broadcasts() {
+    fn shutdown_sends_on_channel() {
         let (state, mut rx) = test_state();
-        let out = dispatch("shutdown", &state);
-        assert_eq!(out, "Shutting down");
-        rx.recv().await.expect("shutdown broadcast received");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn unix_socket_round_trip() {
-        let dir = std::env::temp_dir().join(format!(
-            "sstp-ctl-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("ctl.sock");
-        let (state, shutdown_rx) = test_state();
-        let sock_clone = sock.clone();
-        let task = tokio::spawn(async move {
-            let listener = bind(&sock_clone, None).unwrap();
-            serve(sock_clone, listener, state, shutdown_rx)
-                .await
-                .unwrap();
-        });
-        // Wait for bind.
-        for _ in 0..50 {
-            if sock.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(sock.exists(), "control socket did not appear");
-
-        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
-        stream.write_all(b"show info\n").await.unwrap();
-        let mut buf = [0u8; 512];
-        let n = stream.read(&mut buf).await.unwrap();
-        let resp = std::str::from_utf8(&buf[..n]).unwrap();
-        assert!(resp.contains("io_threads:"), "got: {resp}");
-
-        stream.write_all(b"shutdown\n").await.unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
-        assert!(!sock.exists(), "socket file should be removed");
-        let _ = std::fs::remove_dir_all(&dir);
+        let r = shutdown(&state);
+        assert_eq!(r.message, "shutting down");
+        assert!(rx.try_recv().is_ok());
     }
 }

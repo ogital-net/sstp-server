@@ -2,8 +2,8 @@
 //! control socket.
 //!
 //! Connects to a Unix-domain stream socket (default
-//! `/run/sstp-server.sock`) and drives the line-oriented admin
-//! protocol from [`crate::control`] in a rustyline session.
+//! `/run/sstp-server.sock`) and drives the JSON-RPC 2.0 protocol
+//! served by [`crate::control`] in a rustyline session.
 //!
 //! Fish-style affordances:
 //! - dim inline hint extending the current word to the longest
@@ -12,24 +12,20 @@
 //!   branch point lists candidates,
 //! - persistent history at `$XDG_STATE_HOME/sstp-server/history`
 //!   (or `~/.local/state/sstp-server/history`).
-//!
-//! The CLI is a thin client — it sends the typed line verbatim to
-//! the daemon and prints the response until the daemon writes a
-//! terminator (empty line). `quit` / `exit` / Ctrl-D leave the
-//! REPL without touching the daemon; `shutdown` is forwarded and
-//! ends the session because the daemon closes the connection.
 
 use std::borrow::Cow;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use command_trie::{CommandTrie, CommandTrieBuilder};
 use getopt_iter::Getopt;
+use jasonrpc::client::UdsClient;
+use jasonrpc::transport::Delimited;
 use nu_ansi_term::{Color, Style};
 use rustyline::completion::{Completer, Pair};
+use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
@@ -40,9 +36,8 @@ use rustyline::{Context, Editor, Helper};
 const DEFAULT_SOCKET: &str = "/run/sstp-server.sock";
 
 /// Static command vocabulary advertised to the operator. Kept
-/// deliberately narrower than [`crate::control::dispatch`] supports:
-/// `rekey session` is omitted because the cooperative-rekey path is
-/// not a stable surface for end users (see `crate::crypto::rekey`).
+/// deliberately narrower than [`crate::control`] supports:
+/// `rekey session` is listed.
 ///
 /// `clear` is REPL-local (handled before sending to the daemon).
 const COMMANDS: &[(&str, &str)] = &[
@@ -176,6 +171,10 @@ impl Completer for ReplHelper {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Args
+// ---------------------------------------------------------------------------
+
 #[derive(Debug)]
 struct Args {
     socket: PathBuf,
@@ -221,7 +220,6 @@ fn print_usage(prog: &str) {
         ("-h, --help", "Print this help".to_string()),
         ("-V, --version", "Print version".to_string()),
     ] {
-        // Pad before colouring so the width counts characters, not ANSI bytes.
         let padded = format!("{flag:<22}");
         let _ = writeln!(out, "  {} {}", opt.paint(padded), dim.paint(desc));
     }
@@ -266,79 +264,142 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args { socket, one_shot })
 }
 
-/// Send `cmd` on a fresh connection to `socket` and stream the
-/// response to stdout. The control protocol terminates each
-/// response with a blank line; we read until that or EOF.
-fn run_one(socket: &Path, cmd: &str, color: bool) -> io::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.write_all(cmd.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
+// ---------------------------------------------------------------------------
+// Command translation: translates text commands to JSON-RPC before sending
+// them over the control socket.
+// ---------------------------------------------------------------------------
 
-    let mut buf = [0u8; 4096];
-    let mut acc = Vec::with_capacity(1024);
-    loop {
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            break;
+/// Translate a text command line to a JSON-RPC `(method, params)`
+/// pair, or `None` if the command is REPL-local (`quit`, `exit`, `clear`,
+/// `help`).
+fn translate_command(line: &str) -> Option<(String, serde_json::Value)> {
+    let toks: Vec<&str> = line.split_ascii_whitespace().collect();
+    match toks.as_slice() {
+        ["show", "info"] => Some(("show.info".to_string(), serde_json::Value::Null)),
+        ["show", "stat"] => Some(("show.stat".to_string(), serde_json::Value::Null)),
+        ["show", "session"] => Some(("show.session.list".to_string(), serde_json::Value::Null)),
+        ["show", "session", id_str] => {
+            let id: u64 = id_str.parse().ok()?;
+            Some((
+                "show.session.get".to_string(),
+                serde_json::json!({"id": id}),
+            ))
         }
-        acc.extend_from_slice(&buf[..n]);
-        if acc.ends_with(b"\n\n") {
-            acc.truncate(acc.len() - 1);
-            break;
+        ["disable", "session", id_str] => {
+            let id: u64 = id_str.parse().ok()?;
+            Some(("session.disable".to_string(), serde_json::json!({"id": id})))
+        }
+        ["rekey", "session", id_str] => {
+            let id: u64 = id_str.parse().ok()?;
+            Some(("session.rekey".to_string(), serde_json::json!({"id": id})))
+        }
+        ["rekey", "session", id_str, "request"] => {
+            let id: u64 = id_str.parse().ok()?;
+            Some((
+                "session.rekey".to_string(),
+                serde_json::json!({"id": id, "request_peer": true}),
+            ))
+        }
+        ["shutdown"] => Some(("shutdown".to_string(), serde_json::Value::Null)),
+        _ => None,
+    }
+}
+
+/// Send a single JSON-RPC call and return the pretty-printed result.
+async fn run_rpc_call(
+    client: &UdsClient<Delimited>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<String, jasonrpc::error::ClientError> {
+    let raw_result: serde_json::Value = client.call(method, params).await?;
+    Ok(serde_json::to_string_pretty(&raw_result).expect("JSON serialization should not fail"))
+}
+
+/// Send a single command to the daemon and stream the JSON-RPC result
+/// to stdout.
+fn run_one(socket: &Path, cmd: &str, color: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?;
+
+    // REPL-local commands
+    match cmd {
+        "quit" | "exit" | "clear" => return Ok(()),
+        "help" => {
+            print_help(color);
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let Some((method, params)) = translate_command(cmd) else {
+        let msg = format!("Error: unknown command {cmd:?} (try 'help')");
+        if color {
+            eprintln!("{}", Color::Red.bold().paint(msg));
+        } else {
+            eprintln!("{msg}");
+        }
+        return Ok(());
+    };
+
+    // Quick connectivity check before creating the client — gives a
+    // better error message than a timeout / transport error.
+    match UnixStream::connect(socket) {
+        Ok(s) => drop(s),
+        Err(e) => {
+            eprintln!("connect {}: {e}", socket.display());
+            return Err(e.into());
         }
     }
-    let text = String::from_utf8_lossy(&acc);
-    let mut stdout = io::stdout().lock();
-    if color {
-        write_colored(&mut stdout, &text)?;
-    } else {
-        stdout.write_all(text.as_bytes())?;
-        if !text.ends_with('\n') {
+
+    rt.block_on(async {
+        let client = UdsClient::connect(
+            socket.to_str().expect("valid UTF-8 path"),
+            Delimited::new(b'\0'),
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("connect: {e}").into() })?;
+        let result_text = run_rpc_call(&client, &method, params)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { format!("rpc: {e}").into() })?;
+
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(result_text.as_bytes())?;
+        if !result_text.ends_with('\n') {
             writeln!(stdout)?;
         }
-    }
+        stdout.flush()?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
     Ok(())
 }
 
-/// Decorate a daemon response for a TTY. Cheap heuristics keyed off
-/// the response shape — the daemon's grammar is line-oriented
-/// `key: value` / `Error: ...` / tab-separated tables.
-fn write_colored(out: &mut impl Write, text: &str) -> io::Result<()> {
-    let key_style = Style::new().dimmed();
-    let err_label = Color::Red.bold();
-    let err_body: Style = Color::Red.into();
-    let header_style = Style::new().bold();
-    let ok_label = Color::Green.bold();
+fn print_help(color: bool) {
+    let cmd_style = if color {
+        Style::new().bold()
+    } else {
+        Style::new()
+    };
+    let dim = if color {
+        Style::new().dimmed()
+    } else {
+        Style::new()
+    };
 
-    let lines: Vec<&str> = text.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        if let Some(rest) = line.strip_prefix("Error: ") {
-            writeln!(
-                out,
-                "{}{}",
-                err_label.paint("Error:"),
-                err_body.paint(format!(" {rest}"))
-            )?;
-        } else if line.starts_with("Disconnect queued")
-            || line.starts_with("Shutting down")
-            || line.starts_with("Rekey queued")
-        {
-            let (head, tail) = line.split_once(' ').unwrap_or((line, ""));
-            writeln!(out, "{} {tail}", ok_label.paint(head))?;
-        } else if line.contains('\t') {
-            // Bold the first row only — that's the header for show session.
-            let style = if i == 0 { header_style } else { Style::new() };
-            writeln!(out, "{}", style.paint(*line))?;
-        } else if let Some((k, v)) = line.split_once(": ") {
-            writeln!(out, "{}: {v}", key_style.paint(k))?;
-        } else {
-            writeln!(out, "{line}")?;
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "{}", Style::new().bold().paint("Commands:"));
+    for (cmd, desc) in COMMANDS {
+        if ["quit", "clear"].contains(cmd) {
+            continue; // internal
         }
+        let padded = format!("{cmd:<24}");
+        let _ = writeln!(out, "  {} {}", cmd_style.paint(padded), dim.paint(*desc));
     }
-    Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// History path
+// ---------------------------------------------------------------------------
 
 fn history_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
@@ -357,10 +418,17 @@ fn history_path() -> Option<PathBuf> {
     Some(p)
 }
 
+// ---------------------------------------------------------------------------
+// REPL
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_lines)]
 fn run_repl(socket: &Path, color: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Quick connectivity check before entering the editor; otherwise
-    // every command would surface the same error and the REPL would
-    // feel haunted.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?;
+
+    // Quick connectivity check before entering the editor.
     match UnixStream::connect(socket) {
         Ok(_) => {}
         Err(e) => {
@@ -369,8 +437,20 @@ fn run_repl(socket: &Path, color: bool) -> Result<(), Box<dyn std::error::Error>
         }
     }
 
+    // Establish a persistent UDS client — one TCP connection per REPL
+    // session, reused for every command.
+    let client: UdsClient<Delimited> = rt.block_on(async {
+        UdsClient::connect(
+            socket.to_str().expect("valid UTF-8 path"),
+            Delimited::new(b'\0'),
+        )
+        .await
+        .map_err(|e| format!("connect failed: {e}"))
+    })?;
+
     let mut rl: Editor<ReplHelper, DefaultHistory> = Editor::new()?;
     rl.set_helper(Some(ReplHelper::new(color)));
+    rl.set_completion_type(rustyline::config::CompletionType::List);
 
     let history = history_path();
     if let Some(p) = history.as_ref() {
@@ -399,24 +479,50 @@ fn run_repl(socket: &Path, color: bool) -> Result<(), Box<dyn std::error::Error>
                     continue;
                 }
                 let _ = rl.add_history_entry(trimmed);
+
                 match trimmed {
                     "quit" | "exit" => break,
                     "clear" => {
-                        // ANSI: cursor home + clear screen.
                         let _ = io::stdout().write_all(b"\x1b[2J\x1b[H");
                         let _ = io::stdout().flush();
                         continue;
                     }
+                    "help" => {
+                        print_help(color);
+                        continue;
+                    }
                     _ => {}
                 }
-                if let Err(e) = run_one(socket, trimmed, color) {
-                    let msg = format!("error: {e}");
+
+                let Some((method, params)) = translate_command(trimmed) else {
+                    let msg = format!("Unknown command {trimmed:?} (try 'help')");
                     if color {
                         eprintln!("{}", Color::Red.bold().paint(msg));
                     } else {
                         eprintln!("{msg}");
                     }
+                    continue;
+                };
+
+                match rt.block_on(run_rpc_call(&client, &method, params)) {
+                    Ok(text) => {
+                        let mut stdout = io::stdout().lock();
+                        stdout.write_all(text.as_bytes())?;
+                        if !text.ends_with('\n') {
+                            writeln!(stdout)?;
+                        }
+                        stdout.flush()?;
+                    }
+                    Err(e) => {
+                        let msg = format!("error: {e}");
+                        if color {
+                            eprintln!("{}", Color::Red.bold().paint(msg));
+                        } else {
+                            eprintln!("{msg}");
+                        }
+                    }
                 }
+
                 if trimmed == "shutdown" {
                     eprintln!("(daemon shutting down; closing REPL)");
                     break;
@@ -438,6 +544,10 @@ fn run_repl(socket: &Path, color: bool) -> Result<(), Box<dyn std::error::Error>
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
 
 fn main() -> ExitCode {
     let args = match parse_args() {

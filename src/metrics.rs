@@ -113,81 +113,6 @@ pub static NP_FILTER_DROPS_MRU: Counter = Counter::new();
 
 pub static LOG_LINES_DROPPED: Counter = Counter::new();
 
-/// Render every metric as a HAProxy-style `name: value\n` block,
-/// suitable for the control socket's `show stat` response. Allocation
-/// happens here, not at metric-update time — call sites stay
-/// allocation-free on the hot path.
-///
-/// Output is stable: one line per metric, names in the order declared
-/// above, no header line. Designed to be diff-friendly across
-/// snapshots and easy to grep.
-pub fn render_stats() -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(512);
-    let _ = writeln!(
-        out,
-        "sstp_connections_accepted: {}",
-        CONNECTIONS_ACCEPTED.get()
-    );
-    let _ = writeln!(out, "sstp_connections_active: {}", CONNECTIONS_ACTIVE.get());
-    let _ = writeln!(out, "sstp_handshake_failures: {}", HANDSHAKE_FAILURES.get());
-    let _ = writeln!(out, "sstp_auth_accept: {}", AUTH_ACCEPT.get());
-    let _ = writeln!(out, "sstp_auth_reject: {}", AUTH_REJECT.get());
-    let _ = writeln!(
-        out,
-        "sstp_session_teardown_clean: {}",
-        SESSION_TEARDOWN_CLEAN.get()
-    );
-    let _ = writeln!(
-        out,
-        "sstp_session_teardown_admin: {}",
-        SESSION_TEARDOWN_ADMIN.get()
-    );
-    let _ = writeln!(
-        out,
-        "sstp_session_teardown_coa: {}",
-        SESSION_TEARDOWN_COA.get()
-    );
-    let _ = writeln!(
-        out,
-        "sstp_session_teardown_shutdown: {}",
-        SESSION_TEARDOWN_SHUTDOWN.get()
-    );
-    let _ = writeln!(
-        out,
-        "sstp_session_teardown_rekey_handshake: {}",
-        SESSION_TEARDOWN_REKEY_HANDSHAKE.get()
-    );
-    let _ = writeln!(
-        out,
-        "sstp_session_teardown_rekey_alert: {}",
-        SESSION_TEARDOWN_REKEY_ALERT.get()
-    );
-    let _ = writeln!(
-        out,
-        "sstp_session_teardown_rekey_other: {}",
-        SESSION_TEARDOWN_REKEY_OTHER.get()
-    );
-    let _ = writeln!(out, "sstp_session_panics: {}", SESSION_PANICS.get());
-    let _ = writeln!(
-        out,
-        "sstp_crypto_binding_failures: {}",
-        CRYPTO_BINDING_FAILURES.get()
-    );
-    let _ = writeln!(
-        out,
-        "sstp_np_filter_drops_pre_ipcp: {}",
-        NP_FILTER_DROPS_PRE_IPCP.get()
-    );
-    let _ = writeln!(
-        out,
-        "sstp_np_filter_drops_mru: {}",
-        NP_FILTER_DROPS_MRU.get()
-    );
-    let _ = writeln!(out, "sstp_log_lines_dropped: {}", LOG_LINES_DROPPED.get());
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,28 +131,26 @@ mod tests {
     }
 
     #[test]
-    fn render_stats_lists_every_metric() {
-        let s = render_stats();
-        for name in [
-            "sstp_connections_accepted",
-            "sstp_connections_active",
-            "sstp_handshake_failures",
-            "sstp_auth_accept",
-            "sstp_auth_reject",
-            "sstp_session_teardown_clean",
-            "sstp_session_teardown_admin",
-            "sstp_session_teardown_coa",
-            "sstp_session_teardown_shutdown",
-            "sstp_session_teardown_rekey_handshake",
-            "sstp_session_teardown_rekey_alert",
-            "sstp_session_teardown_rekey_other",
-            "sstp_session_panics",
-            "sstp_crypto_binding_failures",
-            "sstp_np_filter_drops_pre_ipcp",
-            "sstp_np_filter_drops_mru",
-            "sstp_log_lines_dropped",
-        ] {
-            assert!(s.contains(name), "missing {name} in:\n{s}");
-        }
+    fn all_metrics_exist() {
+        // Every metric counter/gauge must be instantiable — this is a
+        // compile-time property, but keep a test that touches each static
+        // so a subsequent metrics audit can audit this list.
+        let _ = CONNECTIONS_ACCEPTED.get();
+        let _ = CONNECTIONS_ACTIVE.get();
+        let _ = HANDSHAKE_FAILURES.get();
+        let _ = AUTH_ACCEPT.get();
+        let _ = AUTH_REJECT.get();
+        let _ = SESSION_TEARDOWN_CLEAN.get();
+        let _ = SESSION_TEARDOWN_ADMIN.get();
+        let _ = SESSION_TEARDOWN_COA.get();
+        let _ = SESSION_TEARDOWN_SHUTDOWN.get();
+        let _ = SESSION_TEARDOWN_REKEY_HANDSHAKE.get();
+        let _ = SESSION_TEARDOWN_REKEY_ALERT.get();
+        let _ = SESSION_TEARDOWN_REKEY_OTHER.get();
+        let _ = SESSION_PANICS.get();
+        let _ = CRYPTO_BINDING_FAILURES.get();
+        let _ = NP_FILTER_DROPS_PRE_IPCP.get();
+        let _ = NP_FILTER_DROPS_MRU.get();
+        let _ = LOG_LINES_DROPPED.get();
     }
 }

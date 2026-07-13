@@ -619,65 +619,97 @@ which session a host-stack-egress packet belongs to.
 
 ## Control socket
 
-A line-oriented Unix socket exposes runtime stats and
-administrative commands. Default path
+A JSON-RPC 2.0 socket exposes runtime stats and administrative
+commands over a Unix-domain stream. Default path
 `/run/sstp-server/sstp-server.sock` (under the systemd
 `RuntimeDirectory`); override with `--control-socket` or disable
 with `--no-control-socket`.
 
 Permissions on the default path are `0660`,
 `root:sstp-server`, so any user in the `sstp-server` group
-can talk to it. Drive it with `socat` or `nc`:
+can talk to it. Frames are NUL-delimited (a single `\0` byte
+after each complete JSON object). Drive it with `socat` or
+`nc`:
 
 ```sh
-echo show info | sudo socat - UNIX-CONNECT:/run/sstp-server/sstp-server.sock
+# show.info — daemon version, uptime, thread counts, active sessions
+printf '{"jsonrpc":"2.0","method":"show.info","id":1}\0' \
+    | sudo socat - UNIX-CONNECT:/run/sstp-server/sstp-server.sock
+
+# show.stat — all metrics as a JSON object
+printf '{"jsonrpc":"2.0","method":"show.stat","id":1}\0' \
+    | sudo socat - UNIX-CONNECT:/run/sstp-server/sstp-server.sock
 ```
 
-### Commands
+The interactive REPL (`sstp-server-cli`) accepts the same
+text commands the old line-oriented protocol used, but
+translates them to JSON-RPC internally:
 
-```text
-show info               version, uptime, worker counts, active sessions
-show stat               counters / gauges (sstp_* namespace)
-show sess               one line per active session
-show sess <id>          detailed dump for one session
-disable session <id>    graceful teardown of one session
-shutdown                graceful drain of the entire daemon
-help                    print the command list
+```sh
+sstp-server-cli                           # interactive REPL
+sstp-server-cli -c "show info"            # one-shot
 ```
 
-`show stat` output is pre-rendered text, one metric per line.
-The vocabulary is fixed:
+### Methods
 
-```
-sstp_connections_accepted: 41
-sstp_connections_active: 7
-sstp_handshake_failures: 2
-sstp_auth_accept: 39
-sstp_auth_reject: 2
-sstp_session_teardown_clean: 28
-sstp_session_teardown_admin: 3
-sstp_session_teardown_coa: 1
-sstp_session_teardown_shutdown: 0
-sstp_session_panics: 0
-sstp_crypto_binding_failures: 0
-sstp_log_lines_dropped: 0
+| Method               | Params                | Returns                              |
+|----------------------|-----------------------|--------------------------------------|
+| `show.info`          | —                     | `{version, uptime_seconds, io_threads, auth_threads, active_sessions}` |
+| `show.stat`          | —                     | `{sstp_connections_accepted: N, …}`  |
+| `show.session.list`  | —                     | `[{id, peer, user, ip, uptime, backend, cipher}, …]` |
+| `show.session.get`   | `{id: u64}`           | Full session detail object           |
+| `session.disable`    | `{id: u64}`           | `{ok: bool, message: str}`          |
+| `session.rekey`      | `{id: u64, request_peer?: bool}` | `{ok: bool, message: str}` |
+| `shutdown`           | —                     | `{message: "shutting down"}`         |
+
+All methods are JSON-RPC 2.0 notifications when `id` is omitted
+(no response is sent). Batch requests (array of request objects)
+are supported.
+
+`show.stat` returns every metric as a flat JSON object keyed by
+the `sstp_*` metric name:
+
+```json
+{
+  "sstp_connections_accepted": 41,
+  "sstp_connections_active": 7,
+  "sstp_handshake_failures": 2,
+  "sstp_auth_accept": 39,
+  "sstp_auth_reject": 2,
+  "sstp_session_teardown_clean": 28,
+  "sstp_session_teardown_admin": 3,
+  "sstp_session_teardown_coa": 1,
+  "sstp_session_teardown_shutdown": 0,
+  "sstp_session_panics": 0,
+  "sstp_crypto_binding_failures": 0,
+  "sstp_log_lines_dropped": 0
+}
 ```
 
 There is **no** Prometheus exposition format and no HTTP
 endpoint built into the daemon. To expose these to Prometheus,
 front the control socket with a tiny scraper sidecar (a
-30-line shell or Python script reading `show stat` and
+30-line shell or Python script calling `show.stat` and
 emitting `text/plain` is enough).
 
-`show sess` output:
+`show.session.list` returns an array of per-session summaries:
 
-```
-1234 peer=203.0.113.4:51022 user=alice ip=10.99.0.42 dur=312 state=Established
-1235 peer=198.51.100.7:48830 user=bob   ip=10.99.0.43 dur=18  state=AuthInFlight
+```json
+[
+  {
+    "id": "1234",
+    "peer": "203.0.113.4:51022",
+    "user": "alice",
+    "ip": "10.99.0.42",
+    "uptime": "5m12s",
+    "backend": "kmod",
+    "cipher": "TLS_AES_256_GCM_SHA384"
+  }
+]
 ```
 
-The `id` in the first column is what `disable session` and
-`show sess <id>` accept.
+The `id` field in each session object is what `session.disable`,
+`session.rekey`, and `show.session.get` accept.
 
 `shutdown` is equivalent to `systemctl stop sstp-server`: it
 stops accepting new connections, broadcasts a graceful
