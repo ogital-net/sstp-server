@@ -246,7 +246,7 @@ impl MessageBuf {
     }
 
     fn pad_to_4(&mut self) {
-        while self.bytes.len() % 4 != 0 {
+        while !self.bytes.len().is_multiple_of(4) {
             self.bytes.push(0);
         }
     }

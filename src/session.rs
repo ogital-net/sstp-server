@@ -1594,11 +1594,11 @@ async fn handle_ppp_step(
                 return false;
             }
         }
-        if !step.frames.is_empty() {
-            if let Err(e) = tx.flush().await {
-                warn!(%id, error = %e, "TLS flush failed");
-                return false;
-            }
+        if !step.frames.is_empty()
+            && let Err(e) = tx.flush().await
+        {
+            warn!(%id, error = %e, "TLS flush failed");
+            return false;
         }
         for owner in &step.timer_stops {
             if ppp_timer.as_ref().is_some_and(|(o, _)| o == owner) {

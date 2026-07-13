@@ -163,13 +163,13 @@ impl Completer for ReplHelper {
         // and offer the trailing portion as candidates.
         let mut out = Vec::new();
         sub.for_each(|key, _| {
-            if let Some(rest) = key.strip_prefix(prefix) {
-                if !rest.is_empty() {
-                    out.push(Pair {
-                        display: format!("{prefix}{rest}"),
-                        replacement: rest.to_string(),
-                    });
-                }
+            if let Some(rest) = key.strip_prefix(prefix)
+                && !rest.is_empty()
+            {
+                out.push(Pair {
+                    display: format!("{prefix}{rest}"),
+                    replacement: rest.to_string(),
+                });
             }
         });
         Ok((pos, out))

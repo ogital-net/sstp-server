@@ -59,14 +59,17 @@ jobs:
       - run: cargo test --all-features --locked
 
   msrv:
-    name: msrv (1.88)
+    name: msrv (1.89)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Must match `rust-version` in Cargo.toml. A build-only check is
-      # enough to catch accidental use of newer language / std features;
-      # behavioural coverage is the stable `test` job's responsibility.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      # Must match `rust-version` in Cargo.toml. Floor is set by
+      # rustyline 18.0.1, which uses the File lock API (File::lock /
+      # lock_shared) stabilized in Rust 1.89.0 (rust-lang/rust#142125).
+      # A build-only check is enough to catch accidental use of newer
+      # language / std features; behavioural coverage is the stable
+      # `test` job's responsibility.
+      - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --all-features --locked
 

@@ -311,7 +311,10 @@ async fn run() -> Result<(), String> {
     }
 
     if let Some(extra) = getopt.remaining().next() {
-        return Err(format!("unexpected positional argument: {extra:?}"));
+        return Err(format!(
+            "unexpected positional argument: {}",
+            extra.to_string_lossy()
+        ));
     }
 
     let verbosity = if quiet {

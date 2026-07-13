@@ -2,7 +2,7 @@
 name = "sstp-server"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "BSD-2-Clause"
 description = "High-performance Linux SSTP (MS-SSTP) server"
 repository = "https://github.com/ogital-net/sstp-server"

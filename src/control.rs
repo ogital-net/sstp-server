@@ -90,13 +90,13 @@ pub fn bind(
     path: &Path,
     owner: Option<(libc::uid_t, libc::gid_t)>,
 ) -> Result<std::os::unix::net::UnixListener, BindError> {
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(BindError::Remove {
-                path: path.to_path_buf(),
-                source: e,
-            });
-        }
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(BindError::Remove {
+            path: path.to_path_buf(),
+            source: e,
+        });
     }
 
     let listener =
