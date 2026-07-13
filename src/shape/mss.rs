@@ -125,11 +125,11 @@ pub struct MssClamp {
 ///
 /// References:
 ///
-/// - TLS 1.3 (RFC 8446 §5.2): `TLSCiphertext` is 5-byte header
-///   + plaintext + 1-byte inner content-type + 16-byte AEAD tag.
-///   All TLS 1.3 ciphers we accept are AEAD with a 16-byte tag,
-///   so the overhead is constant at 22 bytes regardless of
-///   AES-GCM vs. ChaCha20-Poly1305.
+/// - TLS 1.3 (RFC 8446 §5.2): `TLSCiphertext` is a 5-byte header
+///   plus plaintext plus 1-byte inner content-type plus 16-byte
+///   AEAD tag. All TLS 1.3 ciphers we accept are AEAD with a
+///   16-byte tag, so the overhead is constant at 22 bytes
+///   regardless of AES-GCM vs. ChaCha20-Poly1305.
 /// - TLS 1.2 AES-GCM (RFC 5288): 5-byte header + 8-byte explicit
 ///   nonce + 16-byte tag = 29 bytes.
 /// - TLS 1.2 ChaCha20-Poly1305 (RFC 7905 §2): 5-byte header +
@@ -232,10 +232,10 @@ impl MssClamp {
     /// - **on-link bound** — `mtu - 40`, so a peer-side TCP segment
     ///   fits inside the inner IPv4 packet on `pppN`.
     /// - **underlay bound** — `UNDERLAY_PMTU - encap - 40`, where
-    ///   `encap` is the outer-TCP/IPv4 + cipher-specific TLS record
-    ///   + SSTP + PPP overhead, so the same segment still fits
-    ///   through a 1500-byte underlay without fragmentation or
-    ///   PMTU drops.
+    ///   `encap` is the outer-TCP/IPv4 plus cipher-specific TLS
+    ///   record plus SSTP plus PPP overhead, so the same segment
+    ///   still fits through a 1500-byte underlay without
+    ///   fragmentation or PMTU drops.
     ///
     /// The on-link bound alone — what every "MSS = MTU - 40" PPP /
     /// PPPoE clamp computes — is wrong for SSTP when `Framed-MTU`

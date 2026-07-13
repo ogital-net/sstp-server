@@ -753,6 +753,8 @@ mod tests {
         let hlak = hlak_from_mppe(&a).expect("both keys present");
         // Server HLAK = MasterReceiveKey | MasterSendKey
         //             = MS-MPPE-Recv-Key | MS-MPPE-Send-Key
+        // `i` is bounded by the array length (32), so the u8 cast is exact.
+        #[allow(clippy::cast_possible_truncation)]
         let expected: [u8; 32] = std::array::from_fn(|i| i as u8);
         assert_eq!(hlak, expected);
     }

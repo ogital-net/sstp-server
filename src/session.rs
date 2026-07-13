@@ -399,7 +399,7 @@ pub async fn run(
     );
     {
         let mut g = info.lock().expect("session info mutex poisoned");
-        g.correlation_id = preamble.correlation_id.clone();
+        g.correlation_id = preamble.correlation_id;
     }
 
     // Phase 3: drive the SSTP state machine until it terminates.
@@ -852,7 +852,7 @@ async fn drive_sstp(
                 // (SSTP_IOC_REKEY_TX/RX) is not implemented — matches
                 // HAProxy's AWS-LC + kTLS posture, see
                 // crate::crypto::rekey.
-                let backend_is_kernel = kppp.as_ref().is_some_and(|k| k.is_kernel());
+                let backend_is_kernel = kppp.as_ref().is_some_and(KpppSession::is_kernel);
                 if backend_is_kernel {
                     warn!(
                         %id,
@@ -1551,7 +1551,7 @@ fn publish_data_path(
     g.ifname = Some(ifname);
     g.mtu = Some(mtu);
     g.backend = Some(backend);
-    g.shaping = shaping.cloned();
+    g.shaping = shaping.copied();
 }
 
 /// Apply a [`PppStep`]: write each frame as an SSTP data packet,

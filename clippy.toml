@@ -25,4 +25,9 @@ doc-valid-idents = [
     "aarch64",
     "MikroTik",
     "RouterOS",
+    "HAProxy",
+    "BoringSSL",
+    "MasterReceiveKey",
+    "MasterSendKey",
+    "SIGKILLing",
 ]

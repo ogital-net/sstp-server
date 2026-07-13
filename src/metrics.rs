@@ -80,9 +80,9 @@ pub static SESSION_TEARDOWN_SHUTDOWN: Counter = Counter::new();
 /// broken down by record content type ([RFC 8446] §B.1, surfaced
 /// via `TLS_GET_RECORD_TYPE` cmsg). Every such event ends the
 /// session: cooperative rekey across the kmod boundary is not
-/// implemented and not planned for v0.x (matches HAProxy's AWS-LC
-/// + kTLS posture, see [`crate::crypto::rekey`]). The per-type
-/// breakdown is here so a deployment can tell whether they're
+/// implemented and not planned for v0.x (matches HAProxy's
+/// AWS-LC + kTLS posture, see [`crate::crypto::rekey`]). The
+/// per-type breakdown is here so a deployment can tell whether they're
 /// actually seeing `KeyUpdate` / `NewSessionTicket` (handshake
 /// records) versus alerts versus exotic content types.
 pub static SESSION_TEARDOWN_REKEY_HANDSHAKE: Counter = Counter::new();
