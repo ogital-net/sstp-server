@@ -1140,7 +1140,16 @@ impl AsyncRead for TlsStream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
-            let mut guard = ready!(this.fd.poll_read_ready_mut(cx))?;
+            // Attempt SSL_read FIRST, before awaiting socket readability.
+            // libssl may already hold decrypted application data in its
+            // internal buffer — e.g. the client's first record coalesced
+            // into the same TCP segment as the handshake `Finished`, which
+            // the handshake read pulled off the socket. Gating SSL_read
+            // behind poll_read_ready would park forever on a socket-readable
+            // event that can never come, since the bytes are already in
+            // userspace. This mirrors the handshake path (SSL op first,
+            // await readiness only on WANT_READ/WANT_WRITE).
+            //
             // SAFETY: SSL_read writes initialised bytes into the returned
             // region; we mark them initialised below via `ReadBuf::assume_init`
             // before exposing them.
@@ -1170,10 +1179,9 @@ impl AsyncRead for TlsStream {
             match e {
                 aws::SSL_ERROR_ZERO_RETURN => return Poll::Ready(Ok(())), // EOF
                 aws::SSL_ERROR_WANT_READ => {
-                    guard.clear_ready();
+                    ready!(this.fd.poll_read_ready_mut(cx))?.clear_ready();
                 }
                 aws::SSL_ERROR_WANT_WRITE => {
-                    drop(guard);
                     ready!(this.fd.poll_write_ready_mut(cx))?.clear_ready();
                 }
                 _ => return Poll::Ready(Err(ssl_io_err(e))),
