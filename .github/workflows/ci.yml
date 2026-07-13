@@ -2,15 +2,30 @@ name: ci
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# Least privilege: CI only needs to read the checked-out tree.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so a rapid push sequence
+# doesn't queue redundant work. Never cancel on the default branch —
+# we want every `main` commit to produce a complete status.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
+  # Deny warnings crate-wide. Cargo caps lints for dependencies
+  # (`--cap-lints allow`), so this only bites our own code.
   RUSTFLAGS: "-D warnings"
 
 jobs:
   fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +35,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
+    name: clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,17 +43,35 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
+    name: test (stable)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
+      # The e2e integration tests (tests/e2e.rs) self-skip when they
+      # can't get root + /dev/ppp + sstpc on PATH, which is the case on
+      # GitHub-hosted runners; they still compile and their non-priv
+      # assertions run. Everything else runs for real.
+      - run: cargo test --all-features --locked
+
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Must match `rust-version` in Cargo.toml. A build-only check is
+      # enough to catch accidental use of newer language / std features;
+      # behavioural coverage is the stable `test` job's responsibility.
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --all-features --locked
 
   deny:
+    name: cargo-deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,6 +80,7 @@ jobs:
           command: check
 
   asan:
+    name: address-sanitizer
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,9 +88,39 @@ jobs:
         with:
           components: rust-src
       - uses: Swatinem/rust-cache@v2
+      # Unit tests live in the binary crates (there is no lib target),
+      # so `--bins` is the surface that exercises the `unsafe` FFI
+      # wrappers under ASan. `detect_leaks=0`: aws-lc / libssl keep
+      # intentional one-time global allocations that LSan would flag.
       - name: cargo test with AddressSanitizer
         env:
-          RUSTFLAGS: "-Z sanitizer=address"
-          RUSTDOCFLAGS: "-Z sanitizer=address"
+          RUSTFLAGS: "-Zsanitizer=address"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
           ASAN_OPTIONS: "detect_leaks=0"
-        run: cargo test -Z build-std --target x86_64-unknown-linux-gnu --lib --bins
+        run: >
+          cargo test -Z build-std
+          --target x86_64-unknown-linux-gnu
+          --bins --all-features
+
+  kmod:
+    name: kmod build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Compile the out-of-tree kernel module against a real kernel
+      # tree to catch C build breaks. We build against the generic
+      # headers package (not the runner's own kernel, whose exact
+      # headers aren't always in the archive) — a compile check
+      # doesn't require the module to be loadable on this host.
+      - name: Install kernel headers + toolchain
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential linux-headers-generic
+      - name: Build kmod
+        run: |
+          set -eu
+          KDIR=$(ls -d /usr/src/linux-headers-*-generic | sort -V | tail -n1)
+          echo "Building against KDIR=$KDIR"
+          make -C kmod KDIR="$KDIR"
