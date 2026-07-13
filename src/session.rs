@@ -1777,7 +1777,7 @@ async fn handle_ppp_step(
                     // socket is in `tls` ULP mode and libssl can no
                     // longer encrypt/decrypt — so the decision must be
                     // final before `install_ktls` runs.
-                    let effective_data_path = match data_path {
+                    let mut effective_data_path = match data_path {
                         DataPathMode::Auto => {
                             if ktls.compatible {
                                 DataPathMode::Kernel
@@ -1817,44 +1817,68 @@ async fn handle_ppp_step(
                     // keeps using libssl as before.
                     if matches!(effective_data_path, DataPathMode::Kernel) && ktls.compatible {
                         if let Err(e) = tx.tls.install_ktls() {
-                            warn!(%id, error = %e, "kTLS install failed; cannot bring up kernel data path");
-                            return false;
+                            // `BufferedData` is a transient, timing-
+                            // dependent condition (e.g. the client's
+                            // first IP packet coalesced into the final
+                            // IPCP segment), not a structural failure.
+                            // Under `auto` we downgrade to the TUN data
+                            // path so libssl reads the buffered bytes
+                            // correctly and the session survives; under
+                            // forced `kernel` there is no fallback, so
+                            // it stays fatal. Every other install error
+                            // is fatal regardless of mode.
+                            if let (
+                                crate::crypto::tls::TlsError::BufferedData(n),
+                                DataPathMode::Auto,
+                            ) = (&e, data_path)
+                            {
+                                info!(
+                                    %id,
+                                    buffered = *n,
+                                    "libssl held buffered data at kTLS install; falling back to TUN data path"
+                                );
+                                effective_data_path = DataPathMode::Tun;
+                            } else {
+                                warn!(%id, error = %e, "kTLS install failed; cannot bring up kernel data path");
+                                return false;
+                            }
+                        } else {
+                            info!(
+                                %id,
+                                tls_version = %ktls.tls_version,
+                                cipher = %ktls.cipher,
+                                "kTLS installed on TCP socket"
+                            );
+                            // Dup the TCP fd into an `O_NONBLOCK`
+                            // owned fd registered with tokio for
+                            // write-readiness. From this point on
+                            // `TxStream::write_all` routes outbound
+                            // bytes through raw `write(2)` so kTLS
+                            // does the encryption. The TcpStream's
+                            // own fd stays open (the kmod takes a
+                            // borrowed-fd reference at attach), so
+                            // the dup is just for the async write
+                            // path.
+                            let dup = match tx.tls.tcp_fd().try_clone_to_owned() {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    warn!(%id, error = %e, "failed to dup TCP fd for kTLS TX");
+                                    return false;
+                                }
+                            };
+                            let async_fd = match tokio::io::unix::AsyncFd::with_interest(
+                                dup,
+                                tokio::io::Interest::WRITABLE,
+                            ) {
+                                Ok(af) => af,
+                                Err(e) => {
+                                    warn!(%id, error = %e, "failed to register kTLS TX fd with tokio");
+                                    return false;
+                                }
+                            };
+                            tx.ktls_tx = Some(async_fd);
+                            debug!(%id, "kTLS TX writer installed; libssl bypassed on outbound");
                         }
-                        info!(
-                            %id,
-                            tls_version = %ktls.tls_version,
-                            cipher = %ktls.cipher,
-                            "kTLS installed on TCP socket"
-                        );
-                        // Dup the TCP fd into an `O_NONBLOCK`
-                        // owned fd registered with tokio for
-                        // write-readiness. From this point on
-                        // `TxStream::write_all` routes outbound
-                        // bytes through raw `write(2)` so kTLS
-                        // does the encryption. The TcpStream's
-                        // own fd stays open (the kmod takes a
-                        // borrowed-fd reference at attach), so
-                        // the dup is just for the async write
-                        // path.
-                        let dup = match tx.tls.tcp_fd().try_clone_to_owned() {
-                            Ok(d) => d,
-                            Err(e) => {
-                                warn!(%id, error = %e, "failed to dup TCP fd for kTLS TX");
-                                return false;
-                            }
-                        };
-                        let async_fd = match tokio::io::unix::AsyncFd::with_interest(
-                            dup,
-                            tokio::io::Interest::WRITABLE,
-                        ) {
-                            Ok(af) => af,
-                            Err(e) => {
-                                warn!(%id, error = %e, "failed to register kTLS TX fd with tokio");
-                                return false;
-                            }
-                        };
-                        tx.ktls_tx = Some(async_fd);
-                        debug!(%id, "kTLS TX writer installed; libssl bypassed on outbound");
                     }
 
                     match KpppSession::bring_up(

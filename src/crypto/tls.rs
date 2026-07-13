@@ -30,6 +30,18 @@ pub enum TlsError {
     Io(#[from] io::Error),
     #[error("TLS handshake failed: {0}")]
     Handshake(String),
+    /// libssl has buffered data (decrypted plaintext, or undecrypted
+    /// transport bytes) at the moment of the kTLS install. Handing the
+    /// socket to the kernel now would strand those bytes, since the
+    /// kernel takes over the read path and only sees what arrives on
+    /// the wire afterwards. The payload is the number of *decrypted*
+    /// bytes libssl had buffered (`SSL_pending`), which may be 0 when
+    /// only undecrypted transport data is present. This is a transient,
+    /// timing-dependent condition, not a structural failure: the caller
+    /// should fall back to the userspace data path rather than abort
+    /// the session.
+    #[error("libssl has buffered data ({0} decrypted bytes); kTLS install would strand it")]
+    BufferedData(usize),
 }
 
 /// Shared TLS server context (`SSL_CTX`).
@@ -582,6 +594,9 @@ impl TlsStream {
     /// any post-handshake `read`/`write` activity (the kernel takes
     /// over record framing for both directions, so any cleartext
     /// already buffered in `libssl` would be missed by the kernel).
+    /// This precondition is enforced at runtime via `SSL_has_pending`
+    /// (see below), returning [`TlsError::BufferedData`] rather than
+    /// silently losing bytes.
     ///
     /// Supports AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305
     /// over either TLS 1.2 (`ECDHE-{RSA,ECDSA}-*` and the bare
@@ -591,6 +606,32 @@ impl TlsStream {
     /// should fall back to the userspace data path.
     pub fn install_ktls(&self) -> Result<(), TlsError> {
         use super::ktls;
+
+        // Guard against handing the kernel a socket while libssl still
+        // holds buffered data. `SSL_has_pending` (not `SSL_pending`)
+        // is required: the latter only counts already-*decrypted*
+        // bytes, so it returns 0 in the dangerous case where the
+        // client's first IP packet was coalesced into the same TCP
+        // segment as the final IPCP frame — `SSL_read` during PPP
+        // negotiation pulled the whole segment off the socket, leaving
+        // the trailing record buffered but still undecrypted inside
+        // libssl. Once the kmod owns the fd (`SSTP_IOC_ATTACH`), that
+        // record is invisible to the kernel and silently lost. The
+        // daemon never enables read-ahead (`SSL_set_read_ahead`), so a
+        // non-zero result always means real bytes the kernel would
+        // miss — never a spurious partial-record false positive.
+        // SAFETY: ssl is valid for the life of this TlsStream.
+        let has_pending = unsafe { aws::SSL_has_pending(self.ssl.as_ptr()) };
+        if has_pending != 0 {
+            // `SSL_pending` gives the decrypted-byte count for the
+            // diagnostic; it may be 0 here when only undecrypted
+            // transport data is buffered (the coalesced-record case).
+            // SAFETY: ssl is valid for the life of this TlsStream.
+            let pending = unsafe { aws::SSL_pending(self.ssl.as_ptr()) };
+            #[allow(clippy::cast_sign_loss)]
+            let n = pending.max(0) as usize;
+            return Err(TlsError::BufferedData(n));
+        }
 
         // SAFETY: ssl is valid for the life of this TlsStream.
         let cipher = unsafe { aws::SSL_get_current_cipher(self.ssl.as_ptr()) };
