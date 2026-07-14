@@ -892,6 +892,7 @@ dependencies = [
  "socket2",
  "thiserror",
  "tokio",
+ "tokio-osinterval",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -1034,6 +1035,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-osinterval"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edce37ac7f2616a7a93aff0283cedfc80f04dbe81a32d4af25d45c5c5721c2a2"
+dependencies = [
+ "libc",
+ "tokio",
+ "windows-sys",
 ]
 
 [[package]]

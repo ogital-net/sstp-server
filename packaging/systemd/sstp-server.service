@@ -11,11 +11,12 @@ EnvironmentFile=-/etc/sstp-server/sstp-server.env
 # friends) are loaded from the same file. Keep secrets out of
 # the unit and out of `ps`.
 #
-# Sweep stale per-session MSS-clamp tables left by an abnormal
-# exit (SIGKILL, panic-abort) of a previous run. Normal teardown
-# removes them via Drop; this catches what Drop didn't get to.
-# Best-effort: missing `nft` or no stale tables both succeed.
-ExecStartPre=/bin/sh -c 'command -v nft >/dev/null 2>&1 || exit 0; nft list tables ip 2>/dev/null | grep -oE "sstp_mss_[A-Za-z0-9_]+" | while read t; do nft delete table ip "$t" 2>/dev/null || true; done'
+# Sweep stale MSS-clamp tables left by an abnormal exit (SIGKILL,
+# panic-abort). Each daemon instance creates a PID-scoped table
+# `sstp_mss_<PID>` and removes it on clean exit; this catches any
+# that were leaked. Best-effort: missing `nft` or no stale tables
+# both succeed.
+ExecStartPre=/bin/sh -c 'command -v nft >/dev/null 2>&1 || exit 0; nft list tables ip 2>/dev/null | grep -oE "sstp_mss[A-Za-z0-9_]*" | while read t; do nft delete table ip "$t" 2>/dev/null || true; done'
 ExecStart=/usr/sbin/sstp-server $OPTS
 Restart=on-failure
 RestartSec=2s

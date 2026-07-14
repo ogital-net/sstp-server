@@ -43,8 +43,12 @@ incompatible with those constraints belongs in a separate project.
       `--lcp-echo-interval` seconds, drop after `--lcp-echo-failure`
       consecutive misses. The state machine in [`ppp::lcp`](src/ppp/lcp.rs)
       handles the messages; the periodic driver does not exist yet.
-- [ ] **`Session-Timeout` / `Idle-Timeout` enforcement** (RFC 2865
-      §5.27–5.28). Currently honoured by neither timer.
+- [x] **`Session-Timeout` / `Idle-Timeout` enforcement** (RFC 2865
+      §5.27–5.28). *(done)* Both are consumed from the
+      Access-Accept via `auth::reply::SessionPolicy` and installed
+      in `drive_sstp` as one-shot `tokio::time::Sleep` deadlines.
+      `Idle-Timeout` is re-armed whenever the accounting interim
+      detects octet-counter movement.
 - [ ] **Honour peer-advertised LCP MRU on netdev MTU**: today
       we accept the peer's `MRU` option in their Configure-Request
       but don't propagate the value to the `pppN` / `tun0` MTU.
@@ -86,9 +90,12 @@ incompatible with those constraints belongs in a separate project.
       the operator-driven teardown paths (`disable session`,
       shutdown, CoA-Disconnect). The framing exists; the dispatcher
       currently just drops the TLS socket.
-- [ ] **`Echo-Request`/`Echo-Response` keepalive timer** ([MS-SSTP]
-      §3.2.5.2.4). The frames are decoded; the periodic emitter
-      and the timeout-driven abort are not implemented.
+- [x] **`Echo-Request`/`Echo-Response` keepalive timer** ([MS-SSTP]
+      §3.2.5.2.4). *(done)* The per-worker periodic tick (1 s
+      timerfd) sends `PeriodicTick` to all sessions; each session
+      checks `last_rx` and sends an Echo Request after 60 s idle,
+      aborts after 120 s with no response. Zero per-session timer
+      overhead — no timer-wheel entries or timerfd per session.
 - [ ] **TLS 1.3 `KeyUpdate` handling on the kmod path**: the kmod
       already surfaces `SSTP_EVT_TLS_REKEY_NEEDED`; today's userspace
       handler tears the session down cleanly (no Stop loss, metric
@@ -116,9 +123,13 @@ incompatible with those constraints belongs in a separate project.
       live unit with `NLM_F_REPLACE`. Plumbing in
       [`shape::Shaper`](src/shape/mod.rs) supports it; the session
       task does not yet listen for it.
-- [ ] **`Acct-Interim-Interval` honour**: the period is currently
-      hardcoded to 60 s in [`session.rs`](src/session.rs). Honour
-      the value advertised in the Access-Accept (RFC 2869 §2.1).
+- [x] **`Acct-Interim-Interval` honour** *(done)*: the period from
+      the Access-Accept overrides the default 60 s cadence.
+      Driven by the per-worker periodic tick — each session
+      checks `last_acct_interim.elapsed()` locally, with jitter
+      (session ID mod period) to spread interims evenly across
+      the interval and avoid thundering-herd bursts on the
+      RADIUS server.
 - [ ] **`Filter-Id` → nftables**: install a per-session nft chain
       under `inet sstp filter-<id>` and bind it to the `pppN`
       ingress hook. Symmetric design to `shape::`: hand-rolled
@@ -214,13 +225,15 @@ sure we exploit it everywhere.
       ABI bump. Separate work item; benchmark first to see if
       it's worth it given the kmod path is already kTLS-zero-copy
       end-to-end.
-- [ ] **IPv6 MSS clamp**: the per-session MSS clamp in
-      [`shape::mss`](src/shape/mss.rs) is already nftables on the
-      `FORWARD` hook (installed via direct `NETLINK_NETFILTER`,
-      runs in softirq, identical on the kmod and TUN paths) — but
-      the table is `NFPROTO_IPV4` only. Add a sibling
-      `NFPROTO_IPV6` table with the equivalent `TCPv6` payload
-      match when §1's IPV6CP work lands.
+- [x] **IPv6 MSS clamp** *(v4 done, v6 deferred)*: the per-session
+      MSS clamp has been replaced with a shared nftables table —
+      one table per process, one chain per distinct MSS value, and
+      named sets for O(1) per-packet interface lookup. Replaces
+      the previous per-session table approach (565 tables × 2
+      rules → 1 table × 2 set-lookup chains). `NFTA_SET_USERDATA`
+      emits only the 6-byte `KEYBYTEORDER` blob for nft 1.0.6
+      compatibility. The `NFPROTO_IPV6` sibling table will land
+      alongside §1's IPV6CP work.
 - [ ] **Per-CPU listener accounting**: `SO_INCOMING_CPU` /
       `SO_REUSEPORT_CBPF` to pin sessions to the NUMA-local
       worker. Today the kernel hashes by 4-tuple, which is

@@ -51,6 +51,7 @@ socket2 = { version = "0.6", features = ["all"] }
 radius-tokio = { git = "https://github.com/ogital-net/radius-tokio", branch = "client", default-features = false, features = ["dict-rfc", "dict-microsoft", "client", "fast-md5"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
+tokio-osinterval = { version = "1", features = ["periodic"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi", "fmt"] }

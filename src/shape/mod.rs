@@ -60,6 +60,7 @@
 
 pub mod mikrotik;
 pub mod mss;
+pub mod mss_shared;
 mod netlink;
 pub mod tc;
 

@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use tokio::runtime::{Builder, Runtime};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tokio::task::{JoinHandle, LocalSet};
 use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -97,7 +97,7 @@ fn main() -> ExitCode {
 
 #[allow(clippy::too_many_lines)] // boot sequence: linear top-to-bottom, splitting hurts readability
 fn run(config: &Config) -> ExitCode {
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let (shutdown_tx, _) = watch::channel(false);
     let registry = Registry::new();
     let started = std::time::Instant::now();
 
@@ -281,6 +281,18 @@ fn run(config: &Config) -> ExitCode {
         }
     };
 
+    // Shared MSS-clamp table. One nftables table + one chain per
+    // distinct MSS value, with a named set per group for O(1)
+    // per-packet interface lookup. Only constructed when clamping
+    // is enabled; the `Arc` is cloned into every worker and every
+    // session adds/removes its interface via a `SharedMssHandle`.
+    // Dropping the last `Arc` (process exit) destroys the table.
+    let mss_table: Option<Arc<shape::mss_shared::SharedMssTable>> = if config.mss_clamp {
+        Some(Arc::new(shape::mss_shared::SharedMssTable::new()))
+    } else {
+        None
+    };
+
     // I/O workers: one current_thread runtime per worker thread, each
     // with its own LocalSet. Each worker `adopt()`s the std listener
     // we pre-bound above.
@@ -291,7 +303,7 @@ fn run(config: &Config) -> ExitCode {
         let local_ip = config.local_ip;
         let auth_method = config.auth_method;
         let data_path = effective_data_path;
-        let mss_clamp = config.mss_clamp;
+        let mss_table = mss_table.clone();
         let worker_registry = registry.clone();
         let worker_shutdown = shutdown_tx.clone();
         let worker_tls = tls_ctx.clone();
@@ -313,7 +325,7 @@ fn run(config: &Config) -> ExitCode {
                     local_ip,
                     auth_method,
                     data_path,
-                    mss_clamp,
+                    mss_table,
                 );
             })
             .expect("spawn I/O worker");
@@ -357,7 +369,7 @@ fn run(config: &Config) -> ExitCode {
         wait_for_shutdown(shutdown_tx.subscribe()).await;
         // Phase 1: tell workers to stop accepting and tell every live
         // session to begin graceful teardown.
-        let _ = shutdown_for_signal.send(());
+        let _ = shutdown_for_signal.send(true);
         let initial = drain_registry.len();
         if initial > 0 {
             info!(active_sessions = initial, "draining sessions");
@@ -516,16 +528,16 @@ fn io_worker_main(
     id: usize,
     listen: std::net::SocketAddr,
     std_listener: std::net::TcpListener,
-    mut shutdown: broadcast::Receiver<()>,
+    mut shutdown: watch::Receiver<bool>,
     registry: Registry,
-    shutdown_tx: broadcast::Sender<()>,
+    shutdown_tx: watch::Sender<bool>,
     tls_ctx: SharedTlsContext,
     auth_bridge: AuthBridge,
     acct_bridge: Option<AcctBridge>,
     local_ip: std::net::Ipv4Addr,
     auth_method: crate::ppp::AuthMethod,
     data_path: cli::DataPathMode,
-    mss_clamp: bool,
+    mss_table: Option<Arc<shape::mss_shared::SharedMssTable>>,
 ) {
     set_io_thread_realtime(id);
     let rt: Runtime = Builder::new_current_thread()
@@ -555,7 +567,7 @@ fn io_worker_main(
             local_ip,
             auth_method,
             data_path,
-            mss_clamp,
+            mss_table,
         )
         .await;
     });
@@ -565,18 +577,27 @@ fn io_worker_main(
 async fn accept_loop(
     worker_id: usize,
     listener: tokio::net::TcpListener,
-    shutdown: &mut broadcast::Receiver<()>,
+    shutdown: &mut watch::Receiver<bool>,
     registry: Registry,
-    shutdown_tx: broadcast::Sender<()>,
+    shutdown_tx: watch::Sender<bool>,
     tls_ctx: SharedTlsContext,
     auth_bridge: AuthBridge,
     acct_bridge: Option<AcctBridge>,
     local_ip: std::net::Ipv4Addr,
     auth_method: crate::ppp::AuthMethod,
     data_path: cli::DataPathMode,
-    mss_clamp: bool,
+    mss_table: Option<Arc<shape::mss_shared::SharedMssTable>>,
 ) {
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+    // Per-worker periodic tick: one timerfd drives all periodic
+    // session work (hello keepalive, accounting interim). Each tick
+    // sends `PeriodicTick` to every live session on this worker;
+    // sessions check internally what work is due. Dead channels
+    // (session ended) are pruned lazily.
+    let mut tick_senders: Vec<tokio::sync::mpsc::Sender<session::ControlCommand>> = Vec::new();
+    let mut worker_tick = tokio_osinterval::PeriodicInterval::new(session::WORKER_TICK_INTERVAL)
+        .expect("timerfd for worker tick");
+
     loop {
         // Reap completed tasks opportunistically so the Vec doesn't
         // grow without bound under steady-state load.
@@ -584,7 +605,7 @@ async fn accept_loop(
 
         tokio::select! {
             biased;
-            _ = shutdown.recv() => {
+            _ = shutdown.changed() => {
                 info!(
                     worker = worker_id,
                     in_flight = tasks.len(),
@@ -592,9 +613,19 @@ async fn accept_loop(
                 );
                 break;
             }
+            _ = worker_tick.tick() => {
+                // Prune dead senders and send PeriodicTick to survivors.
+                tick_senders.retain(|tx| {
+                    !tx.is_closed()
+                });
+                for tx in &tick_senders {
+                    let _ = tx.try_send(session::ControlCommand::PeriodicTick);
+                }
+            }
             res = listener.accept() => match res {
                 Ok((stream, peer)) => {
-                    let (id, control_rx, info_handle) = session::spawn_handle(&registry, peer);
+                    let (id, control_rx, hello_tx, info_handle) = session::spawn_handle(&registry, peer);
+                    tick_senders.push(hello_tx);
                     let drain_rx = shutdown_tx.subscribe();
                     let registry = registry.clone();
                     let session_tls = tls_ctx
@@ -603,8 +634,9 @@ async fn accept_loop(
                         .clone();
                     let session_auth = auth_bridge.clone();
                     let session_acct = acct_bridge.clone();
+                    let session_mss = mss_table.clone();
                     let handle = tokio::task::spawn_local(session::run(
-                        stream, peer, id, registry, control_rx, drain_rx, session_tls, session_auth, session_acct, local_ip, auth_method, data_path, mss_clamp, info_handle,
+                        stream, peer, id, registry, control_rx, drain_rx, session_tls, session_auth, session_acct, local_ip, auth_method, data_path, session_mss, info_handle,
                     ));
                     tasks.push(handle);
                 }
@@ -638,7 +670,7 @@ async fn accept_loop(
     info!(worker = worker_id, "accept loop exited");
 }
 
-async fn wait_for_shutdown(mut admin_rx: broadcast::Receiver<()>) {
+async fn wait_for_shutdown(mut admin_rx: watch::Receiver<bool>) {
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(e) => {
@@ -650,7 +682,7 @@ async fn wait_for_shutdown(mut admin_rx: broadcast::Receiver<()>) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("received SIGINT, shutting down"),
         _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
-        _ = admin_rx.recv() => info!("received control-socket shutdown, shutting down"),
+        _ = admin_rx.changed() => info!("received control-socket shutdown, shutting down"),
     }
 }
 

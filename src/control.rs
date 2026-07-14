@@ -32,7 +32,7 @@ use jasonrpc::{Error as RpcError, Request};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::cli;
@@ -69,7 +69,7 @@ pub enum BindError {
 #[derive(Clone)]
 pub struct ControlState {
     pub registry: Registry,
-    pub shutdown_tx: broadcast::Sender<()>,
+    pub shutdown_tx: watch::Sender<bool>,
     pub started: Instant,
     pub io_threads: usize,
     pub auth_threads: usize,
@@ -198,7 +198,7 @@ pub async fn serve(
     path: PathBuf,
     listener: std::os::unix::net::UnixListener,
     state: ControlState,
-    mut shutdown_rx: broadcast::Receiver<()>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), BindError> {
     let listener = UnixListener::from_std(listener).map_err(|source| BindError::Bind {
         path: path.clone(),
@@ -214,7 +214,7 @@ pub async fn serve(
     loop {
         tokio::select! {
             biased;
-            _ = shutdown_rx.recv() => {
+            _ = shutdown_rx.changed() => {
                 debug!("control socket draining");
                 break;
             }
@@ -496,7 +496,7 @@ fn rekey_session(state: &ControlState, raw_id: u64, request_peer: bool) -> Sessi
 }
 
 fn shutdown(state: &ControlState) -> ShutdownResult {
-    let _ = state.shutdown_tx.send(());
+    let _ = state.shutdown_tx.send(true);
     ShutdownResult {
         message: "shutting down".to_string(),
     }
@@ -538,8 +538,8 @@ fn format_rate(rate: Option<&crate::shape::RateSpec>) -> String {
 mod tests {
     use super::*;
 
-    fn test_state() -> (ControlState, broadcast::Receiver<()>) {
-        let (tx, rx) = broadcast::channel(1);
+    fn test_state() -> (ControlState, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
         let state = ControlState {
             registry: Registry::new(),
             shutdown_tx: tx,
@@ -660,6 +660,7 @@ mod tests {
         let (state, mut rx) = test_state();
         let r = shutdown(&state);
         assert_eq!(r.message, "shutting down");
-        assert!(rx.try_recv().is_ok());
+        assert!(rx.has_changed().unwrap());
+        assert!(*rx.borrow_and_update());
     }
 }

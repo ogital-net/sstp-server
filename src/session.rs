@@ -22,11 +22,11 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::acct_bridge::AcctBridge;
@@ -37,12 +37,20 @@ use crate::crypto::tls::{SslContext, TlsStream};
 use crate::kppp::session::KpppSession;
 use crate::metrics;
 use crate::ppp::{AuthMethod, AuthVerdict, Ppp, PppEvent, PppStep, TimerOwner};
+use crate::shape::mss_shared::{SharedMssHandle, SharedMssTable};
 use crate::sstp::preamble;
 
 /// Bounded depth for the per-session control channel. Control commands
 /// (Disconnect) are rare enough that any backlog past a couple of slots
 /// signals a stuck session — we want to drop rather than queue forever.
 const CONTROL_CHANNEL_DEPTH: usize = 4;
+
+/// How often the per-worker periodic tick fires. Each tick sends
+/// `PeriodicTick` to every session on the worker; sessions check
+/// internally whether hello keepalive or accounting interim work is
+/// due. 1 s gives ±1 s jitter on the 60 s accounting cadence and
+/// the 60 s hello threshold — well within spec tolerance for both.
+pub const WORKER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Monotonic per-process session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -110,6 +118,16 @@ pub enum ControlCommand {
     Rekey {
         request_peer: bool,
     },
+    /// Per-worker periodic tick (~1 s). The session checks whether
+    /// any periodic work is due:
+    /// - Hello keepalive: send SSTP Echo Request if idle > 60 s,
+    ///   abort if idle > 120 s ([MS-SSTP] §3.1.2.3).
+    /// - Accounting interim: emit an Acct-Status-Type=Interim-Update
+    ///   if the configured interval has elapsed since the last record.
+    ///
+    /// One timerfd per worker drives all sessions — no per-session
+    /// timer-wheel entries or timerfd overhead.
+    PeriodicTick,
 }
 
 /// Cloneable, `Send` handle to a session living on some I/O worker.
@@ -292,14 +310,14 @@ pub async fn run(
     id: SessionId,
     registry: Registry,
     mut control_rx: mpsc::Receiver<ControlCommand>,
-    mut drain_rx: broadcast::Receiver<()>,
+    mut drain_rx: watch::Receiver<bool>,
     tls_ctx: SslContext,
     auth_bridge: AuthBridge,
     acct_bridge: Option<AcctBridge>,
     local_ip: Ipv4Addr,
     auth_method: AuthMethod,
     data_path: DataPathMode,
-    mss_clamp_enabled: bool,
+    mss_table: Option<Arc<SharedMssTable>>,
     info: SessionInfoHandle,
 ) {
     info!(%id, %peer, "session accepted");
@@ -327,7 +345,7 @@ pub async fn run(
     // single `HANDSHAKE_FAILURES` bucket.
     let mut tls = tokio::select! {
         biased;
-        _ = drain_rx.recv() => {
+        _ = drain_rx.changed() => {
             info!(%id, "session draining before TLS handshake");
             return;
         }
@@ -423,7 +441,7 @@ pub async fn run(
         local_ip,
         auth_method,
         data_path,
-        mss_clamp_enabled,
+        mss_table,
         info,
     )
     .await;
@@ -448,7 +466,7 @@ async fn drive_sstp(
     peer: SocketAddr,
     tls: TlsStream,
     mut control_rx: mpsc::Receiver<ControlCommand>,
-    mut drain_rx: broadcast::Receiver<()>,
+    mut drain_rx: watch::Receiver<bool>,
     auth_bridge: AuthBridge,
     acct_bridge: Option<AcctBridge>,
     cert_hash_sha1: [u8; 20],
@@ -456,7 +474,7 @@ async fn drive_sstp(
     local_ip: Ipv4Addr,
     auth_method: AuthMethod,
     data_path: DataPathMode,
-    mss_clamp_enabled: bool,
+    mss_table: Option<Arc<SharedMssTable>>,
     info: SessionInfoHandle,
 ) {
     use std::future::poll_fn;
@@ -489,7 +507,31 @@ async fn drive_sstp(
     let mut ppp_timer: Option<(TimerOwner, Pin<Box<Sleep>>)> = None;
     let mut kppp: Option<KpppSession> = None;
     let mut kppp_buf = [0u8; 2048];
-    let mut mss_clamp: Option<crate::shape::mss::MssClamp> = None;
+    // Per-worker periodic tick state. The worker sends
+    // `ControlCommand::PeriodicTick` every WORKER_TICK_INTERVAL;
+    // the handler checks these timestamps to decide what work is due.
+    let mut last_rx = Instant::now();
+    let mut hello_echo_pending = false;
+    // Jitter the initial accounting deadline across [0, period) so
+    // sessions that start at the same time (reconnect burst) don't
+    // all fire their first interim in the same tick. Uses the
+    // session ID (monotonic u64) as a cheap deterministic spread —
+    // no RNG needed, just distribute evenly across the interval.
+    let mut acct_interim_period = Duration::from_secs(60);
+    let jitter = Duration::from_millis(id.as_u64() % acct_interim_period.as_secs());
+    let mut last_acct_interim = Instant::now().checked_sub(jitter).unwrap_or_else(Instant::now);
+    // RAII handle for this session's entry in the shared MSS-clamp
+    // set. `None` until IPCP converges and the netdev is up; on drop
+    // (session teardown) it removes the interface from the nftables
+    // set. `None` for the whole session when clamping is disabled.
+    let mut mss_handle: Option<SharedMssHandle> = None;
+    // Borrow the owned `Option<Arc<SharedMssTable>>` once so every
+    // downstream handler call can pass the (Copy) `Option<&Arc>`
+    // without a per-call `as_ref()`. The owned binding stays alive
+    // to the end of this scope, keeping the borrow valid; the
+    // per-session `SharedMssHandle` (above) holds its own `Arc`
+    // clone, so table lifetime is independent of this borrow.
+    let mss_table = mss_table.as_ref();
     // Stashed at PAP Accept time (`NeedPapAuth` handler in
     // `handle_ppp_step`), consumed at `NetworkUp` time once the
     // kernel netdev exists. `None` after consumption or when the
@@ -539,17 +581,6 @@ async fn drive_sstp(
     // few sites with a more specific cause set this explicitly
     // before exiting.
     let acct_cause = std::cell::Cell::new(crate::auth::accounting::SessionEnd::LostCarrier);
-    // Periodic Acct-Status-Type=Interim-Update. Default 60s,
-    // overridable per-session via the RADIUS
-    // `Acct-Interim-Interval` attribute (RFC 2869 §5.16). The
-    // interval applies once `pending_policy` is consumed at
-    // `NetworkUp`; until then we keep the default cadence.
-    let acct_interim_period = std::time::Duration::from_secs(60);
-    let mut acct_interim_tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + acct_interim_period,
-        acct_interim_period,
-    );
-    acct_interim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // RADIUS-driven hard session deadline (RFC 2865 §5.27,
     // `Session-Timeout`). `None` until policy applies at
@@ -597,8 +628,8 @@ async fn drive_sstp(
         &mut pending_username,
         &mut pending_hlak,
         &mut acct_state,
-        mss_clamp_enabled,
-        &mut mss_clamp,
+        mss_table,
+        &mut mss_handle,
         &info,
     )
     .await
@@ -655,9 +686,7 @@ async fn drive_sstp(
             && let Some(policy) = pending_policy.take()
         {
             if let Some(period) = policy.acct_interim_interval {
-                acct_interim_tick =
-                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-                acct_interim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                acct_interim_period = period;
                 info!(
                     %id,
                     ?period,
@@ -735,11 +764,10 @@ async fn drive_sstp(
             });
             tokio::select! {
                 biased;
-                _ = drain_rx.recv() => DriverEvent::Drain,
+                _ = drain_rx.changed() => DriverEvent::Drain,
                 c = control_rx.recv() => DriverEvent::Control(c),
                 () = session_timeout_fut => DriverEvent::SessionTimeout,
                 () = idle_timeout_fut => DriverEvent::IdleTimeout,
-                _ = acct_interim_tick.tick() => DriverEvent::AcctInterim,
                 () = sstp_timer_fut => DriverEvent::SstpTimer,
                 () = ppp_timer_fut => DriverEvent::PppTimer,
                 r = kppp_read_fut => DriverEvent::KpppRead(r),
@@ -804,8 +832,8 @@ async fn drive_sstp(
                     &mut pending_username,
                     &mut pending_hlak,
                     &mut acct_state,
-                    mss_clamp_enabled,
-                    &mut mss_clamp,
+                    mss_table,
+                    &mut mss_handle,
                     &info,
                 )
                 .await
@@ -835,13 +863,107 @@ async fn drive_sstp(
                     &mut pending_username,
                     &mut pending_hlak,
                     &mut acct_state,
-                    mss_clamp_enabled,
-                    &mut mss_clamp,
+                    mss_table,
+                    &mut mss_handle,
                     &info,
                 )
                 .await
                 {
                     return;
+                }
+            }
+            DriverEvent::Control(Some(ControlCommand::PeriodicTick)) => {
+                // --- Hello keepalive check ---
+                use crate::sstp::state::{State, TIMER_VAL_HELLO};
+                if ssm.state() == State::ServerCallConnected {
+                    let idle = last_rx.elapsed();
+                    if hello_echo_pending && idle >= TIMER_VAL_HELLO + TIMER_VAL_HELLO {
+                        debug!(%id, ?idle, "hello timeout: no echo response, aborting");
+                        let out = ssm.on_hello_timeout_no_response();
+                        if !handle_sstp_step(
+                            id,
+                            &mut tx,
+                            &out,
+                            &mut tx_buf,
+                            &mut sstp_timer,
+                            &mut ppp,
+                            &mut ppp_timer,
+                            &auth,
+                            local_ip,
+                            auth_method,
+                            &mut kppp,
+                            data_path,
+                            &mut pending_shaping,
+                            &mut pending_policy,
+                            &mut pending_username,
+                            &mut pending_hlak,
+                            &mut acct_state,
+                            mss_table,
+                            &mut mss_handle,
+                            &info,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    } else if !hello_echo_pending && idle >= TIMER_VAL_HELLO {
+                        debug!(%id, ?idle, "hello: sending echo request");
+                        hello_echo_pending = true;
+                        let out = ssm.on_timer(Timer::Hello, &mut tx_buf);
+                        if !handle_sstp_step(
+                            id,
+                            &mut tx,
+                            &out,
+                            &mut tx_buf,
+                            &mut sstp_timer,
+                            &mut ppp,
+                            &mut ppp_timer,
+                            &auth,
+                            local_ip,
+                            auth_method,
+                            &mut kppp,
+                            data_path,
+                            &mut pending_shaping,
+                            &mut pending_policy,
+                            &mut pending_username,
+                            &mut pending_hlak,
+                            &mut acct_state,
+                            mss_table,
+                            &mut mss_handle,
+                            &info,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                }
+
+                // --- Accounting interim check ---
+                if last_acct_interim.elapsed() >= acct_interim_period {
+                    last_acct_interim = Instant::now();
+                    if let (Some(state), Some(bridge)) = (acct_state.as_mut(), auth.acct) {
+                        let counters = sample_acct_counters(
+                            state.ifindex,
+                            state.started,
+                            &state.last_counters,
+                        );
+                        let total = counters.input_octets.saturating_add(counters.output_octets);
+                        if total != last_activity_octets {
+                            last_activity_octets = total;
+                            if let Some(period) = idle_timeout {
+                                idle_timeout_deadline = Some(Box::pin(tokio::time::sleep(period)));
+                            }
+                        }
+                        state.last_counters = counters.clone();
+                        bridge.submit(
+                            state.username.clone(),
+                            peer,
+                            state.session.clone(),
+                            crate::auth::accounting::AcctEvent::InterimUpdate,
+                            counters,
+                        );
+                    }
                 }
             }
             DriverEvent::Control(Some(ControlCommand::Rekey { request_peer })) => {
@@ -877,32 +999,6 @@ async fn drive_sstp(
                 debug!(%id, "control channel closed by all senders");
                 return;
             }
-            DriverEvent::AcctInterim => {
-                if let (Some(state), Some(bridge)) = (acct_state.as_mut(), auth.acct) {
-                    let counters =
-                        sample_acct_counters(state.ifindex, state.started, &state.last_counters);
-                    // Idle-Timeout (RFC 2865 §5.28): if the
-                    // octet counters moved since the previous
-                    // sample, re-arm the deadline. If they
-                    // didn't, leave the deadline running — it
-                    // will fire on its own at `IdleTimeout`.
-                    let total = counters.input_octets.saturating_add(counters.output_octets);
-                    if total != last_activity_octets {
-                        last_activity_octets = total;
-                        if let Some(period) = idle_timeout {
-                            idle_timeout_deadline = Some(Box::pin(tokio::time::sleep(period)));
-                        }
-                    }
-                    state.last_counters = counters.clone();
-                    bridge.submit(
-                        state.username.clone(),
-                        peer,
-                        state.session.clone(),
-                        crate::auth::accounting::AcctEvent::InterimUpdate,
-                        counters,
-                    );
-                }
-            }
             DriverEvent::SessionTimeout => {
                 info!(%id, "Session-Timeout reached; tearing session down");
                 acct_cause.set(crate::auth::accounting::SessionEnd::SessionTimeout);
@@ -937,8 +1033,8 @@ async fn drive_sstp(
                     &mut pending_username,
                     &mut pending_hlak,
                     &mut acct_state,
-                    mss_clamp_enabled,
-                    &mut mss_clamp,
+                    mss_table,
+                    &mut mss_handle,
                     &info,
                 )
                 .await
@@ -970,8 +1066,8 @@ async fn drive_sstp(
                         &mut pending_username,
                         &mut pending_hlak,
                         &mut acct_state,
-                        mss_clamp_enabled,
-                        &mut mss_clamp,
+                        mss_table,
+                        &mut mss_handle,
                         &info,
                     )
                     .await
@@ -1004,6 +1100,10 @@ async fn drive_sstp(
                 }
             }
             DriverEvent::KmodEvents { io_err } => {
+                // Kmod control events count as rx activity for hello.
+                last_rx = Instant::now();
+                hello_echo_pending = false;
+
                 if let Some(e) = io_err {
                     warn!(%id, error = %e, "kmod event poll failed; tearing session down");
                     return;
@@ -1083,8 +1183,8 @@ async fn drive_sstp(
                                 &mut pending_username,
                                 &mut pending_hlak,
                                 &mut acct_state,
-                                mss_clamp_enabled,
-                                &mut mss_clamp,
+                                mss_table,
+                                &mut mss_handle,
                                 &info,
                             )
                             .await
@@ -1163,6 +1263,10 @@ async fn drive_sstp(
                 return;
             }
             DriverEvent::Read(Ok(n)) => {
+                // Any inbound byte activity resets the hello state.
+                last_rx = Instant::now();
+                hello_echo_pending = false;
+
                 rx_buf.extend_from_slice(&chunk[..n]);
                 // Drain as many complete SSTP packets as the buffer
                 // currently holds. The codec is zero-copy against
@@ -1208,8 +1312,8 @@ async fn drive_sstp(
                                 &mut pending_username,
                                 &mut pending_hlak,
                                 &mut acct_state,
-                                mss_clamp_enabled,
-                                &mut mss_clamp,
+                                mss_table,
+                                &mut mss_handle,
                                 &info,
                             )
                             .await
@@ -1293,8 +1397,8 @@ async fn drive_sstp(
                                     &mut pending_username,
                                     &mut pending_hlak,
                                     &mut acct_state,
-                                    mss_clamp_enabled,
-                                    &mut mss_clamp,
+                                    mss_table,
+                                    &mut mss_handle,
                                     &info,
                                 )
                                 .await
@@ -1344,8 +1448,8 @@ async fn drive_sstp(
                                         &mut pending_username,
                                         &mut pending_hlak,
                                         &mut acct_state,
-                                        mss_clamp_enabled,
-                                        &mut mss_clamp,
+                                        mss_table,
+                                        &mut mss_handle,
                                         &info,
                                     )
                                     .await
@@ -1439,9 +1543,6 @@ enum DriverEvent {
     SstpTimer,
     PppTimer,
     KpppRead(std::io::Result<usize>),
-    /// Periodic 60s tick that emits a RADIUS
-    /// `Acct-Status-Type=Interim-Update`.
-    AcctInterim,
     /// `Session-Timeout` (RFC 2865 §5.27) hard deadline expired —
     /// tear down with `Acct-Terminate-Cause=Session-Timeout`.
     SessionTimeout,
@@ -1484,8 +1585,8 @@ async fn handle_sstp_step(
     pending_username: &mut Option<String>,
     pending_hlak: &mut Option<[u8; 32]>,
     acct_state: &mut Option<AcctState>,
-    mss_clamp_enabled: bool,
-    mss_clamp: &mut Option<crate::shape::mss::MssClamp>,
+    mss_table: Option<&Arc<SharedMssTable>>,
+    mss_handle: &mut Option<SharedMssHandle>,
     info: &SessionInfoHandle,
 ) -> bool {
     let outcome = apply_step(id, tx, out, tx_buf, sstp_timer, kppp.as_ref()).await;
@@ -1518,8 +1619,8 @@ async fn handle_sstp_step(
             pending_username,
             pending_hlak,
             acct_state,
-            mss_clamp_enabled,
-            mss_clamp,
+            mss_table,
+            mss_handle,
             info,
         )
         .await
@@ -1579,8 +1680,8 @@ async fn handle_ppp_step(
     pending_username: &mut Option<String>,
     pending_hlak: &mut Option<[u8; 32]>,
     acct_state: &mut Option<AcctState>,
-    mss_clamp_enabled: bool,
-    mss_clamp: &mut Option<crate::shape::mss::MssClamp>,
+    mss_table: Option<&Arc<SharedMssTable>>,
+    mss_handle: &mut Option<SharedMssHandle>,
     info: &SessionInfoHandle,
 ) -> bool {
     use tokio::time::{Instant, sleep_until};
@@ -1944,22 +2045,36 @@ async fn handle_ppp_step(
                                     }
                                 }
                             }
-                            if mss_clamp_enabled {
+                            if let Some(table) = mss_table {
                                 let mtu = link_mtu.unwrap_or(1500);
-                                match crate::shape::mss::MssClamp::install_for_ifname(
-                                    &k.ifname(),
+                                // Cipher-aware MSS: selects the
+                                // shared chain/set the interface
+                                // joins based on the negotiated
+                                // TLS cipher overhead.
+                                let bounds = crate::shape::mss::compute_mss4(
                                     mtu,
                                     &ktls.tls_version,
                                     &ktls.cipher,
-                                ) {
+                                );
+                                let ifname = k.ifname();
+                                match table.add(&ifname, bounds.mss4) {
                                     Ok(guard) => {
-                                        *mss_clamp = Some(guard);
+                                        info!(
+                                            %id,
+                                            ifname = %ifname,
+                                            mtu,
+                                            mss = bounds.mss4,
+                                            "installed nftables MSS clamp rules"
+                                        );
+                                        *mss_handle =
+                                            Some(SharedMssHandle::new(Arc::clone(table), guard));
                                     }
                                     Err(e) => {
                                         warn!(
                                             %id,
-                                            ifname = %k.ifname(),
+                                            ifname = %ifname,
                                             mtu,
+                                            mss = bounds.mss4,
                                             error = %e,
                                             "MSS clamp install failed; session continues without SYN rewrite"
                                         );
@@ -2339,14 +2454,21 @@ async fn apply_step(
         *active_timer = None;
     }
     if let Some((which, dur)) = out.timer_start {
-        let deadline = Instant::now() + dur;
-        match active_timer.as_mut() {
-            Some((slot_which, sleep)) => {
-                *slot_which = which;
-                sleep.as_mut().reset(deadline);
-            }
-            None => {
-                *active_timer = Some((which, Box::pin(sleep_until(deadline))));
+        // Hello keepalive is driven by the per-worker periodic tick
+        // (ControlCommand::PeriodicTick); skip arming a per-session
+        // Sleep for it. Negotiation / Abort / Disconnect timers
+        // still use the per-session slot — they're short-lived and
+        // only active during state transitions.
+        if which != crate::sstp::state::Timer::Hello {
+            let deadline = Instant::now() + dur;
+            match active_timer.as_mut() {
+                Some((slot_which, sleep)) => {
+                    *slot_which = which;
+                    sleep.as_mut().reset(deadline);
+                }
+                None => {
+                    *active_timer = Some((which, Box::pin(sleep_until(deadline))));
+                }
             }
         }
     }
@@ -2515,19 +2637,24 @@ impl Drop for RegistrationGuard<'_> {
 pub fn spawn_handle(
     registry: &Registry,
     peer: SocketAddr,
-) -> (SessionId, mpsc::Receiver<ControlCommand>, SessionInfoHandle) {
+) -> (
+    SessionId,
+    mpsc::Receiver<ControlCommand>,
+    mpsc::Sender<ControlCommand>,
+    SessionInfoHandle,
+) {
     let id = SessionId::next();
     let (tx, rx) = mpsc::channel(CONTROL_CHANNEL_DEPTH);
     let info = new_info_handle();
     registry.register(SessionHandle {
         id,
         peer,
-        tx,
+        tx: tx.clone(),
         info: info.clone(),
     });
     metrics::CONNECTIONS_ACCEPTED.inc();
     metrics::CONNECTIONS_ACTIVE.inc();
-    (id, rx, info)
+    (id, rx, tx, info)
 }
 
 #[cfg(test)]

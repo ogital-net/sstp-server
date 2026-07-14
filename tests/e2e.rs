@@ -830,6 +830,17 @@ fn netfilter_shaping_skip_reason() -> Option<String> {
     None
 }
 
+/// Lowercase hex encoding of a byte slice, no separators. Fallback
+/// for matching nftables set elements on older `nft` builds that
+/// ignore `NFTA_SET_USERDATA` and render keys as raw hex.
+fn hex_of(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 /// Run a command and return (status, combined-stdout-string,
 /// combined-stderr-string). Used to make the kernel-state probes
 /// (`nft list ruleset`, `tc qdisc show`, …) more legible in
@@ -855,15 +866,18 @@ fn run_capture(bin: &std::path::Path, args: &[&str]) -> (std::process::ExitStatu
 /// `tunN` netdev:
 ///
 ///   * `IFLA_MTU` matches `Framed-MTU` (clamped `[576, 1500]`).
-///   * An `inet`-family nftables table `sstp_mss_<pid>_<n>` exists
-///     and the `forward` chain references the netdev's name in
-///     `iifname` / `oifname` rules.
+///   * The process-scoped nftables table `sstp_mss_<PID>` exists and
+///     an `ifaces_<mss>` set contains the netdev's name (the
+///     `fwd_<mss>` chain's rules match on that set for both
+///     directions).
 ///   * `tc qdisc show dev <ifname>` lists an `htb` root qdisc and
 ///     an `ingress` qdisc; `tc class show` lists a leaf class with
 ///     a rate close to the one in `Mikrotik-Rate-Limit`.
 ///
 /// After SIGKILLing `sstpc` and waiting for the netdev to disappear,
-/// asserts the nft table is gone (RAII cleanup via `MssClamp::Drop`).
+/// asserts the netdev's name is gone from the set (RAII cleanup
+/// via `SharedMssHandle::Drop`). The `sstp_mss_<PID>` table
+/// persists for the daemon's lifetime by design.
 ///
 /// Skipped if any of the prerequisites are missing — see
 /// [`netfilter_shaping_skip_reason`].
@@ -1021,25 +1035,38 @@ async fn sstpc_mtu_netfilter_shaping() {
         "expected `{mtu_needle}` in:\n{ip_stdout}"
     );
 
-    // (2) nftables: a table named `sstp_mss_*` must exist (table
-    // names embed the daemon's pid, but the prefix is stable; see
-    // `src/shape/mss.rs::next_table_name`). We inspect the *full*
-    // ruleset rather than `nft list tables` so the rule contents
-    // (iifname / oifname references to our netdev) are visible in
-    // failure output.
+    // (2) nftables: a `sstp_mss_<PID>` table must exist and one
+    // of its `ifaces_<mss>` sets must contain our netdev's name
+    // (see `src/shape/mss_shared.rs`). We inspect the full ruleset
+    // so the set contents are visible in failure output.
     assert!(
         nft_status.success(),
         "`nft list ruleset` failed (status={nft_status:?}): {nft_stderr}"
     );
     assert!(
-        nft_stdout.contains("table ip sstp_mss_"),
-        "expected `table ip sstp_mss_…` in nft ruleset:\n{nft_stdout}"
+        nft_stdout.contains("table ip sstp_mss"),
+        "expected `table ip sstp_mss` in nft ruleset:\n{nft_stdout}"
     );
-    // Both directions of the FORWARD-hook rules should reference
-    // the netdev (one as `iifname`, one as `oifname`).
+    // The netdev's name must appear as a set element (the shared
+    // `fwd_<mss>` chain matches `iifname`/`oifname` against the set,
+    // so the per-session state is the set membership, not a rule).
+    //
+    // Our NEWSET includes NFTA_SET_USERDATA with the `ifname` type
+    // descriptor, so `nft list` renders elements as quoted interface
+    // names (e.g. `"ppp5"`). The hex fallback below covers the edge
+    // case where an older nft binary ignores the userdata.
+    let ifname_hex = hex_of(ifname.as_bytes());
+    let nft_hex_normalized: String = nft_stdout
+        .to_ascii_lowercase()
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .collect();
     assert!(
-        nft_stdout.contains(&format!("\"{ifname}\"")) || nft_stdout.contains(&ifname),
-        "expected nft rule body to reference `{ifname}`:\n{nft_stdout}"
+        nft_stdout.contains(&format!("\"{ifname}\""))
+            || nft_stdout.contains(&ifname)
+            || nft_hex_normalized.contains(&ifname_hex),
+        "expected nft `ifaces_*` set to contain `{ifname}` \
+         (literal or hex `{ifname_hex}`):\n{nft_stdout}"
     );
 
     // (3) tc qdiscs: HTB root + ingress qdisc.
@@ -1087,20 +1114,35 @@ async fn sstpc_mtu_netfilter_shaping() {
         "expected u32+police filter on ingress of `{ifname}`:\n{filter_stdout}"
     );
 
-    // ----- post-teardown: nft table should be gone (MssClamp::Drop) -----
+    // ----- post-teardown: the netdev's set element should be gone
+    // (SharedMssHandle::Drop). The `sstp_mss_<PID>` table persists
+    // for the daemon's lifetime, so we assert on the interface name
+    // disappearing from the ruleset, not on the table. -----
 
     // Give the session task a beat to unwind. The Drop impl on
-    // MssClamp opens a fresh netlink socket and runs a delete batch
-    // synchronously, so this is usually instantaneous; allow a
-    // generous window for a loaded box.
+    // SharedMssHandle opens a fresh netlink socket and runs a
+    // del-setelem batch synchronously, so this is usually
+    // instantaneous; allow a generous window for a loaded box.
+    // Same rendering caveat as the membership check above: the
+    // element may show up either as the literal name or as the hex
+    // of its bytes, so probe for both when deciding whether it's
+    // still present.
+    let element_present = |out: &str| -> bool {
+        let hex: String = out
+            .to_ascii_lowercase()
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .collect();
+        out.contains(&ifname) || hex.contains(&ifname_hex)
+    };
     let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut leaked = String::new();
     loop {
-        let (st, out, _err) = run_capture(&nft_bin, &["list", "tables"]);
+        let (st, out, _err) = run_capture(&nft_bin, &["list", "ruleset"]);
         if !st.success() {
             break; // can't probe; don't fail the cleanup assertion on a tooling glitch
         }
-        if !out.contains("sstp_mss_") {
+        if !element_present(&out) {
             leaked.clear();
             break;
         }
@@ -1112,6 +1154,6 @@ async fn sstpc_mtu_netfilter_shaping() {
     }
     assert!(
         leaked.is_empty(),
-        "nft `sstp_mss_*` table leaked after session teardown:\n{leaked}"
+        "nft `ifaces_*` set still references `{ifname}` after session teardown:\n{leaked}"
     );
 }

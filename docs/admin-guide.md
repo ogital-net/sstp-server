@@ -866,12 +866,14 @@ file a bug.
 
 ### Stale `sstp_mss_*` nftables tables after a crash
 
-Per-session TCP MSS clamping installs a small `nf_tables` table
-named `sstp_mss_<pid>_<n>` for the lifetime of each session.
-The daemon removes the table when the session ends. SIGKILL
-and process-abort bypass that cleanup — the kernel has no way
-to know the userspace owner is gone, so the rules linger until
-something deletes them.
+TCP MSS clamping uses a PID-scoped `nf_tables` table named
+`sstp_mss_<PID>`. It holds one chain plus one named set per
+distinct MSS value; each session only adds its netdev name to
+the appropriate set (and removes it on teardown). The daemon
+deletes the table on a clean exit. SIGKILL and process-abort
+bypass that cleanup — the kernel has no way to know the
+userspace owner is gone, so the table lingers until something
+deletes it.
 
 The systemd unit sweeps stragglers in `ExecStartPre=` before
 each start, so a `systemctl restart` after a crash is enough.
@@ -880,7 +882,7 @@ same thing by hand:
 
 ```sh
 nft list tables ip \
-    | grep -oE 'sstp_mss_[A-Za-z0-9_]+' \
+    | grep -oE 'sstp_mss[A-Za-z0-9_]*' \
     | while read t; do nft delete table ip "$t"; done
 ```
 
