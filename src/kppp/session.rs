@@ -24,7 +24,7 @@
 
 use std::io;
 use std::net::Ipv4Addr;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
@@ -32,6 +32,19 @@ use tokio::io::unix::AsyncFd;
 use tracing::{trace, warn};
 
 use crate::cli::DataPathMode;
+
+/// Non-owning fd wrapper for [`AsyncFd`] registration. Implements
+/// `AsRawFd` but has no `Drop` — the underlying fd is owned by
+/// [`KmodSession`] and must outlive any `AsyncFd<FdRef>`. This
+/// avoids a `dup(2)` per kmod session.
+#[derive(Debug)]
+pub(crate) struct FdRef(RawFd);
+
+impl AsRawFd for FdRef {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
 
 use super::SessionIpConfig;
 use super::netlink::{NetlinkError, RtNetlink};
@@ -355,16 +368,17 @@ impl KpppSession {
         }
     }
 
-    /// Dup the kmod session fd and wrap it in an [`AsyncFd`] for the
-    /// session driver's `select!`. Returns `Ok(None)` for TUN. The
-    /// dup shares the open-file-description, including the
-    /// `O_NONBLOCK` flag set by [`KmodSession::attach`].
-    pub fn kmod_async_fd(&self) -> io::Result<Option<AsyncFd<OwnedFd>>> {
+    /// Wrap the kmod session fd in an [`AsyncFd`] for the session
+    /// driver's `select!`. Returns `Ok(None)` for TUN. Uses a
+    /// non-owning [`FdRef`] so no `dup(2)` is needed — the fd is
+    /// owned by [`KmodSession`] and must outlive the returned
+    /// `AsyncFd`.
+    pub fn kmod_async_fd(&self) -> io::Result<Option<AsyncFd<FdRef>>> {
         let Some(fd) = self.kmod_fd() else {
             return Ok(None);
         };
-        let dup = fd.try_clone_to_owned()?;
-        let async_fd = AsyncFd::with_interest(dup, Interest::READABLE)?;
+        let fd_ref = FdRef(fd.as_raw_fd());
+        let async_fd = AsyncFd::with_interest(fd_ref, Interest::READABLE)?;
         Ok(Some(async_fd))
     }
 

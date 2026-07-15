@@ -452,6 +452,16 @@ impl TlsStream {
         self.fd.get_ref().as_fd()
     }
 
+    /// Poll the TCP socket's write readiness. Used by the kmod
+    /// control-frame path to wait for backpressure relief when
+    /// `SSTP_IOC_SEND_CONTROL` returns `EAGAIN`, without needing
+    /// a separate dup'd fd.
+    pub async fn tcp_writable(
+        &self,
+    ) -> std::io::Result<tokio::io::unix::AsyncFdReadyGuard<'_, std::net::TcpStream>> {
+        self.fd.writable().await
+    }
+
     /// Return whether the negotiated TLS session parameters are a
     /// reasonable kTLS candidate for the in-tree SSTP kernel module.
     ///

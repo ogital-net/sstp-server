@@ -378,8 +378,9 @@ pub async fn run(
     }
 
     // kTLS install is *not* invoked here — it happens at kernel-
-    // mode kmod attach inside [`handle_ppp_step`], paired with the
-    // TX-path swap to raw `write(2)` via [`TxStream::ktls_tx`].
+    // mode kmod attach inside [`handle_ppp_step`]. In kmod mode the
+    // data path runs entirely in kernel context; userspace only
+    // sends control frames via `SSTP_IOC_SEND_CONTROL`.
     // Installing it earlier would mean either (a) libssl `SSL_write`
     // double-encrypting on subsequent control writes, or (b) needing
     // the raw-fd TX path to be ready before we know whether the
@@ -478,7 +479,6 @@ async fn drive_sstp(
     info: SessionInfoHandle,
 ) {
     use std::future::poll_fn;
-    use std::os::fd::OwnedFd;
     use std::pin::Pin;
     use std::task::Poll;
     use tokio::io::unix::AsyncFd;
@@ -490,12 +490,10 @@ async fn drive_sstp(
     use crate::sstp::state::Timer;
     use crate::sstp::{ControlMessage, Packet, StateMachine, parse_control, parse_control_payload};
 
-    // Wrap the libssl-backed TLS stream in a `TxStream`. While
-    // `tx.ktls_tx` is `None`, writes go through libssl as usual;
-    // once kernel mode is brought up and kTLS is installed (inside
-    // [`handle_ppp_step`] at `NetworkUp`), `tx.ktls_tx` becomes
-    // `Some(AsyncFd)` and outbound bytes route through raw
-    // `write(2)` on the TCP fd with the kernel doing AEAD.
+    // Wrap the libssl-backed TLS stream in a `TxStream`. In TUN
+    // mode, all writes go through libssl. In kmod mode, data frames
+    // are handled by the kernel; only control frames route through
+    // `SSTP_IOC_SEND_CONTROL` (see `apply_step`).
     let mut tx = TxStream::new(tls);
 
     let mut ssm = StateMachine::new(cert_hash_sha1, cert_hash);
@@ -548,7 +546,7 @@ async fn drive_sstp(
     // tokio readability polling. While `Some`, `tx.tls.read()` is
     // gated off (the kmod owns the byte path) and incoming SSTP
     // control packets arrive as `SSTP_EVT_CONTROL_PACKET` events.
-    let mut kmod_async_fd: Option<AsyncFd<OwnedFd>> = None;
+    let mut kmod_async_fd: Option<AsyncFd<crate::kppp::session::FdRef>> = None;
     // Scratch buffer for `SSTP_IOC_RECV_CONTROL`. Sized at the
     // kernel's `SSTP_CONTROL_MAX` so the ioctl never returns
     // `EMSGSIZE`.
@@ -1910,14 +1908,13 @@ async fn handle_ppp_step(
                     // kmod's `SSTP_IOC_ATTACH` requires kTLS RX+TX
                     // to be installed up-front (it returns
                     // `EOPNOTSUPP` otherwise). After install,
-                    // libssl's `SSL_write` would produce
-                    // double-encrypted bytes, so the matching TX
-                    // path swap (dup the TCP fd into
-                    // `TxStream::ktls_tx`; raw `write(2)` from
-                    // there, kernel does the AEAD) happens here
-                    // too. Under `--data-path auto` we skip the
-                    // install entirely so the TUN-fallback path
-                    // keeps using libssl as before.
+                    // the kmod owns the data-plane byte path;
+                    // control frames go through
+                    // `SSTP_IOC_SEND_CONTROL`, which the kmod
+                    // sends via kTLS on our behalf. Under
+                    // `--data-path auto` we skip the install
+                    // entirely so the TUN-fallback path keeps
+                    // using libssl as before.
                     if matches!(effective_data_path, DataPathMode::Kernel) && ktls.compatible {
                         if let Err(e) = tx.tls.install_ktls() {
                             // `BufferedData` is a transient, timing-
@@ -1952,35 +1949,6 @@ async fn handle_ppp_step(
                                 cipher = %ktls.cipher,
                                 "kTLS installed on TCP socket"
                             );
-                            // Dup the TCP fd into an `O_NONBLOCK`
-                            // owned fd registered with tokio for
-                            // write-readiness. From this point on
-                            // `TxStream::write_all` routes outbound
-                            // bytes through raw `write(2)` so kTLS
-                            // does the encryption. The TcpStream's
-                            // own fd stays open (the kmod takes a
-                            // borrowed-fd reference at attach), so
-                            // the dup is just for the async write
-                            // path.
-                            let dup = match tx.tls.tcp_fd().try_clone_to_owned() {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    warn!(%id, error = %e, "failed to dup TCP fd for kTLS TX");
-                                    return false;
-                                }
-                            };
-                            let async_fd = match tokio::io::unix::AsyncFd::with_interest(
-                                dup,
-                                tokio::io::Interest::WRITABLE,
-                            ) {
-                                Ok(af) => af,
-                                Err(e) => {
-                                    warn!(%id, error = %e, "failed to register kTLS TX fd with tokio");
-                                    return false;
-                                }
-                            };
-                            tx.ktls_tx = Some(async_fd);
-                            debug!(%id, "kTLS TX writer installed; libssl bypassed on outbound");
                         }
                     }
 
@@ -2412,22 +2380,16 @@ async fn apply_step(
                 match kppp_ref.send_control(body) {
                     Ok(()) => break,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // Wait for TCP writability via the kTLS TX
-                        // AsyncFd we already hold (registered with
-                        // WRITABLE interest at attach). The kmod's
-                        // EPOLLOUT pivots off the same TCP socket's
-                        // `sk_stream_is_writeable`, so this is the
-                        // matching wakeup signal.
-                        let Some(fd) = tx.ktls_tx.as_ref() else {
-                            warn!(%id, "kmod returned WouldBlock but no kTLS TX fd to wait on");
-                            return SstpOutcome::stop();
-                        };
-                        match fd.writable().await {
+                        // Wait for TCP writability via the TLS
+                        // stream's existing AsyncFd (no dup needed).
+                        // The kmod's ioctl backpressure tracks
+                        // `sk_stream_is_writeable` on the same socket.
+                        match tx.tls.tcp_writable().await {
                             Ok(mut g) => {
                                 g.clear_ready();
                             }
                             Err(e) => {
-                                warn!(%id, error = %e, "kTLS TX writable wait failed");
+                                warn!(%id, error = %e, "TCP writable wait failed");
                                 return SstpOutcome::stop();
                             }
                         }
@@ -2520,83 +2482,24 @@ async fn apply_step(
 /// kmod's event channel instead.
 struct TxStream {
     tls: TlsStream,
-    /// `Some` once kTLS TX has been installed on the TCP socket
-    /// (which, in v0.1, only happens at kernel-mode kmod attach).
-    /// Holds an `O_NONBLOCK` dup of the TCP fd registered with
-    /// tokio for write-readiness polling.
-    ktls_tx: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
 }
 
 impl TxStream {
     fn new(tls: TlsStream) -> Self {
-        Self { tls, ktls_tx: None }
+        Self { tls }
     }
 
-    /// Write `bytes` to the wire in full. Routes through `SSL_write`
-    /// when `ktls_tx` is `None` and through raw `write(2)` on the
-    /// dup'd TCP fd (kernel does the kTLS AEAD) otherwise.
+    /// Write `bytes` to the wire in full via `SSL_write`.
     async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        if let Some(fd) = self.ktls_tx.as_ref() {
-            ktls_write_all(fd, bytes).await
-        } else {
-            use tokio::io::AsyncWriteExt;
-            self.tls.write_all(bytes).await
-        }
+        use tokio::io::AsyncWriteExt;
+        self.tls.write_all(bytes).await
     }
 
-    /// Drain any libssl buffering. No-op once kTLS TX is installed
-    /// — raw `write(2)` is unbuffered at this layer.
+    /// Drain any libssl buffering.
     async fn flush(&mut self) -> std::io::Result<()> {
-        if self.ktls_tx.is_some() {
-            Ok(())
-        } else {
-            use tokio::io::AsyncWriteExt;
-            self.tls.flush().await
-        }
+        use tokio::io::AsyncWriteExt;
+        self.tls.flush().await
     }
-}
-
-/// Raw kTLS write loop. The TCP socket is `O_NONBLOCK` (via the
-/// `AsyncFd` registration), so a full send buffer surfaces as
-/// `WouldBlock` and we re-arm. Short writes are normal and looped
-/// until the buffer drains.
-async fn ktls_write_all(
-    fd: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
-    mut buf: &[u8],
-) -> std::io::Result<()> {
-    use std::io;
-    use std::os::fd::AsRawFd;
-
-    while !buf.is_empty() {
-        let mut guard = fd.writable().await?;
-        let res = guard.try_io(|inner| {
-            // SAFETY: `inner.get_ref().as_raw_fd()` is an open fd
-            // owned by the `AsyncFd`; `buf` is a valid borrowed
-            // slice of `buf.len()` bytes. `write(2)` returns the
-            // number of bytes consumed or -1; we read `errno` only
-            // on -1.
-            let n = unsafe {
-                libc::write(
-                    inner.get_ref().as_raw_fd(),
-                    buf.as_ptr().cast::<libc::c_void>(),
-                    buf.len(),
-                )
-            };
-            if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                #[allow(clippy::cast_sign_loss)] // n >= 0 from above
-                Ok(n as usize)
-            }
-        });
-        match res {
-            Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(Ok(n)) => buf = &buf[n..],
-            Ok(Err(e)) => return Err(e),
-            Err(_would_block) => {} // re-arm on next loop iteration
-        }
-    }
-    Ok(())
 }
 
 /// Outcome of one SSTP FSM step from the session driver's view.
