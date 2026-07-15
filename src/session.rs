@@ -519,7 +519,9 @@ async fn drive_sstp(
     // no RNG needed, just distribute evenly across the interval.
     let mut acct_interim_period = Duration::from_secs(60);
     let jitter = Duration::from_millis(id.as_u64() % acct_interim_period.as_secs());
-    let mut last_acct_interim = Instant::now().checked_sub(jitter).unwrap_or_else(Instant::now);
+    let mut last_acct_interim = Instant::now()
+        .checked_sub(jitter)
+        .unwrap_or_else(Instant::now);
     // RAII handle for this session's entry in the shared MSS-clamp
     // set. `None` until IPCP converges and the netdev is up; on drop
     // (session teardown) it removes the interface from the nftables
