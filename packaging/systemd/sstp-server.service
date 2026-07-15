@@ -24,11 +24,13 @@ RestartSec=2s
 # Run as a dedicated unprivileged account. CAP_NET_BIND_SERVICE
 # lets the daemon bind :443; CAP_NET_ADMIN is required per
 # session for /dev/ppp PPPIOCNEWUNIT and for the netlink
-# RTM_NEWADDR / link-up sequence.
+# RTM_NEWADDR / link-up sequence. CAP_SYS_NICE lets I/O worker
+# threads promote themselves to SCHED_FIFO for jitter-free
+# packet forwarding.
 User=sstp-server
 Group=sstp-server
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_NICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_NICE
 NoNewPrivileges=yes
 
 # Control socket lives under /run/sstp-server (created and
@@ -59,13 +61,16 @@ ProtectKernelTunables=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
 RestrictNamespaces=yes
-RestrictRealtime=yes
+RestrictRealtime=no
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
+SystemCallFilter=~@resources
+# Re-allow sched_setscheduler (denied by ~@resources above) so I/O
+# workers can promote to SCHED_FIFO via CAP_SYS_NICE.
+SystemCallFilter=sched_setscheduler
 
 LimitNOFILE=65536
 
